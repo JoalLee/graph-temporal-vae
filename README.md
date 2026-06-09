@@ -1,8 +1,36 @@
-# Graph TCN-VAE
+# Graph-Temporal VAE
 
-This repository provides the model architecture implementation for a graph-enhanced TCN-VAE for time-series imputation with uncertainty estimation.
+Graph-Temporal VAE provides model architecture implementations for graph-enhanced temporal variational autoencoders designed for uncertainty-aware time-series imputation.
 
 It is a lightweight public package focused on reusable model code. Full research experiments, datasets, checkpoints, analysis notebooks, and thesis materials are intentionally not included.
+
+## Why This Matters
+
+High-resolution environmental monitoring systems often produce rich but incomplete time series. In aerosol supersite measurements, instrument downtime, calibration, flow instability, liquid handling issues, and severe-weather protection shutdowns can fragment co-located particle size distribution (PSD), chemical speciation, and meteorological records. These gaps are not simple isolated missing values; they often occur as structured, modality-dependent outages in a coupled physicochemical system.
+
+Incomplete aerosol records limit downstream analyses such as mass closure, optical closure, source apportionment, exposure assessment, and climate-relevant aerosol process studies. Common gap-handling approaches such as deletion, zero-fill, mean substitution, or short-segment interpolation can discard expensive observations or introduce systematic bias, especially when full PSD spectra or groups of chemical measurements are unavailable.
+
+This project is motivated by the need for imputation models that can recover coupled chemical and microphysical aerosol states while also reporting uncertainty. For scientific use, an imputed value should not be treated as equivalent to a direct measurement; its predictive uncertainty and operating context should travel with it.
+
+## Purpose
+
+The main purpose of this package is to make the Graph-TCN-VAE model architecture reusable outside the original research workspace. The architecture combines:
+
+- feature-space graph learning, where chemical species and PSD size bins are represented as feature nodes rather than monitoring stations;
+- temporal encoding with dilated temporal convolutional blocks, which captures local, diurnal, and multi-day structure inside each moving window;
+- probabilistic latent-variable modeling, which represents unresolved ambiguity in partially observed aerosol states;
+- heteroscedastic decoding, which returns predictive means together with feature- and time-dependent uncertainty estimates;
+- optional auxiliary conditioning, allowing meteorological and temporal variables to guide reconstruction without being reconstruction targets.
+
+The implementation is site-agnostic at the architecture level. It can be adapted to other multivariate time-series imputation problems where missingness is structured, variables are interdependent, and uncertainty estimates are required.
+
+## Main Use Cases
+
+- Reconstructing missing aerosol chemical speciation and PSD time series from co-located monitoring instruments.
+- Building uncertainty-aware "virtual sensor" workflows for environmental monitoring data.
+- Studying feature-to-feature dependencies in high-dimensional time-series systems through learned graph attention or sensitivity analysis.
+- Prototyping graph-temporal VAE models for other scientific sensor networks with structured missingness.
+- Providing a clean architecture reference for papers, thesis work, or downstream model extensions without exposing private datasets or experiment artifacts.
 
 ## Included Models
 
@@ -14,8 +42,8 @@ It is a lightweight public package focused on reusable model code. Full research
 ## Installation
 
 ```bash
-git clone https://github.com/<your-user>/graph-tcn-vae.git
-cd graph-tcn-vae
+git clone https://github.com/JoalLee/graph-temporal-vae.git
+cd graph-temporal-vae
 pip install -e ".[dev]"
 ```
 
