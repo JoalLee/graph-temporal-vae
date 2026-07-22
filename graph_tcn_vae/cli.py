@@ -45,6 +45,9 @@ def build_parser():
     train_p.add_argument("--dynamic-masking-mode", choices=["block", "legacy"], default="block")
     train_p.add_argument("--dynamic-random-point-drop-prob", type=float, default=0.0)
     train_p.add_argument("--selection-val-seed", type=int, default=100003)
+    train_p.add_argument("--selection-mask-mode", choices=["block", "anchor_constrained"], default="block")
+    train_p.add_argument("--selection-mask-ratio", type=float, default=0.10)
+    train_p.add_argument("--shared-full-heldout-mask", action="store_true")
     train_p.add_argument(
         "--validation-metric", choices=["ho_nll", "ho_mse", "ho_crps"], default="ho_nll",
         help="Held-out selection metric for early stopping.",
@@ -144,6 +147,9 @@ def main(argv=None):
             dynamic_masking_mode=args.dynamic_masking_mode,
             dynamic_random_point_drop_prob=args.dynamic_random_point_drop_prob,
             selection_val_seed=args.selection_val_seed,
+            selection_mask_mode=args.selection_mask_mode,
+            selection_mask_ratio=args.selection_mask_ratio,
+            shared_full_heldout_mask=args.shared_full_heldout_mask,
             validation_metric=args.validation_metric,
             val_crps_mc_samples=args.val_crps_mc_samples,
             val_crps_every_n_epochs=args.val_crps_every_n_epochs,

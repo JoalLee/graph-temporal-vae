@@ -272,6 +272,81 @@ def sample_dynamic_heldout_mask(observed_mask, config=None, seed=0, rng=None):
     return heldout
 
 
+def _observed_runs(mask_1d):
+    indices = np.flatnonzero(np.asarray(mask_1d, dtype=bool))
+    if indices.size == 0:
+        return
+    cuts = np.where(np.diff(indices) > 1)[0] + 1
+    for group in np.split(indices, cuts):
+        yield int(group[0]), int(group[-1])
+
+
+def _sample_anchor_constrained_series(observed_1d, target_count, rng,
+                                      mean_duration=48.0, std_duration=24.0,
+                                      min_duration=3, max_duration=168):
+    available = np.asarray(observed_1d, dtype=bool).copy()
+    heldout = np.zeros_like(available, dtype=bool)
+    target_count = int(target_count)
+    current = 0
+    attempts = 0
+    while current < target_count and attempts < 200_000:
+        attempts += 1
+        remaining = target_count - current
+        duration = int(np.clip(
+            rng.normal(mean_duration, std_duration), min_duration, max_duration
+        ))
+        if remaining < min_duration or current + duration > target_count:
+            duration = remaining
+        candidates = []
+        weights = []
+        for run_start, run_end in _observed_runs(available):
+            n_starts = run_end - run_start + 1 - duration - 1
+            if n_starts > 0:
+                candidates.append((run_start, run_end))
+                weights.append(n_starts)
+        if not candidates:
+            if duration <= min_duration:
+                break
+            continue
+        weights = np.asarray(weights, dtype=np.float64)
+        run_start, run_end = candidates[int(rng.choice(len(candidates), p=weights / weights.sum()))]
+        start = int(rng.integers(run_start + 1, run_end - duration + 1))
+        end = start + duration
+        heldout[start:end] = True
+        available[start:end] = False
+        current += duration
+    return heldout
+
+
+def sample_anchor_constrained_heldout_mask(observed_mask, ratio=0.10, seed=42, n_chem=None):
+    """Generate 26e-style held-out gaps bounded by observed anchors.
+
+    Chemistry is sampled per feature. PSD-like features share time gaps and
+    require every PSD feature to be observed at the candidate timestamps.
+    """
+    observed_mask = np.asarray(observed_mask, dtype=bool)
+    if observed_mask.ndim != 2:
+        raise ValueError("observed_mask must be 2-D")
+    n_rows, n_features = observed_mask.shape
+    n_chem = n_features if n_chem is None else min(max(int(n_chem), 0), n_features)
+    rng = np.random.default_rng(seed)
+    heldout = np.zeros_like(observed_mask, dtype=bool)
+
+    for feature in range(n_chem):
+        observed_count = int(observed_mask[:, feature].sum())
+        heldout[:, feature] = _sample_anchor_constrained_series(
+            observed_mask[:, feature], int(observed_count * ratio), rng
+        )
+
+    if n_chem < n_features:
+        psd_observed = observed_mask[:, n_chem:].all(axis=1)
+        heldout_time = _sample_anchor_constrained_series(
+            psd_observed, int(psd_observed.sum() * ratio), rng
+        )
+        heldout[np.ix_(heldout_time, np.arange(n_chem, n_features))] = True
+    return heldout
+
+
 class WindowedTimeSeriesDataset(Dataset):
     """Windows a (already NaN-filled, already scaled) target/aux array pair.
 

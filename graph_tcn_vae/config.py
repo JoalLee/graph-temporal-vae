@@ -38,6 +38,9 @@ class TrainConfig:
     dynamic_masking_mode: str = "block"
     dynamic_random_point_drop_prob: float = 0.0
     selection_val_seed: int = 100003
+    selection_mask_mode: str = "block"
+    selection_mask_ratio: float = 0.10
+    shared_full_heldout_mask: bool = False
     validation_metric: str = "ho_nll"
     val_crps_mc_samples: int = 20
     val_crps_every_n_epochs: int = 1
@@ -89,6 +92,10 @@ class TrainConfig:
             raise ValueError("dynamic_masking_mode must be 'block' or 'legacy'")
         if not 0 <= self.dynamic_random_point_drop_prob <= 1:
             raise ValueError("dynamic_random_point_drop_prob must be in [0, 1]")
+        if self.selection_mask_mode not in {"block", "anchor_constrained"}:
+            raise ValueError("selection_mask_mode must be 'block' or 'anchor_constrained'")
+        if not 0 < self.selection_mask_ratio <= 1:
+            raise ValueError("selection_mask_ratio must be in (0, 1]")
         if self.window_size < 1 or self.stride < 1:
             raise ValueError("window_size and stride must be positive")
         if self.lr_min < 0 or self.weight_decay < 0:

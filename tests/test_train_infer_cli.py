@@ -5,7 +5,7 @@ import torch
 
 from graph_tcn_vae.cli import main as cli_main
 from graph_tcn_vae.config import TrainConfig
-from graph_tcn_vae.data import sample_dynamic_heldout_mask
+from graph_tcn_vae.data import sample_anchor_constrained_heldout_mask, sample_dynamic_heldout_mask
 from graph_tcn_vae.infer import aggregate_window_samples, load_bundle
 from graph_tcn_vae.train import Trainer, vae_loss
 
@@ -205,3 +205,18 @@ def test_legacy_dynamic_mask_matches_research_modal_pattern():
     # PSD-like targets are masked as shared time blocks, not independently.
     assert np.array_equal(heldout[:, 2], heldout[:, 3])
     assert np.array_equal(heldout[:, 3], heldout[:, 5])
+
+
+def test_anchor_constrained_selection_mask_preserves_observed_anchors():
+    observed = np.ones((168, 4), dtype=bool)
+    heldout = sample_anchor_constrained_heldout_mask(observed, ratio=0.1, seed=42, n_chem=1)
+
+    assert heldout.shape == observed.shape
+    assert heldout.any()
+    for feature in range(4):
+        positions = np.flatnonzero(heldout[:, feature])
+        if positions.size:
+            assert positions.min() > 0
+            assert positions.max() < len(observed) - 1
+            assert not heldout[positions.min() - 1, feature]
+            assert not heldout[positions.max() + 1, feature]

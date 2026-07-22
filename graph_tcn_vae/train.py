@@ -24,6 +24,7 @@ from .data import (
     WindowedTimeSeriesDataset,
     chronological_split_index,
     load_frame,
+    sample_anchor_constrained_heldout_mask,
     sample_dynamic_heldout_mask,
     transform_target_values,
 )
@@ -434,11 +435,31 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "random_point_drop_prob": config.dynamic_random_point_drop_prob,
         "n_chem": n_chem,
     }
-    val_selection_mask = sample_dynamic_heldout_mask(
-        ~np.isnan(val_target),
-        {**dynamic_mask_config, "ensure_nonempty": True},
-        seed=config.selection_val_seed,
-    ) if len(val_target) else None
+    if len(val_target):
+        if config.selection_mask_mode == "anchor_constrained":
+            if config.shared_full_heldout_mask:
+                selection_full = sample_anchor_constrained_heldout_mask(
+                    ~np.isnan(target_model_space),
+                    ratio=config.selection_mask_ratio,
+                    seed=config.selection_val_seed,
+                    n_chem=n_chem,
+                )
+                val_selection_mask = selection_full[split_idx:]
+            else:
+                val_selection_mask = sample_anchor_constrained_heldout_mask(
+                    ~np.isnan(val_target),
+                    ratio=config.selection_mask_ratio,
+                    seed=config.selection_val_seed,
+                    n_chem=n_chem,
+                )
+        else:
+            val_selection_mask = sample_dynamic_heldout_mask(
+                ~np.isnan(val_target),
+                {**dynamic_mask_config, "ensure_nonempty": True},
+                seed=config.selection_val_seed,
+            )
+    else:
+        val_selection_mask = None
     if len(val_target) and val_selection_mask.sum() == 0:
         raise ValueError("Validation split has no observed target positions for selection-HO validation")
 
@@ -505,7 +526,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "aux_missing_mode": "mask_channel" if config.aux_mask_channel else "legacy_zero_fill",
         "aux_mask_channel": config.aux_mask_channel,
         "target_transform": config.target_transform,
-        "selection_mask_protocol": "fixed_dynamic_ho",
+        "selection_mask_protocol": f"fixed_{config.selection_mask_mode}_ho",
         "schema": {
             "target_cols": list(config.target_cols),
             "aux_value_cols": list(config.aux_cols),
