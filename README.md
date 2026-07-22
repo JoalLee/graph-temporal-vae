@@ -1,8 +1,8 @@
 # Graph-Temporal VAE
 
-Graph-Temporal VAE provides model architecture implementations for graph-enhanced temporal variational autoencoders designed for uncertainty-aware time-series imputation.
+Graph-Temporal VAE provides model architecture implementations for graph-enhanced temporal variational autoencoders designed for uncertainty-aware time-series imputation, plus a reference CLI for training on your own CSV data and running imputation/uncertainty inference against it.
 
-It is a lightweight public package focused on reusable model code. Full research experiments, datasets, checkpoints, analysis notebooks, and thesis materials are intentionally not included.
+It is a lightweight public package. Full research experiments, private datasets, trained checkpoints, analysis notebooks, and thesis materials are intentionally not included — see [What Is Not Included](#what-is-not-included).
 
 ## Why This Matters
 
@@ -99,16 +99,62 @@ For imputation models:
 - `logvar`: `[batch, latent_dim]`
 - `graph_attention`: learned feature relationship tensor when available.
 
+## Training and Inference
+
+The `graph-tcn-vae` command trains `ImputationVAE_Graph` on your own CSV data and saves a single self-contained checkpoint **bundle** (weights + model kwargs + column names + the training-fit normalization stats), so later `impute` runs need nothing else to reproduce the exact model.
+
+Column selection is name-based: point `--target-cols` at the variables you want imputed/predicted and `--aux-cols` at conditioning variables (meteorology, engineered time features, etc.). Multiple `--csv` paths are outer-joined on `--timestamp-col`, so co-located instruments can live in separate files.
+
+```bash
+graph-tcn-vae train \
+  --csv path/to/data.csv \
+  --timestamp-col time \
+  --target-cols species_a,species_b,species_c \
+  --aux-cols wind_speed,wind_dir,temperature \
+  --window-size 48 --stride 24 \
+  --epochs 200 \
+  -o checkpoints/run1.pt
+
+graph-tcn-vae impute \
+  --bundle checkpoints/run1.pt \
+  --csv path/to/new_data.csv \
+  -o imputed.csv
+```
+
+`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with the raw observed value where available, plus `imputed_mean`, `imputed_std`, and a 5–95% predictive interval (`q05`/`q95`) from `compute_uncertainty`. Observed points are restored verbatim with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use sample-level overlap-add with a trapezoidal position envelope, so quantiles and cross-window disagreement are retained instead of averaging per-window quantiles.
+
+When auxiliary columns are configured, the CLI automatically appends one observedness channel per auxiliary column to `cond`. A missing auxiliary value is therefore represented as `(zero-filled value, mask=0)` and is not silently treated as a real standardized zero. The target `mask` remains target-only.
+
+Any `ImputationVAE_Graph` constructor flag (see `graph_tcn_vae/model_graph_uq.py`) can be set via `--model-config path/to/config.json`, which takes priority over the convenience flags (`--latent-dim`, `--hidden-dims`, `--encoder-layers`, `--decoder-layers`, `--n-graph-heads`, `--n-chem`, `--heteroscedastic`).
+
+The same functionality is available programmatically:
+
+```python
+from graph_tcn_vae import TrainConfig, train_from_config, load_bundle, impute
+
+config = TrainConfig(
+    csv=["path/to/data.csv"],
+    timestamp_col="time",
+    target_cols=["species_a", "species_b"],
+    aux_cols=["wind_speed", "temperature"],
+)
+train_from_config(config, "checkpoints/run1.pt")
+
+impute(["path/to/new_data.csv"], "checkpoints/run1.pt", "imputed.csv")
+```
+
+Training uses dynamic contiguous held-out masking on observed target values. The validation mask is generated once from the same protocol and then held fixed for early stopping, preventing epoch-to-epoch mask noise from changing the selection target. `--validation-metric ho_nll` is the calibration-aware default; `ho_mse` selects directly on point-estimation error, while `ho_crps` is available with configurable MC sample count and evaluation interval. This is still a general-purpose reference implementation, not a reproduction of any specific thesis training run; W&B logging and extensive gate/attention diagnostics remain research-specific.
+
 ## What Is Not Included
 
 This public package does not include:
 
-- training pipelines from the research workspace,
-- experiment scripts,
+- the private research workspace's experiment scripts, ablation harnesses, or W&B/diagnostic instrumentation,
 - private or licensed datasets,
-- generated results,
-- model checkpoints,
+- trained model checkpoints or generated results,
 - thesis drafts or analysis notebooks.
+
+The training/inference CLI above is a general-purpose reference pipeline shipped with this package; it is separate from the above.
 
 ## Development Check
 

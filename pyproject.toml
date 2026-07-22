@@ -22,12 +22,17 @@ keywords = [
 dependencies = [
     "numpy>=1.24",
     "torch>=2.1",
+    "pandas>=2.0",
+    "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
 ]
+
+[project.scripts]
+graph-tcn-vae = "graph_tcn_vae.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["graph_tcn_vae*"]
