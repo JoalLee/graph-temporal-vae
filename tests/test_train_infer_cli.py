@@ -1,10 +1,13 @@
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from graph_tcn_vae.cli import main as cli_main
 from graph_tcn_vae.config import TrainConfig
+from graph_tcn_vae.data import sample_dynamic_heldout_mask
 from graph_tcn_vae.infer import aggregate_window_samples, load_bundle
+from graph_tcn_vae.train import Trainer, vae_loss
 
 
 def _write_synthetic_csv(path, n=200, seed=0):
@@ -121,3 +124,84 @@ def test_heldout_validation_metric_accepts_mse():
         validation_metric="ho_mse",
     )
     assert config.validation_metric == "ho_mse"
+
+
+def test_26e_training_controls_are_serializable():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        kl_warmup_ratio=0.1,
+        kl_strategy="cosine",
+        use_amp=True,
+        amp_dtype="auto",
+        prior_type="student_t",
+        use_student_t_nll=True,
+        loss_normalization="window_feature_sum",
+        aux_mask_channel=False,
+    )
+
+    saved = config.to_dict()
+    assert saved["kl_warmup_ratio"] == 0.1
+    assert saved["kl_strategy"] == "cosine"
+    assert saved["use_amp"] is True
+    assert saved["prior_type"] == "student_t"
+    assert saved["use_student_t_nll"] is True
+    assert saved["loss_normalization"] == "window_feature_sum"
+    assert saved["aux_mask_channel"] is False
+
+
+def test_student_t_window_feature_loss_uses_experiment_normalization():
+    target = torch.tensor([[[1.0], [3.0]]])
+    recon_mean = torch.zeros_like(target)
+    recon_logvar = torch.zeros_like(target)
+    obs_mask = torch.ones_like(target)
+    mu = torch.zeros((1, 1))
+    logvar = torch.zeros((1, 1))
+
+    loss, recon, kl = vae_loss(
+        recon_mean,
+        recon_logvar,
+        target,
+        obs_mask,
+        mu,
+        logvar,
+        beta=0.0,
+        prior_type="student_t",
+        use_student_t_nll=True,
+        loss_normalization="window_feature_sum",
+        n_chem=0,
+    )
+
+    df = torch.tensor(3.0)
+    variance = torch.tensor(1.0)
+    sigma_sq = variance * (df - 2.0) / df
+    const = torch.lgamma((df + 1.0) / 2.0) - torch.lgamma(df / 2.0) - 0.5 * torch.log(df * torch.pi)
+    point_nll = -const + 0.5 * torch.log(sigma_sq) + 2.0 * torch.log1p(target.square() / (df * sigma_sq))
+    expected = point_nll.sum()
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert recon.item() == pytest.approx(expected.item())
+    assert kl.item() == pytest.approx(0.0)
+
+
+def test_legacy_dynamic_mask_matches_research_modal_pattern():
+    observed = np.ones((168, 6), dtype=bool)
+    observed[0, 0] = False
+    heldout = sample_dynamic_heldout_mask(
+        observed,
+        {
+            "mode": "legacy",
+            "n_chem": 2,
+            "legacy_chem_blocks": 8,
+            "legacy_psd_blocks": 6,
+            "random_point_drop_prob": 0.0,
+        },
+        seed=42,
+    )
+
+    assert heldout.shape == observed.shape
+    assert not heldout[0, 0]
+    # PSD-like targets are masked as shared time blocks, not independently.
+    assert np.array_equal(heldout[:, 2], heldout[:, 3])
+    assert np.array_equal(heldout[:, 3], heldout[:, 5])

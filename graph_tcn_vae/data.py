@@ -199,6 +199,34 @@ def sample_dynamic_heldout_mask(observed_mask, config=None, seed=0, rng=None):
     min_duration = max(1, int(config.get("min_duration", 3)))
     max_duration = max(min_duration, int(config.get("max_duration", 168)))
     n_chem = min(max(0, int(config.get("n_chem", 0))), n_features)
+    if config.get("mode", "block") == "legacy":
+        heldout = np.zeros_like(observed_mask, dtype=bool)
+        n_psd = n_features - n_chem
+        max_psd_blocks = max(0, int(config.get("legacy_psd_blocks", 6)))
+        max_chem_blocks = max(0, int(config.get("legacy_chem_blocks", 8)))
+        psd_max_len = max(1, int(window_size * 0.15))
+        chem_max_len = max(1, int(window_size * 0.10))
+
+        if n_psd > 0:
+            for _ in range(max_psd_blocks):
+                start = int(rng.integers(0, max(1, window_size)))
+                length = int(rng.integers(1, psd_max_len + 1))
+                end = min(window_size, start + length)
+                heldout[start:end, n_chem:] |= observed_mask[start:end, n_chem:]
+
+        if n_chem > 0:
+            for _ in range(max_chem_blocks):
+                start = int(rng.integers(0, max(1, window_size)))
+                length = int(rng.integers(1, chem_max_len + 1))
+                end = min(window_size, start + length)
+                feature = int(rng.integers(0, n_chem))
+                heldout[start:end, feature] |= observed_mask[start:end, feature]
+
+        random_prob = float(config.get("random_point_drop_prob", 0.04))
+        if random_prob > 0:
+            heldout |= (rng.random(observed_mask.shape) < random_prob) & observed_mask
+        return heldout
+
     chem_blocks = max(1, int(config.get("chem_blocks", 1)))
     psd_blocks = max(1, int(config.get("psd_blocks", 1)))
     expected_block_fraction = max(mean_duration / max(window_size, 1), 1e-6)

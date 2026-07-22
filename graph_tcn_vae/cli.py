@@ -28,7 +28,11 @@ def build_parser():
     train_p.add_argument("--batch-size", type=int, default=32)
     train_p.add_argument("--epochs", type=int, default=100)
     train_p.add_argument("--lr", type=float, default=1e-3)
+    train_p.add_argument("--lr-min", type=float, default=1e-6)
+    train_p.add_argument("--weight-decay", type=float, default=0.0)
     train_p.add_argument("--patience", type=int, default=15)
+    train_p.add_argument("--train-loader-num-workers", type=int, default=0)
+    train_p.add_argument("--val-loader-num-workers", type=int, default=0)
     train_p.add_argument("--denoise-prob", type=float, default=0.0,
                          help="Optional extra random point-drop probability; dynamic HO masking is always enabled.")
     train_p.add_argument("--dynamic-mask-target-ratio", type=float, default=0.10)
@@ -38,6 +42,8 @@ def build_parser():
     train_p.add_argument("--dynamic-mask-max-duration", type=int, default=168)
     train_p.add_argument("--dynamic-mask-chem-blocks", type=int, default=1)
     train_p.add_argument("--dynamic-mask-psd-blocks", type=int, default=1)
+    train_p.add_argument("--dynamic-masking-mode", choices=["block", "legacy"], default="block")
+    train_p.add_argument("--dynamic-random-point-drop-prob", type=float, default=0.0)
     train_p.add_argument("--selection-val-seed", type=int, default=100003)
     train_p.add_argument(
         "--validation-metric", choices=["ho_nll", "ho_mse", "ho_crps"], default="ho_nll",
@@ -45,6 +51,17 @@ def build_parser():
     )
     train_p.add_argument("--val-crps-mc-samples", type=int, default=20)
     train_p.add_argument("--val-crps-every-n-epochs", type=int, default=1)
+    train_p.add_argument("--val-crps-dist-type", choices=["gaussian", "student_t"], default="gaussian")
+    train_p.add_argument("--val-mc-batch-size", type=int, default=1)
+    train_p.add_argument("--kl-warmup-ratio", type=float, default=None)
+    train_p.add_argument("--kl-strategy", choices=["linear", "cosine", "cyclical"], default="cosine")
+    train_p.add_argument("--use-amp", action="store_true")
+    train_p.add_argument("--amp-dtype", choices=["auto", "bfloat16", "float16", "float32"], default="auto")
+    train_p.add_argument("--prior-type", choices=["gaussian", "laplace", "student_t"], default="gaussian")
+    train_p.add_argument("--use-student-t-nll", action="store_true")
+    train_p.add_argument("--loss-normalization", choices=["observed_mean", "window_feature_sum"], default="observed_mean")
+    train_p.add_argument("--aux-mask-channel", dest="aux_mask_channel", action="store_true", default=True)
+    train_p.add_argument("--no-aux-mask-channel", dest="aux_mask_channel", action="store_false")
     train_p.add_argument("--seed", type=int, default=0)
 
     train_p.add_argument("--n-chem", type=int, default=0, help="First N target columns treated as the Chem modality.")
@@ -111,7 +128,11 @@ def main(argv=None):
             batch_size=args.batch_size,
             epochs=args.epochs,
             lr=args.lr,
+            lr_min=args.lr_min,
+            weight_decay=args.weight_decay,
             patience=args.patience,
+            train_loader_num_workers=args.train_loader_num_workers,
+            val_loader_num_workers=args.val_loader_num_workers,
             denoise_prob=args.denoise_prob,
             dynamic_mask_target_ratio=args.dynamic_mask_target_ratio,
             dynamic_mask_mean_duration=args.dynamic_mask_mean_duration,
@@ -120,10 +141,22 @@ def main(argv=None):
             dynamic_mask_max_duration=args.dynamic_mask_max_duration,
             dynamic_mask_chem_blocks=args.dynamic_mask_chem_blocks,
             dynamic_mask_psd_blocks=args.dynamic_mask_psd_blocks,
+            dynamic_masking_mode=args.dynamic_masking_mode,
+            dynamic_random_point_drop_prob=args.dynamic_random_point_drop_prob,
             selection_val_seed=args.selection_val_seed,
             validation_metric=args.validation_metric,
             val_crps_mc_samples=args.val_crps_mc_samples,
             val_crps_every_n_epochs=args.val_crps_every_n_epochs,
+            val_crps_dist_type=args.val_crps_dist_type,
+            val_mc_batch_size=args.val_mc_batch_size,
+            kl_warmup_ratio=args.kl_warmup_ratio,
+            kl_strategy=args.kl_strategy,
+            use_amp=args.use_amp,
+            amp_dtype=args.amp_dtype,
+            prior_type=args.prior_type,
+            use_student_t_nll=args.use_student_t_nll,
+            loss_normalization=args.loss_normalization,
+            aux_mask_channel=args.aux_mask_channel,
             seed=args.seed,
             model_kwargs=_model_kwargs_from_args(args),
         )
