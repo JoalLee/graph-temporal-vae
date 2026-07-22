@@ -24,6 +24,7 @@ from .data import (
     chronological_split_index,
     load_frame,
     sample_dynamic_heldout_mask,
+    transform_target_values,
 )
 from .model_graph_uq import ImputationVAE_Graph
 from .utils import KLAnnealingScheduler, LRWarmupCosineScheduler, setup_device
@@ -214,6 +215,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
     frame = load_frame(config.csv, config.timestamp_col, config.target_cols, config.aux_cols)
 
     target_raw = frame[config.target_cols].to_numpy(dtype=np.float64)
+    target_model_space = transform_target_values(target_raw, config.target_transform)
     aux_raw = (
         frame[config.aux_cols].to_numpy(dtype=np.float64)
         if config.aux_cols
@@ -221,7 +223,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
     )
 
     split_idx = chronological_split_index(len(frame), config.val_fraction)
-    train_target, val_target = target_raw[:split_idx], target_raw[split_idx:]
+    train_target, val_target = target_model_space[:split_idx], target_model_space[split_idx:]
     train_aux, val_aux = aux_raw[:split_idx], aux_raw[split_idx:]
     train_aux_mask = ~np.isnan(train_aux)
     val_aux_mask = ~np.isnan(val_aux)
@@ -307,6 +309,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "window_size": config.window_size,
         "aux_missing_mode": "mask_channel",
         "aux_mask_channel": True,
+        "target_transform": config.target_transform,
         "selection_mask_protocol": "fixed_dynamic_ho",
         "schema": {
             "target_cols": list(config.target_cols),

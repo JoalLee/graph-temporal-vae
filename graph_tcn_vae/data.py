@@ -14,6 +14,40 @@ import torch
 from torch.utils.data import Dataset
 
 
+SUPPORTED_TARGET_TRANSFORMS = {"none", "log1p"}
+
+
+def transform_target_values(array, transform="none"):
+    """Transform target values before fitting/scaling the model input."""
+    if transform not in SUPPORTED_TARGET_TRANSFORMS:
+        raise ValueError(
+            f"Unsupported target transform {transform!r}; "
+            f"choose from {sorted(SUPPORTED_TARGET_TRANSFORMS)}"
+        )
+    values = np.asarray(array, dtype=np.float64)
+    if transform == "none":
+        return values.copy()
+    finite = np.isfinite(values)
+    if np.any(values[finite] < 0):
+        raise ValueError("target_transform='log1p' requires non-negative finite target values")
+    out = values.copy()
+    out[finite] = np.log1p(out[finite])
+    return out
+
+
+def inverse_target_values(array, transform="none"):
+    """Map model-space target values back to the physical output scale."""
+    if transform not in SUPPORTED_TARGET_TRANSFORMS:
+        raise ValueError(
+            f"Unsupported target transform {transform!r}; "
+            f"choose from {sorted(SUPPORTED_TARGET_TRANSFORMS)}"
+        )
+    values = np.asarray(array, dtype=np.float64)
+    if transform == "none":
+        return values.copy()
+    return np.expm1(values).clip(min=0.0)
+
+
 class NaNAwareStandardScaler:
     """Per-feature z-score scaler that ignores NaNs when fitting.
 

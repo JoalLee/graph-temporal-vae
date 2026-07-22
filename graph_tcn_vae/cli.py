@@ -20,6 +20,8 @@ def build_parser():
     train_p.add_argument("--timestamp-col", required=True)
     train_p.add_argument("--target-cols", required=True, help="Comma-separated columns to impute/predict.")
     train_p.add_argument("--aux-cols", default="", help="Comma-separated conditioning columns (met, time, etc.).")
+    train_p.add_argument("--target-transform", choices=["none", "log1p"], default="none",
+                         help="Transform targets before scaling/training; log1p matches the research preprocessing.")
     train_p.add_argument("--window-size", type=int, default=48)
     train_p.add_argument("--stride", type=int, default=24)
     train_p.add_argument("--val-fraction", type=float, default=0.15)
@@ -102,6 +104,7 @@ def main(argv=None):
             timestamp_col=args.timestamp_col,
             target_cols=_csv_list(args.target_cols),
             aux_cols=_csv_list(args.aux_cols),
+            target_transform=args.target_transform,
             window_size=args.window_size,
             stride=args.stride,
             val_fraction=args.val_fraction,

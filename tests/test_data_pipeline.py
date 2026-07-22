@@ -7,7 +7,9 @@ from graph_tcn_vae.data import (
     WindowedTimeSeriesDataset,
     chronological_split_index,
     compute_window_starts,
+    inverse_target_values,
     load_frame,
+    transform_target_values,
 )
 
 
@@ -31,6 +33,16 @@ def test_scaler_handles_constant_and_allnan_columns():
     scaler = NaNAwareStandardScaler().fit(array)
     scaled = scaler.transform(array)
     assert np.isfinite(scaled).all()
+
+
+def test_log1p_target_transform_round_trip_and_rejects_negative_values():
+    values = np.array([[0.0, 9.0], [np.nan, 3.0]])
+    transformed = transform_target_values(values, "log1p")
+    assert np.isnan(transformed[1, 0])
+    assert np.allclose(inverse_target_values(transformed, "log1p"), values, equal_nan=True)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        transform_target_values(np.array([[1.0, -0.1]]), "log1p")
 
 
 def test_compute_window_starts_covers_full_series():

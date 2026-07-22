@@ -10,6 +10,7 @@ class TrainConfig:
     timestamp_col: str
     target_cols: List[str]
     aux_cols: List[str] = field(default_factory=list)
+    target_transform: str = "none"
 
     window_size: int = 48
     stride: int = 24
@@ -49,6 +50,8 @@ class TrainConfig:
             self.model_kwargs.pop(derived, None)
         if self.validation_metric not in {"ho_nll", "ho_mse", "ho_crps"}:
             raise ValueError("validation_metric must be 'ho_nll', 'ho_mse', or 'ho_crps'")
+        if self.target_transform not in {"none", "log1p"}:
+            raise ValueError("target_transform must be 'none' or 'log1p'")
         if self.window_size < 1 or self.stride < 1:
             raise ValueError("window_size and stride must be positive")
         if not 0 <= self.val_fraction < 1:

@@ -6,7 +6,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .data import NaNAwareStandardScaler, compute_window_starts, load_frame, make_condition
+from .data import (
+    NaNAwareStandardScaler,
+    compute_window_starts,
+    inverse_target_values,
+    load_frame,
+    make_condition,
+    transform_target_values,
+)
 from .model_graph_uq import ImputationVAE_Graph
 from .utils import setup_device
 
@@ -23,6 +30,8 @@ def _validate_bundle(bundle):
         raise ValueError("Checkpoint bundle must contain at least one target column")
     if bundle["aux_missing_mode"] not in {"legacy_zero_fill", "mask_channel"}:
         raise ValueError(f"Unsupported aux_missing_mode: {bundle['aux_missing_mode']!r}")
+    if bundle.get("target_transform", "none") not in {"none", "log1p"}:
+        raise ValueError(f"Unsupported target_transform: {bundle.get('target_transform')!r}")
     if len(bundle["scaler_target"]["mean"]) != len(bundle["target_cols"]):
         raise ValueError("Target scaler schema does not match target_cols")
     if len(bundle["scaler_aux"]["mean"]) != len(bundle["aux_cols"]):
@@ -42,6 +51,7 @@ def load_bundle(path, device=None):
     bundle.setdefault("bundle_version", 1)
     bundle.setdefault("aux_missing_mode", "legacy_zero_fill")
     bundle.setdefault("aux_mask_channel", bundle["aux_missing_mode"] == "mask_channel")
+    bundle.setdefault("target_transform", bundle.get("config", {}).get("target_transform", "none"))
     _validate_bundle(bundle)
 
     aux_dim = len(bundle["aux_cols"]) * (2 if bundle["aux_mask_channel"] else 1)
@@ -65,6 +75,7 @@ def load_bundle(path, device=None):
         "window_size": bundle["window_size"],
         "aux_missing_mode": bundle["aux_missing_mode"],
         "aux_mask_channel": bundle["aux_mask_channel"],
+        "target_transform": bundle.get("target_transform", "none"),
         "bundle_version": bundle["bundle_version"],
         "schema": bundle.get("schema"),
         "timestamp_col": bundle["config"].get("timestamp_col"),
@@ -201,6 +212,7 @@ def impute(
     scaler_target = bundle["scaler_target"]
     scaler_aux = bundle["scaler_aux"]
     aux_mask_channel = bool(bundle.get("aux_mask_channel", False))
+    target_transform = bundle.get("target_transform", "none")
 
     ts_col = timestamp_col or bundle["timestamp_col"]
     if not ts_col:
@@ -218,10 +230,11 @@ def impute(
         raise ValueError(f"Series length {n} is shorter than window_size={window_size}")
 
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
+    target_model_space = transform_target_values(target_raw, target_transform)
     aux_raw = frame[aux_cols].to_numpy(dtype=np.float64) if aux_cols else np.zeros((n, 0))
     obs_mask_full = (~np.isnan(target_raw)).astype(np.float32)
 
-    target_scaled = np.nan_to_num(scaler_target.transform(target_raw), nan=0.0)
+    target_scaled = np.nan_to_num(scaler_target.transform(target_model_space), nan=0.0)
     aux_scaled = scaler_aux.transform(aux_raw) if aux_cols else aux_raw
     aux_observed = ~np.isnan(aux_raw)
 
@@ -248,7 +261,12 @@ def impute(
                     return_samples=True,
                     mc_batch_size=mc_batch_size,
                 )
-                samples = result[-2].cpu().numpy()  # [MC, batch, window, features]
+                samples_scaled = result[-2].cpu().numpy()  # [MC, batch, window, features]
+                samples_model = (
+                    samples_scaled * scaler_target.std_[None, None, None, :]
+                    + scaler_target.mean_[None, None, None, :]
+                )
+                samples = inverse_target_values(samples_model, target_transform)
                 for i, start in enumerate(batch_starts):
                     yield start, samples[:, i]
 
@@ -257,15 +275,10 @@ def impute(
         position_weights=trapezoid_position_weights(window_size),
         quantiles=(0.05, 0.95),
     )
-    mean_scaled = aggregated["mean"]
-    var_scaled = aggregated["variance"]
-    q05_scaled = aggregated["quantiles"][0.05]
-    q95_scaled = aggregated["quantiles"][0.95]
-
-    mean_out = scaler_target.inverse_transform(mean_scaled)
-    std_out = np.sqrt(var_scaled) * scaler_target.std_
-    q05_out = scaler_target.inverse_transform(q05_scaled)
-    q95_out = scaler_target.inverse_transform(q95_scaled)
+    mean_out = aggregated["mean"]
+    std_out = np.sqrt(np.maximum(aggregated["variance"], 0.0))
+    q05_out = aggregated["quantiles"][0.05]
+    q95_out = aggregated["quantiles"][0.95]
 
     # Restore observed values verbatim; there's no imputation uncertainty there.
     mean_out = np.where(obs_mask_full == 1, target_raw, mean_out)
