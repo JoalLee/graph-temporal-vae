@@ -66,6 +66,10 @@ def build_parser():
     infer_p.add_argument("--timestamp-col", default=None, help="Defaults to the column used at training time.")
     infer_p.add_argument("--stride", type=int, default=None, help="Defaults to window_size // 2.")
     infer_p.add_argument("--n-mc-samples", type=int, default=50)
+    infer_p.add_argument("--inference-batch-size", type=int, default=4,
+                         help="Number of sliding windows per model call.")
+    infer_p.add_argument("--mc-batch-size", type=int, default=1,
+                         help="Number of MC draws replicated per model call.")
     infer_p.add_argument("-o", "--output", required=True)
 
     return parser
@@ -131,6 +135,8 @@ def main(argv=None):
             stride=args.stride,
             n_mc_samples=args.n_mc_samples,
             timestamp_col=args.timestamp_col,
+            inference_batch_size=args.inference_batch_size,
+            mc_batch_size=args.mc_batch_size,
         )
         print(f"wrote imputed output to {args.output}")
 

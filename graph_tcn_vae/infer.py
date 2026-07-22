@@ -173,7 +173,16 @@ def aggregate_window_samples(
     return {"mean": mean, "variance": variance, "quantiles": quantile_values}
 
 
-def impute(csv_paths, bundle, output_csv, stride=None, n_mc_samples=50, timestamp_col=None):
+def impute(
+    csv_paths,
+    bundle,
+    output_csv,
+    stride=None,
+    n_mc_samples=50,
+    timestamp_col=None,
+    inference_batch_size=4,
+    mc_batch_size=1,
+):
     """Impute/predict on new CSVs using a trained checkpoint bundle.
 
     `bundle` may be a path to a checkpoint file or an already-loaded bundle
@@ -199,6 +208,8 @@ def impute(csv_paths, bundle, output_csv, stride=None, n_mc_samples=50, timestam
 
     stride = stride or max(1, window_size // 2)
     stride = min(stride, window_size)
+    if inference_batch_size < 1 or mc_batch_size < 1:
+        raise ValueError("inference_batch_size and mc_batch_size must be positive")
 
     frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
     n = len(frame)
@@ -217,21 +228,29 @@ def impute(csv_paths, bundle, output_csv, stride=None, n_mc_samples=50, timestam
     def iter_window_samples():
         model.eval()
         with torch.no_grad():
-            for start in starts:
-                end = start + window_size
-                mask_win = obs_mask_full[start:end]
-                x_win = target_scaled[start:end] * mask_win
-                cond_win = make_condition(aux_scaled[start:end], aux_observed[start:end], aux_mask_channel)
+            for batch_start in range(0, len(starts), inference_batch_size):
+                batch_starts = starts[batch_start:batch_start + inference_batch_size]
+                masks = np.stack([obs_mask_full[s:s + window_size] for s in batch_starts])
+                xs = np.stack([target_scaled[s:s + window_size] * masks[i] for i, s in enumerate(batch_starts)])
+                conds = np.stack([
+                    make_condition(aux_scaled[s:s + window_size], aux_observed[s:s + window_size], aux_mask_channel)
+                    for s in batch_starts
+                ])
 
-                x_t = torch.from_numpy(x_win).float().unsqueeze(0).to(device)
-                cond_t = torch.from_numpy(cond_win).float().unsqueeze(0).to(device)
-                mask_t = torch.from_numpy(mask_win).float().unsqueeze(0).to(device)
-
+                x_t = torch.from_numpy(xs).float().to(device)
+                cond_t = torch.from_numpy(conds).float().to(device)
+                mask_t = torch.from_numpy(masks).float().to(device)
                 result = model.compute_uncertainty(
-                    x_t, cond_t, mask_t, n_samples=max(2, n_mc_samples), return_samples=True,
+                    x_t,
+                    cond_t,
+                    mask_t,
+                    n_samples=max(2, n_mc_samples),
+                    return_samples=True,
+                    mc_batch_size=mc_batch_size,
                 )
-                samples = result[-2].squeeze(1).cpu().numpy()
-                yield start, samples
+                samples = result[-2].cpu().numpy()  # [MC, batch, window, features]
+                for i, start in enumerate(batch_starts):
+                    yield start, samples[:, i]
 
     aggregated = aggregate_window_samples(
         iter_window_samples(), total_length=n,
