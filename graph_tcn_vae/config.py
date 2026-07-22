@@ -10,7 +10,12 @@ class TrainConfig:
     timestamp_col: str
     target_cols: List[str]
     aux_cols: List[str] = field(default_factory=list)
+    # Transform applied to values read from the CSV before scaling/training.
+    # For an already-log1p-preprocessed experiment CSV, use "none" here.
     target_transform: str = "none"
+    # Transform used to map model-space predictions back to output values.
+    # None keeps backward-compatible behavior: it follows target_transform.
+    target_output_transform: Optional[str] = None
 
     window_size: int = 48
     stride: int = 24
@@ -62,6 +67,9 @@ class TrainConfig:
     use_family_balanced_loss: bool = False
     family_loss_chem_weight: float = 0.5
     family_loss_scale: str = "target_dim"
+    # The 26e reference uses 12x Chem and 1x PSD feature weighting.
+    chem_feature_weight: float = 1.0
+    psd_feature_weight: float = 1.0
     aux_mask_channel: bool = True
     seed: int = 0
 
@@ -80,6 +88,10 @@ class TrainConfig:
             raise ValueError("val_crps_dist_type must be 'gaussian' or 'student_t'")
         if self.target_transform not in {"none", "log1p"}:
             raise ValueError("target_transform must be 'none' or 'log1p'")
+        if self.target_output_transform is None:
+            self.target_output_transform = self.target_transform
+        if self.target_output_transform not in {"none", "log1p"}:
+            raise ValueError("target_output_transform must be 'none' or 'log1p'")
         if self.prior_type not in {"gaussian", "laplace", "student_t"}:
             raise ValueError("prior_type must be 'gaussian', 'laplace', or 'student_t'")
         if self.loss_normalization not in {"observed_mean", "window_feature_sum"}:
@@ -100,6 +112,10 @@ class TrainConfig:
             raise ValueError("window_size and stride must be positive")
         if self.lr_min < 0 or self.weight_decay < 0:
             raise ValueError("lr_min and weight_decay must be non-negative")
+        if self.chem_feature_weight < 0 or self.psd_feature_weight < 0:
+            raise ValueError("feature weights must be non-negative")
+        if self.chem_feature_weight == 0 and self.psd_feature_weight == 0:
+            raise ValueError("at least one feature weight must be positive")
         if self.train_loader_num_workers < 0 or self.val_loader_num_workers < 0:
             raise ValueError("loader worker counts must be non-negative")
         if not 0 <= self.val_fraction < 1:

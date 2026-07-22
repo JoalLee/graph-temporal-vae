@@ -32,6 +32,11 @@ def _validate_bundle(bundle):
         raise ValueError(f"Unsupported aux_missing_mode: {bundle['aux_missing_mode']!r}")
     if bundle.get("target_transform", "none") not in {"none", "log1p"}:
         raise ValueError(f"Unsupported target_transform: {bundle.get('target_transform')!r}")
+    if bundle.get("target_output_transform", "none") not in {"none", "log1p"}:
+        raise ValueError(
+            "Unsupported target_output_transform: "
+            f"{bundle.get('target_output_transform')!r}"
+        )
     if len(bundle["scaler_target"]["mean"]) != len(bundle["target_cols"]):
         raise ValueError("Target scaler schema does not match target_cols")
     if len(bundle["scaler_aux"]["mean"]) != len(bundle["aux_cols"]):
@@ -52,6 +57,10 @@ def load_bundle(path, device=None):
     bundle.setdefault("aux_missing_mode", "legacy_zero_fill")
     bundle.setdefault("aux_mask_channel", bundle["aux_missing_mode"] == "mask_channel")
     bundle.setdefault("target_transform", bundle.get("config", {}).get("target_transform", "none"))
+    bundle.setdefault(
+        "target_output_transform",
+        bundle.get("config", {}).get("target_output_transform", bundle["target_transform"]),
+    )
     _validate_bundle(bundle)
 
     aux_dim = len(bundle["aux_cols"]) * (2 if bundle["aux_mask_channel"] else 1)
@@ -76,6 +85,7 @@ def load_bundle(path, device=None):
         "aux_missing_mode": bundle["aux_missing_mode"],
         "aux_mask_channel": bundle["aux_mask_channel"],
         "target_transform": bundle.get("target_transform", "none"),
+        "target_output_transform": bundle.get("target_output_transform", "none"),
         "bundle_version": bundle["bundle_version"],
         "schema": bundle.get("schema"),
         "timestamp_col": bundle["config"].get("timestamp_col"),
@@ -213,6 +223,7 @@ def impute(
     scaler_aux = bundle["scaler_aux"]
     aux_mask_channel = bool(bundle.get("aux_mask_channel", False))
     target_transform = bundle.get("target_transform", "none")
+    target_output_transform = bundle.get("target_output_transform", target_transform)
 
     ts_col = timestamp_col or bundle["timestamp_col"]
     if not ts_col:
@@ -266,7 +277,7 @@ def impute(
                     samples_scaled * scaler_target.std_[None, None, None, :]
                     + scaler_target.mean_[None, None, None, :]
                 )
-                samples = inverse_target_values(samples_model, target_transform)
+                samples = inverse_target_values(samples_model, target_output_transform)
                 for i, start in enumerate(batch_starts):
                     yield start, samples[:, i]
 
@@ -280,18 +291,22 @@ def impute(
     q05_out = aggregated["quantiles"][0.05]
     q95_out = aggregated["quantiles"][0.95]
 
-    # Restore observed values verbatim; there's no imputation uncertainty there.
-    mean_out = np.where(obs_mask_full == 1, target_raw, mean_out)
+    # Restore observed values in the public/raw output space; there's no
+    # imputation uncertainty there.  The input CSV may already be transformed
+    # (e.g. the 26e artifact stores log1p targets), so target_raw is not
+    # necessarily the physical output value.
+    observed_output = inverse_target_values(target_raw, target_output_transform)
+    mean_out = np.where(obs_mask_full == 1, observed_output, mean_out)
     std_out = np.where(obs_mask_full == 1, 0.0, std_out)
-    q05_out = np.where(obs_mask_full == 1, target_raw, q05_out)
-    q95_out = np.where(obs_mask_full == 1, target_raw, q95_out)
+    q05_out = np.where(obs_mask_full == 1, observed_output, q05_out)
+    q95_out = np.where(obs_mask_full == 1, observed_output, q95_out)
 
     frames = []
     for j, col in enumerate(target_cols):
         frames.append(pd.DataFrame({
             "timestamp": frame.index,
             "feature": col,
-            "observed": target_raw[:, j],
+            "observed": observed_output[:, j],
             "imputed_mean": mean_out[:, j],
             "imputed_std": std_out[:, j],
             "q05": q05_out[:, j],

@@ -62,13 +62,23 @@ def _student_t_nll(recon_mean, recon_logvar, target, var_min=1e-3, var_max=10.0,
 def _reduce_window_feature_loss(point_loss, mask, normalization, n_chem=0,
                                 use_family_balanced_loss=False,
                                 family_loss_chem_weight=0.5,
-                                family_loss_scale="target_dim"):
+                                family_loss_scale="target_dim",
+                                chem_feature_weight=1.0,
+                                psd_feature_weight=1.0):
     mask = mask.float()
+    n_features = point_loss.shape[-1]
+    feature_weights = torch.full(
+        (n_features,), float(psd_feature_weight),
+        device=point_loss.device, dtype=point_loss.dtype,
+    )
+    if n_chem > 0:
+        feature_weights[:min(n_chem, n_features)] = float(chem_feature_weight)
+    weighted_point_loss = point_loss * feature_weights.view(1, 1, -1)
     if normalization == "observed_mean":
-        return (point_loss * mask).sum() / mask.sum().clamp(min=1.0)
+        return (weighted_point_loss * mask).sum() / mask.sum().clamp(min=1.0)
 
     window_size = point_loss.shape[1]
-    loss_per_feature = (point_loss * mask).sum(dim=1)
+    loss_per_feature = (weighted_point_loss * mask).sum(dim=1)
     count_per_feature = mask.sum(dim=1).clamp(min=1.0)
     normalized = loss_per_feature * (window_size / count_per_feature)
     if use_family_balanced_loss and 0 < n_chem < normalized.shape[-1]:
@@ -113,7 +123,8 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
              *, model=None, prior_type="gaussian", use_student_t_nll=False,
              loss_normalization="observed_mean", n_chem=0,
              use_family_balanced_loss=False, family_loss_chem_weight=0.5,
-             family_loss_scale="target_dim", var_min=1e-3, var_max=10.0):
+             family_loss_scale="target_dim", chem_feature_weight=1.0,
+             psd_feature_weight=1.0, var_min=1e-3, var_max=10.0):
     obs_mask = obs_mask.float()
     metric_mask = obs_mask if metric_mask is None else metric_mask.float()
     n_obs = metric_mask.sum().clamp(min=1.0)
@@ -137,6 +148,8 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             use_family_balanced_loss=use_family_balanced_loss,
             family_loss_chem_weight=family_loss_chem_weight,
             family_loss_scale=family_loss_scale,
+            chem_feature_weight=chem_feature_weight,
+            psd_feature_weight=psd_feature_weight,
         )
     else:
         recon = _reduce_window_feature_loss(
@@ -147,6 +160,8 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             use_family_balanced_loss=use_family_balanced_loss,
             family_loss_chem_weight=family_loss_chem_weight,
             family_loss_scale=family_loss_scale,
+            chem_feature_weight=chem_feature_weight,
+            psd_feature_weight=psd_feature_weight,
         )
 
     kl = _latent_kl_loss(mu, logvar, model=model, prior_type=prior_type)
@@ -273,6 +288,8 @@ class Trainer:
                         use_family_balanced_loss=self.config.use_family_balanced_loss,
                         family_loss_chem_weight=self.config.family_loss_chem_weight,
                         family_loss_scale=self.config.family_loss_scale,
+                        chem_feature_weight=self.config.chem_feature_weight,
+                        psd_feature_weight=self.config.psd_feature_weight,
                     )
 
                 if train:
@@ -526,6 +543,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "aux_missing_mode": "mask_channel" if config.aux_mask_channel else "legacy_zero_fill",
         "aux_mask_channel": config.aux_mask_channel,
         "target_transform": config.target_transform,
+        "target_output_transform": config.target_output_transform,
         "selection_mask_protocol": f"fixed_{config.selection_mask_mode}_ho",
         "schema": {
             "target_cols": list(config.target_cols),

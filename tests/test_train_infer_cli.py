@@ -7,7 +7,7 @@ from graph_tcn_vae.cli import main as cli_main
 from graph_tcn_vae.config import TrainConfig
 from graph_tcn_vae.data import sample_anchor_constrained_heldout_mask, sample_dynamic_heldout_mask
 from graph_tcn_vae.infer import aggregate_window_samples, load_bundle
-from graph_tcn_vae.train import Trainer, vae_loss
+from graph_tcn_vae.train import Trainer, train_from_config, vae_loss
 
 
 def _write_synthetic_csv(path, n=200, seed=0):
@@ -139,6 +139,9 @@ def test_26e_training_controls_are_serializable():
         use_student_t_nll=True,
         loss_normalization="window_feature_sum",
         aux_mask_channel=False,
+        target_output_transform="log1p",
+        chem_feature_weight=12.0,
+        psd_feature_weight=1.0,
     )
 
     saved = config.to_dict()
@@ -149,6 +152,86 @@ def test_26e_training_controls_are_serializable():
     assert saved["use_student_t_nll"] is True
     assert saved["loss_normalization"] == "window_feature_sum"
     assert saved["aux_mask_channel"] is False
+    assert saved["target_output_transform"] == "log1p"
+    assert saved["chem_feature_weight"] == 12.0
+    assert saved["psd_feature_weight"] == 1.0
+
+
+def test_pretransformed_input_is_inverted_once_at_public_output(tmp_path):
+    csv_path = tmp_path / "pretransformed.csv"
+    raw = _write_synthetic_csv(csv_path, n=80)
+    expected_raw = raw[["target_a", "target_b"]].clip(lower=0.0)
+    raw[["target_a", "target_b"]] = np.log1p(expected_raw)
+    raw.to_csv(csv_path, index=False)
+
+    config = TrainConfig(
+        csv=[str(csv_path)],
+        timestamp_col="time",
+        target_cols=["target_a", "target_b"],
+        aux_cols=["ws", "at"],
+        target_transform="none",
+        target_output_transform="log1p",
+        window_size=16,
+        stride=8,
+        val_fraction=0.2,
+        batch_size=4,
+        epochs=1,
+        patience=1,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8, 8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    bundle_path = tmp_path / "bundle.pt"
+    train_from_config(config, str(bundle_path))
+    bundle = load_bundle(bundle_path)
+    assert bundle["target_transform"] == "none"
+    assert bundle["target_output_transform"] == "log1p"
+
+    output_path = tmp_path / "output.csv"
+    cli_main([
+        "impute",
+        "--bundle", str(bundle_path),
+        "--csv", str(csv_path),
+        "--stride", "8",
+        "--n-mc-samples", "3",
+        "-o", str(output_path),
+    ])
+    result = pd.read_csv(output_path)
+    target_a = result[result["feature"] == "target_a"].reset_index(drop=True)
+    expected_observed = expected_raw["target_a"].to_numpy()
+    assert np.allclose(
+        target_a.loc[:49, "observed"], expected_observed[:50], equal_nan=True
+    )
+    assert np.allclose(target_a.loc[:49, "imputed_mean"], expected_observed[:50])
+
+
+def test_feature_weights_are_applied_before_window_reduction():
+    target = torch.ones((1, 1, 2))
+    recon_mean = torch.zeros_like(target)
+    obs_mask = torch.ones_like(target)
+    mu = torch.zeros((1, 1))
+    logvar = torch.zeros((1, 1))
+
+    loss, recon, _ = vae_loss(
+        recon_mean,
+        None,
+        target,
+        obs_mask,
+        mu,
+        logvar,
+        beta=0.0,
+        loss_normalization="window_feature_sum",
+        n_chem=1,
+        chem_feature_weight=12.0,
+        psd_feature_weight=1.0,
+    )
+
+    assert loss.item() == pytest.approx(13.0)
+    assert recon.item() == pytest.approx(13.0)
 
 
 def test_student_t_window_feature_loss_uses_experiment_normalization():

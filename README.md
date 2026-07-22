@@ -121,7 +121,21 @@ graph-tcn-vae impute \
   -o imputed.csv
 ```
 
-`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with the raw observed value where available, plus `imputed_mean`, `imputed_std`, and a 5–95% predictive interval (`q05`/`q95`) from `compute_uncertainty`. Observed points are restored verbatim with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use sample-level overlap-add with a trapezoidal position envelope, so quantiles and cross-window disagreement are retained instead of averaging per-window quantiles.
+`--target-transform` describes the values in the input CSV: `log1p` applies one log1p transform before scaling/training, while `none` leaves the CSV values unchanged. `--target-output-transform` describes the public output scale and defaults to `--target-transform`. This separation is important when the input CSV is already log1p-preprocessed, as in the 26e experiment artifact:
+
+```bash
+graph-tcn-vae train \
+  --csv experiment_input_log1p.csv \
+  --timestamp-col time \
+  --target-cols species_a,species_b \
+  --target-transform none \
+  --target-output-transform log1p \
+  -o checkpoints/pretransformed_run.pt
+```
+
+`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with the observed value in the configured output scale, plus `imputed_mean`, `imputed_std`, and a 5–95% predictive interval (`q05`/`q95`) from `compute_uncertainty`. Observed points are restored in that output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use sample-level overlap-add with a trapezoidal position envelope, so quantiles and cross-window disagreement are retained instead of averaging per-window quantiles.
+
+For the 26e Chem/PSD weighting protocol, set `--n-chem 32 --chem-feature-weight 12 --psd-feature-weight 1`. The defaults are 1/1 for a general dataset.
 
 When auxiliary columns are configured, the CLI automatically appends one observedness channel per auxiliary column to `cond`. A missing auxiliary value is therefore represented as `(zero-filled value, mask=0)` and is not silently treated as a real standardized zero. The target `mask` remains target-only.
 

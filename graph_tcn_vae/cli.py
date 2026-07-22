@@ -22,6 +22,11 @@ def build_parser():
     train_p.add_argument("--aux-cols", default="", help="Comma-separated conditioning columns (met, time, etc.).")
     train_p.add_argument("--target-transform", choices=["none", "log1p"], default="none",
                          help="Transform targets before scaling/training; log1p matches the research preprocessing.")
+    train_p.add_argument(
+        "--target-output-transform", choices=["none", "log1p"], default=None,
+        help="Inverse transform for output values; defaults to --target-transform. "
+             "Use log1p when the input CSV is already log1p-transformed.",
+    )
     train_p.add_argument("--window-size", type=int, default=48)
     train_p.add_argument("--stride", type=int, default=24)
     train_p.add_argument("--val-fraction", type=float, default=0.15)
@@ -63,6 +68,8 @@ def build_parser():
     train_p.add_argument("--prior-type", choices=["gaussian", "laplace", "student_t"], default="gaussian")
     train_p.add_argument("--use-student-t-nll", action="store_true")
     train_p.add_argument("--loss-normalization", choices=["observed_mean", "window_feature_sum"], default="observed_mean")
+    train_p.add_argument("--chem-feature-weight", type=float, default=1.0)
+    train_p.add_argument("--psd-feature-weight", type=float, default=1.0)
     train_p.add_argument("--aux-mask-channel", dest="aux_mask_channel", action="store_true", default=True)
     train_p.add_argument("--no-aux-mask-channel", dest="aux_mask_channel", action="store_false")
     train_p.add_argument("--seed", type=int, default=0)
@@ -125,6 +132,7 @@ def main(argv=None):
             target_cols=_csv_list(args.target_cols),
             aux_cols=_csv_list(args.aux_cols),
             target_transform=args.target_transform,
+            target_output_transform=args.target_output_transform,
             window_size=args.window_size,
             stride=args.stride,
             val_fraction=args.val_fraction,
@@ -162,6 +170,8 @@ def main(argv=None):
             prior_type=args.prior_type,
             use_student_t_nll=args.use_student_t_nll,
             loss_normalization=args.loss_normalization,
+            chem_feature_weight=args.chem_feature_weight,
+            psd_feature_weight=args.psd_feature_weight,
             aux_mask_channel=args.aux_mask_channel,
             seed=args.seed,
             model_kwargs=_model_kwargs_from_args(args),
