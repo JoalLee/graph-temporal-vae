@@ -1,3 +1,8 @@
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -95,6 +100,55 @@ def test_train_then_impute_round_trip(tmp_path):
     assert gap_rows["observed"].isna().all()
     assert np.isfinite(gap_rows["imputed_mean"]).all()
     assert (gap_rows["imputed_std"] > 0).all()
+
+
+def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
+    csv_path = tmp_path / "synthetic.csv"
+    _write_synthetic_csv(csv_path)
+    bundle_path = tmp_path / "bundle.pt"
+
+    cli_main([
+        "train",
+        "--csv", str(csv_path),
+        "--timestamp-col", "time",
+        "--target-cols", "target_a,target_b",
+        "--aux-cols", "ws,at",
+        "--window-size", "16",
+        "--stride", "8",
+        "--val-fraction", "0.2",
+        "--batch-size", "4",
+        "--epochs", "2",
+        "--patience", "2",
+        "--latent-dim", "4",
+        "--hidden-dims", "8,8",
+        "--encoder-layers", "1",
+        "--decoder-layers", "1",
+        "--n-graph-heads", "1",
+        "-o", str(bundle_path),
+    ])
+
+    output_path = tmp_path / "heldout_metrics.json"
+    script = Path(__file__).resolve().parents[1] / "examples" / "heldout_eval.py"
+    proc = subprocess.run(
+        [
+            sys.executable, str(script),
+            "--bundle", str(bundle_path),
+            "--csv", str(csv_path),
+            "--n-chem", "1",
+            "--n-mc-samples", "3",
+            "--stride", "8",
+            "-o", str(output_path),
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    results = json.loads(output_path.read_text())
+    for group in ("chem", "psd"):
+        assert f"{group}_heldout_n" in results
+        assert results[f"{group}_heldout_n"] > 0
+        assert np.isfinite(results[f"{group}_heldout_mae"])
+        assert 0.0 <= results[f"{group}_heldout_picp95"] <= 1.0
 
 
 def test_sample_level_overlap_aggregation_preserves_cross_window_mixture():

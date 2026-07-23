@@ -29,7 +29,7 @@ from .data import (
     transform_target_values,
 )
 from .model_graph_uq import ImputationVAE_Graph
-from .utils import KLAnnealingScheduler, LRWarmupCosineScheduler, setup_device
+from .utils import KLAnnealingScheduler, LRWarmupCosineScheduler, is_interactive, setup_device
 
 
 def _seed_window_worker(_worker_id):
@@ -278,7 +278,10 @@ class Trainer:
         n_batches = 0
 
         with torch.set_grad_enabled(train):
-            for batch in tqdm(loader, desc=f"{'train' if train else 'train'} epoch {epoch + 1}", leave=False):
+            # _run_epoch is only ever called with train=True (validation goes
+            # through _run_validation instead); per-batch bars are only worth
+            # drawing on a live terminal -- see utils.is_interactive.
+            for batch in tqdm(loader, desc=f"train epoch {epoch + 1}", leave=False, disable=not is_interactive()):
                 input_x = batch["input_x"].to(self.device)
                 cond = batch["cond"].to(self.device)
                 input_mask = batch["input_mask"].to(self.device)
@@ -340,7 +343,7 @@ class Trainer:
         )
 
         with torch.no_grad():
-            for batch in tqdm(loader, desc=f"val epoch {epoch + 1}", leave=False):
+            for batch in tqdm(loader, desc=f"val epoch {epoch + 1}", leave=False, disable=not is_interactive()):
                 input_x = batch["input_x"].to(self.device)
                 cond = batch["cond"].to(self.device)
                 input_mask = batch["input_mask"].to(self.device)
@@ -384,13 +387,21 @@ class Trainer:
         best_state = None
         epochs_without_improvement = 0
 
-        for epoch in range(self.config.epochs):
+        # Outer, whole-run progress bar (epoch X/N, ETA). Only drawn on a
+        # live terminal; in a redirected log (nohup, CI) it's a no-op and the
+        # per-epoch tqdm.write() lines below are the only output, one clean
+        # line per epoch instead of a wall of `\r` fragments.
+        epoch_bar = tqdm(
+            range(self.config.epochs), desc="training", disable=not is_interactive(), dynamic_ncols=True
+        )
+        for epoch in epoch_bar:
             in_warmup = epoch < self.lr_scheduler.warmup_epochs
             # Original behavior: cosine scheduler runs every epoch. Adaptive
             # mode: warmup/cosine first, then plateau scheduler post-warmup.
             if not self.use_adaptive_lr or in_warmup:
                 self.lr_scheduler.step(epoch)
             train_loss = self._run_epoch(self.train_loader, epoch, train=True)
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             if self.val_loader is not None:
                 val_metrics = self._run_validation(self.val_loader, epoch)
@@ -399,11 +410,15 @@ class Trainer:
                 # count skipped epochs against patience.
                 if metric is None:
                     metric = None
-                print(
+                tqdm.write(
                     f"epoch {epoch + 1}/{self.config.epochs}  train_loss={train_loss:.4f} "
                     f"val_ho_nll={val_metrics['ho_nll']:.4f} "
                     f"val_ho_mse={val_metrics['ho_mse']:.4f} "
-                    f"val_ho_crps={val_metrics['ho_crps'] if val_metrics['ho_crps'] is not None else 'skipped'}"
+                    f"val_ho_crps={val_metrics['ho_crps'] if val_metrics['ho_crps'] is not None else 'skipped'} "
+                    f"lr={current_lr:.2e}"
+                )
+                epoch_bar.set_postfix(
+                    loss=f"{train_loss:.3f}", ho_mse=f"{val_metrics['ho_mse']:.3f}", lr=f"{current_lr:.1e}"
                 )
                 # Adaptive LR monitors held-out MSE specifically (task-aligned),
                 # independent of whichever metric selects the best checkpoint.
@@ -412,6 +427,7 @@ class Trainer:
             else:
                 val_metrics = {"ho_nll": train_loss, "ho_mse": train_loss, "ho_crps": None}
                 metric = train_loss
+                epoch_bar.set_postfix(loss=f"{train_loss:.3f}", lr=f"{current_lr:.1e}")
                 if self.use_adaptive_lr and not in_warmup:
                     self.plateau_scheduler.step(train_loss)
 
@@ -422,9 +438,10 @@ class Trainer:
             elif metric is not None:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= self.config.patience:
-                    print(f"early stopping at epoch {epoch + 1}")
+                    tqdm.write(f"early stopping at epoch {epoch + 1}")
                     break
 
+        epoch_bar.close()
         if best_state is not None:
             self.model.load_state_dict(best_state)
         return best_val
@@ -570,6 +587,14 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
     )
 
     device = setup_device()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"[graph-tcn-vae] {len(frame)} rows -> {len(train_dataset)} train / "
+        f"{len(val_dataset) if val_loader is not None else 0} val windows "
+        f"({len(train_loader)} batches/epoch), {len(config.target_cols)} targets "
+        f"({n_chem} chem + {len(config.target_cols) - n_chem} psd), {len(config.aux_cols)} aux cols, "
+        f"{n_params:,} params, device={device}, epochs={config.epochs}, batch_size={config.batch_size}"
+    )
     trainer = Trainer(model, train_loader, val_loader, config, device)
     best_val = trainer.fit()
 

@@ -161,6 +161,18 @@ impute(["path/to/new_data.csv"], "checkpoints/run1.pt", "imputed.csv")
 
 Training uses dynamic contiguous held-out masking on observed target values. The validation mask is generated once from the same protocol and then held fixed for early stopping, preventing epoch-to-epoch mask noise from changing the selection target. `--validation-metric ho_nll` is the calibration-aware default; `ho_mse` selects directly on point-estimation error, while `ho_crps` is available with configurable MC sample count and evaluation interval. This is still a general-purpose reference implementation, not a reproduction of any specific thesis training run; W&B logging and extensive gate/attention diagnostics remain research-specific.
 
+`impute` always reports zero uncertainty at genuinely observed points, so it cannot answer "how accurate is this model on data it never saw?" `examples/heldout_eval.py` fills that gap: it regenerates the exact fixed held-out mask a bundle was trained with (same `--n-chem`/ratio/seed), forces those points to look unobserved at inference time, and reports R²/MAE/PICP against their true values, split by Chem/PSD:
+
+```bash
+python examples/heldout_eval.py \
+  --bundle checkpoints/run1.pt --csv path/to/data.csv \
+  --n-chem 32 -o heldout_metrics.json
+```
+
+### Progress output
+
+Training and inference print one summary line up front (row/window counts, device, epoch or MC-sample budget) and one line per epoch during training. On an interactive terminal this is backed by `tqdm` progress bars (per-epoch, per-batch, and per-window during inference); when stdout/stderr isn't a TTY (`nohup`, a background job, CI), the bars disable themselves automatically and only the plain summary lines are printed, so log files stay readable instead of filling up with `\r`-fragmented bar redraws.
+
 ## What Is Not Included
 
 This public package does not include:

@@ -1,5 +1,23 @@
+import sys
+
 import torch
 import numpy as np
+
+
+def is_interactive():
+    """True when stderr is a real terminal.
+
+    tqdm's `\\r`-based redraws are only useful on a live terminal; when
+    stdout/stderr is redirected to a file (nohup, CI, a background training
+    job) every redraw becomes its own line and the log turns into an
+    unreadable wall of partial progress bars. Callers use this to disable
+    per-batch tqdm bars and fall back to the plain per-epoch/per-chunk status
+    lines in that case.
+    """
+    try:
+        return sys.stderr.isatty()
+    except Exception:
+        return False
 
 class KLAnnealingScheduler:
     def __init__(self, total_epochs, warmup_epochs, min_beta=0.0, max_beta=1.0, strategy='cosine', n_cycles=4, ratio=0.5):

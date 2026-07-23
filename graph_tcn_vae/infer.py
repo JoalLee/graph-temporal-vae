@@ -1,10 +1,12 @@
 """Load a checkpoint bundle produced by `train.py` and impute new CSVs."""
+import math
 from pathlib import Path
 from itertools import chain
 
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from .data import (
     NaNAwareStandardScaler,
@@ -15,7 +17,7 @@ from .data import (
     transform_target_values,
 )
 from .model_graph_uq import ImputationVAE_Graph
-from .utils import setup_device
+from .utils import is_interactive, setup_device
 
 
 def _validate_bundle(bundle):
@@ -187,7 +189,11 @@ def aggregate_window_samples(
     mean = np.full((total_length, n_features), np.nan, dtype=np.float64)
     variance = np.full_like(mean, np.nan)
     quantile_values = {float(q): np.full_like(mean, np.nan) for q in quantiles}
-    for pos in range(total_length):
+    # Pure-CPU weighted-quantile pass over every timestep x feature; on a
+    # long series with many features this can take a while after all GPU
+    # work is already done, so it gets its own bar rather than looking like
+    # a silent hang.
+    for pos in tqdm(range(total_length), desc="aggregating", disable=not is_interactive()):
         if not values_by_position[pos]:
             continue
         values = np.concatenate(values_by_position[pos], axis=0)
@@ -260,10 +266,17 @@ def impute(
     aux_scaled = scaler_aux.transform(aux_raw) if aux_cols else aux_raw
     aux_observed = ~np.isnan(aux_raw)
 
+    n_batches = math.ceil(len(starts) / inference_batch_size)
+    print(
+        f"[graph-tcn-vae] {n} rows -> {len(starts)} windows ({n_batches} batches), "
+        f"{len(target_cols)} targets, {n_mc_samples} MC samples, stride={stride}, device={device}"
+    )
+
     def iter_window_samples():
         model.eval()
         with torch.no_grad():
-            for batch_start in range(0, len(starts), inference_batch_size):
+            batch_starts_list = range(0, len(starts), inference_batch_size)
+            for batch_start in tqdm(batch_starts_list, desc="impute windows", total=n_batches, disable=not is_interactive()):
                 batch_starts = starts[batch_start:batch_start + inference_batch_size]
                 masks = np.stack([obs_mask_full[s:s + window_size] for s in batch_starts])
                 xs = np.stack([target_scaled[s:s + window_size] * masks[i] for i, s in enumerate(batch_starts)])
