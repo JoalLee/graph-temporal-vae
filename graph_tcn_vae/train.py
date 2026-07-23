@@ -418,14 +418,21 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         else np.zeros((len(frame), 0))
     )
 
+    full_data_validation = config.val_fraction == 0.0
     split_idx = chronological_split_index(len(frame), config.val_fraction)
-    train_target, val_target = target_model_space[:split_idx], target_model_space[split_idx:]
-    train_aux, val_aux = aux_raw[:split_idx], aux_raw[split_idx:]
+    if full_data_validation:
+        train_target = val_target = target_model_space
+        train_aux = val_aux = aux_raw
+    else:
+        train_target, val_target = target_model_space[:split_idx], target_model_space[split_idx:]
+        train_aux, val_aux = aux_raw[:split_idx], aux_raw[split_idx:]
     train_aux_mask = ~np.isnan(train_aux)
     val_aux_mask = ~np.isnan(val_aux)
 
-    scaler_target = NaNAwareStandardScaler().fit(train_target)
-    scaler_aux = NaNAwareStandardScaler().fit(train_aux) if config.aux_cols else NaNAwareStandardScaler().fit(
+    scaler_target_fit = target_model_space if config.scaler_fit_scope == "full" else train_target
+    scaler_aux_fit = aux_raw if config.scaler_fit_scope == "full" else train_aux
+    scaler_target = NaNAwareStandardScaler().fit(scaler_target_fit)
+    scaler_aux = NaNAwareStandardScaler().fit(scaler_aux_fit) if config.aux_cols else NaNAwareStandardScaler().fit(
         np.zeros((1, 0))
     )
 
@@ -452,6 +459,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "random_point_drop_prob": config.dynamic_random_point_drop_prob,
         "n_chem": n_chem,
     }
+    train_fixed_mask = None
     if len(val_target):
         if config.selection_mask_mode == "anchor_constrained":
             if config.shared_full_heldout_mask:
@@ -461,7 +469,12 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
                     seed=config.selection_val_seed,
                     n_chem=n_chem,
                 )
-                val_selection_mask = selection_full[split_idx:]
+                if full_data_validation:
+                    train_fixed_mask = selection_full
+                    val_selection_mask = selection_full
+                else:
+                    train_fixed_mask = selection_full[:split_idx]
+                    val_selection_mask = selection_full[split_idx:]
             else:
                 val_selection_mask = sample_anchor_constrained_heldout_mask(
                     ~np.isnan(val_target),
@@ -469,12 +482,14 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
                     seed=config.selection_val_seed,
                     n_chem=n_chem,
                 )
+                train_fixed_mask = None
         else:
             val_selection_mask = sample_dynamic_heldout_mask(
                 ~np.isnan(val_target),
                 {**dynamic_mask_config, "ensure_nonempty": True},
                 seed=config.selection_val_seed,
             )
+            train_fixed_mask = None
     else:
         val_selection_mask = None
     if len(val_target) and val_selection_mask.sum() == 0:
@@ -484,7 +499,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         train_target_scaled, train_aux_scaled, config.window_size, config.stride,
         mode="train", denoise_prob=config.denoise_prob, seed=config.seed,
         aux_mask=train_aux_mask, aux_mask_channel=config.aux_mask_channel,
-        dynamic_mask_config=dynamic_mask_config,
+        dynamic_mask_config=dynamic_mask_config, fixed_mask=train_fixed_mask,
     )
     if len(train_dataset) == 0:
         raise ValueError(

@@ -27,6 +27,7 @@ def build_parser():
         help="Inverse transform for output values; defaults to --target-transform. "
              "Use log1p when the input CSV is already log1p-transformed.",
     )
+    train_p.add_argument("--scaler-fit-scope", choices=["train", "full"], default="train")
     train_p.add_argument("--window-size", type=int, default=48)
     train_p.add_argument("--stride", type=int, default=24)
     train_p.add_argument("--val-fraction", type=float, default=0.15)
@@ -133,6 +134,7 @@ def main(argv=None):
             aux_cols=_csv_list(args.aux_cols),
             target_transform=args.target_transform,
             target_output_transform=args.target_output_transform,
+            scaler_fit_scope=args.scaler_fit_scope,
             window_size=args.window_size,
             stride=args.stride,
             val_fraction=args.val_fraction,

@@ -16,6 +16,10 @@ class TrainConfig:
     # Transform used to map model-space predictions back to output values.
     # None keeps backward-compatible behavior: it follows target_transform.
     target_output_transform: Optional[str] = None
+    # The reference 26e preprocessing fits normalization on the complete
+    # time axis before applying the fixed held-out mask.  General users may
+    # prefer the leakage-safe train-only default.
+    scaler_fit_scope: str = "train"
 
     window_size: int = 48
     stride: int = 24
@@ -92,6 +96,8 @@ class TrainConfig:
             self.target_output_transform = self.target_transform
         if self.target_output_transform not in {"none", "log1p"}:
             raise ValueError("target_output_transform must be 'none' or 'log1p'")
+        if self.scaler_fit_scope not in {"train", "full"}:
+            raise ValueError("scaler_fit_scope must be 'train' or 'full'")
         if self.prior_type not in {"gaussian", "laplace", "student_t"}:
             raise ValueError("prior_type must be 'gaussian', 'laplace', or 'student_t'")
         if self.loss_normalization not in {"observed_mean", "window_feature_sum"}:

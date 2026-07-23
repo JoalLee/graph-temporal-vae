@@ -368,6 +368,7 @@ class WindowedTimeSeriesDataset(Dataset):
         aux_mask_channel=True,
         dynamic_mask_config=None,
         selection_mask=None,
+        fixed_mask=None,
     ):
         self.target = np.asarray(target, dtype=np.float32)
         self.aux = np.asarray(aux, dtype=np.float32)
@@ -386,6 +387,9 @@ class WindowedTimeSeriesDataset(Dataset):
         self.selection_mask = None if selection_mask is None else np.asarray(selection_mask, dtype=bool)
         if self.selection_mask is not None and self.selection_mask.shape != self.target.shape:
             raise ValueError("selection_mask must have the same shape as target")
+        self.fixed_mask = None if fixed_mask is None else np.asarray(fixed_mask, dtype=bool)
+        if self.fixed_mask is not None and self.fixed_mask.shape != self.target.shape:
+            raise ValueError("fixed_mask must have the same shape as target")
         self.starts = compute_window_starts(len(self.target), window_size, stride)
         self.rng = np.random.default_rng(seed)
 
@@ -406,13 +410,18 @@ class WindowedTimeSeriesDataset(Dataset):
 
         input_mask = obs_mask.copy()
         heldout_mask = np.zeros_like(obs_mask)
+        if self.fixed_mask is not None:
+            heldout_mask = (self.fixed_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
+            input_mask = obs_mask * (1.0 - heldout_mask)
         if self.dynamic_mask_config:
-            heldout_mask = sample_dynamic_heldout_mask(
+            dynamic_mask = sample_dynamic_heldout_mask(
                 obs_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
             ).astype(np.float32)
+            heldout_mask = np.maximum(heldout_mask, dynamic_mask)
             input_mask = obs_mask * (1.0 - heldout_mask)
         elif self.selection_mask is not None:
-            heldout_mask = (self.selection_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
+            selection_mask = (self.selection_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
+            heldout_mask = np.maximum(heldout_mask, selection_mask)
             input_mask = obs_mask * (1.0 - heldout_mask)
         if self.denoise_prob > 0:
             drop = (obs_mask == 1.0) & (self.rng.random(obs_mask.shape) < self.denoise_prob)

@@ -5,7 +5,11 @@ import torch
 
 from graph_tcn_vae.cli import main as cli_main
 from graph_tcn_vae.config import TrainConfig
-from graph_tcn_vae.data import sample_anchor_constrained_heldout_mask, sample_dynamic_heldout_mask
+from graph_tcn_vae.data import (
+    WindowedTimeSeriesDataset,
+    sample_anchor_constrained_heldout_mask,
+    sample_dynamic_heldout_mask,
+)
 from graph_tcn_vae.infer import aggregate_window_samples, load_bundle
 from graph_tcn_vae.train import Trainer, train_from_config, vae_loss
 
@@ -140,6 +144,7 @@ def test_26e_training_controls_are_serializable():
         loss_normalization="window_feature_sum",
         aux_mask_channel=False,
         target_output_transform="log1p",
+        scaler_fit_scope="full",
         chem_feature_weight=12.0,
         psd_feature_weight=1.0,
     )
@@ -153,6 +158,7 @@ def test_26e_training_controls_are_serializable():
     assert saved["loss_normalization"] == "window_feature_sum"
     assert saved["aux_mask_channel"] is False
     assert saved["target_output_transform"] == "log1p"
+    assert saved["scaler_fit_scope"] == "full"
     assert saved["chem_feature_weight"] == 12.0
     assert saved["psd_feature_weight"] == 1.0
 
@@ -232,6 +238,25 @@ def test_feature_weights_are_applied_before_window_reduction():
 
     assert loss.item() == pytest.approx(13.0)
     assert recon.item() == pytest.approx(13.0)
+
+
+def test_fixed_mask_is_kept_out_of_training_inputs():
+    target = np.ones((8, 2), dtype=np.float32)
+    aux = np.ones((8, 1), dtype=np.float32)
+    fixed = np.zeros_like(target, dtype=bool)
+    fixed[3, 1] = True
+    dataset = WindowedTimeSeriesDataset(
+        target,
+        aux,
+        window_size=8,
+        stride=8,
+        mode="train",
+        fixed_mask=fixed,
+    )
+    item = dataset[0]
+    assert item["heldout_mask"][3, 1].item() == 1.0
+    assert item["input_mask"][3, 1].item() == 0.0
+    assert item["target"][3, 1].item() == 1.0
 
 
 def test_student_t_window_feature_loss_uses_experiment_normalization():
