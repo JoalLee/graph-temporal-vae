@@ -161,7 +161,10 @@ This reference runner intentionally uses the full 15,336-row timeline (633
 windows at `window=168, stride=24`), `seed=42` for both training and the
 anchor-constrained held-out mask, `ho_mse` selection, AdamW with
 `weight_decay=0.01`, legacy dynamic masking, and the 26e Student-t/loss
-weighting schedule. It is separate from the general CLI defaults.
+weighting schedule. It is separate from the general CLI defaults. If the
+input is an already log1p-transformed artifact, pass
+`--target-transform none`; the preparation helper above writes raw targets and
+therefore uses the runner default `--target-transform log1p`.
 
 Any `ImputationVAE_Graph` constructor flag (see `graph_tcn_vae/model_graph_uq.py`) can be set via `--model-config path/to/config.json`, which takes priority over the convenience flags (`--latent-dim`, `--hidden-dims`, `--encoder-layers`, `--decoder-layers`, `--n-graph-heads`, `--n-chem`, `--heteroscedastic`).
 

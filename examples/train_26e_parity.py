@@ -23,7 +23,12 @@ from graph_tcn_vae.train import train_from_config
 from prepare_26e_input import AUX_COLS, CHEM_COLS, TIME_COLS
 
 
-def build_26e_config(input_csv: str | Path, model_config: str | Path, epochs: int = 2000) -> TrainConfig:
+def build_26e_config(
+    input_csv: str | Path,
+    model_config: str | Path,
+    epochs: int = 2000,
+    target_transform: str = "log1p",
+) -> TrainConfig:
     columns = pd.read_csv(input_csv, nrows=0).columns.tolist()
     reserved = {"time", *CHEM_COLS, *AUX_COLS, *TIME_COLS}
     psd_cols = [col for col in columns if col not in reserved]
@@ -40,7 +45,7 @@ def build_26e_config(input_csv: str | Path, model_config: str | Path, epochs: in
         timestamp_col="time",
         target_cols=CHEM_COLS + psd_cols,
         aux_cols=AUX_COLS + TIME_COLS,
-        target_transform="log1p",
+        target_transform=target_transform,
         target_output_transform="log1p",
         scaler_fit_scope="full",
         window_size=168,
@@ -104,9 +109,15 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="Raw CSV from prepare_26e_input.py")
     parser.add_argument("--model-config", default="examples/26e_parity_model_config.json")
     parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument(
+        "--target-transform", choices=["none", "log1p"], default="log1p",
+        help="Transform present in the input contract. Use 'none' for the private pre-log1p experiment_input_raw_26e.csv; the preparation helper writes raw values, so its default is 'log1p'.",
+    )
     parser.add_argument("-o", "--output", required=True)
     args = parser.parse_args()
-    config = build_26e_config(args.input, args.model_config, epochs=args.epochs)
+    config = build_26e_config(
+        args.input, args.model_config, epochs=args.epochs, target_transform=args.target_transform
+    )
     best_val = train_from_config(config, args.output)
     print(f"saved checkpoint bundle to {args.output} (best ho_mse={best_val:.6f})")
 
