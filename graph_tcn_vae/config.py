@@ -64,6 +64,14 @@ class TrainConfig:
     lr_reduce_patience: int = 10
     lr_reduce_threshold: float = 1e-4
     lr_reduce_cooldown: int = 2
+    # LR warmup previously had no config knob at all -- it was hardcoded to
+    # 5% of `epochs` in Trainer.__init__. The 26e reference protocol
+    # preserves an ABSOLUTE warmup length (100 epochs) even when a run uses
+    # a reduced epoch budget (e.g. 700 instead of 2000), so a ratio of the
+    # *current* run's epochs is the wrong knob when reproducing it -- set
+    # lr_warmup_epochs explicitly in that case instead of lr_warmup_ratio.
+    lr_warmup_epochs: Optional[int] = None
+    lr_warmup_ratio: Optional[float] = None
     kl_warmup_epochs: Optional[int] = None
     kl_warmup_ratio: Optional[float] = None
     kl_strategy: str = "cosine"
@@ -140,6 +148,10 @@ class TrainConfig:
             raise ValueError("val_mc_batch_size must be positive")
         if self.kl_warmup_ratio is not None and not 0 < self.kl_warmup_ratio <= 1:
             raise ValueError("kl_warmup_ratio must be in (0, 1]")
+        if self.lr_warmup_ratio is not None and not 0 < self.lr_warmup_ratio <= 1:
+            raise ValueError("lr_warmup_ratio must be in (0, 1]")
+        if self.lr_warmup_epochs is not None and self.lr_warmup_epochs < 1:
+            raise ValueError("lr_warmup_epochs must be positive")
         if not 0 < self.lr_reduce_factor < 1:
             raise ValueError("lr_reduce_factor must be in (0, 1)")
         if self.lr_reduce_patience < 0 or self.lr_reduce_cooldown < 0:

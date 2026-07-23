@@ -220,10 +220,15 @@ class Trainer:
             n_cycles=config.kl_cycles,
             ratio=config.kl_cycle_ratio,
         )
+        if config.lr_warmup_epochs is not None:
+            lr_warmup_epochs = config.lr_warmup_epochs
+        else:
+            lr_warmup_ratio = config.lr_warmup_ratio if config.lr_warmup_ratio is not None else 0.05
+            lr_warmup_epochs = max(1, int(config.epochs * lr_warmup_ratio))
         self.lr_scheduler = LRWarmupCosineScheduler(
             self.optimizer,
             config.epochs,
-            max(1, int(config.epochs * 0.05)),
+            lr_warmup_epochs,
             min_lr=config.lr_min,
         )
         # Matches the 26e reference: linear warmup + cosine runs the whole

@@ -107,6 +107,39 @@ def test_train_then_impute_round_trip(tmp_path):
     assert (gap_rows["imputed_std"] > 0).all()
 
 
+def test_two_stream_aggregation_keeps_mean_stable_despite_noisy_outlier_samples():
+    # Mirrors infer.impute's compute_window_predictions design: the point
+    # estimate must be built from the clean per-window mean stream
+    # (compute_uncertainty's result[0], mc=1, no injected likelihood noise),
+    # never from the noisy generative-sample stream (result[-2]) that's used
+    # for quantiles/std. A single wild noisy draw -- a realistic Student-t/
+    # Gaussian tail event under a clamped-but-nonzero predicted variance --
+    # must not drag imputed_mean, even though it should still widen the
+    # reported interval. Averaging the noisy stream for BOTH (what this
+    # package used to do) is what turned a real held-out eval's
+    # psd_heldout_r2 into the thousands-negative.
+    window_size, n_features = 4, 1
+    clean_mean = 0.5  # log1p-space model prediction, nothing exotic
+    mean_chunks = [(0, np.full((1, window_size, n_features), clean_mean))]
+    noisy_samples = np.full((5, window_size, n_features), clean_mean)
+    noisy_samples[0] = 25.0  # one wild Student-t/Gaussian tail draw
+    sample_chunks = [(0, noisy_samples)]
+
+    position_weights = np.ones(window_size)
+    mean_agg = aggregate_window_samples(
+        mean_chunks, total_length=window_size, position_weights=position_weights, quantiles=()
+    )
+    dist_agg = aggregate_window_samples(
+        sample_chunks, total_length=window_size, position_weights=position_weights, quantiles=(0.05, 0.95)
+    )
+    mean_out, std_out, _quantiles_out = summary_to_output_scale(
+        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], transform="log1p",
+    )
+
+    assert mean_out[0, 0] == pytest.approx(np.expm1(clean_mean))  # unaffected by the wild noisy draw
+    assert std_out[0, 0] > 0  # but the noisy stream still widens reported uncertainty
+
+
 def test_summary_to_output_scale_avoids_sample_then_transform_blowup():
     # A Student-t draw can occasionally be extreme; transforming EACH sample
     # with expm1 before averaging ("sample-then-transform") is biased high
@@ -241,6 +274,33 @@ def test_trapezoid_position_weights_falls_back_for_small_windows():
     assert len(weights) == 3
     assert np.all(weights > 0)
     assert weights[1] == 1.0
+
+
+def test_lr_warmup_epochs_overrides_ratio_default():
+    # Before this, LR warmup had no config knob at all -- it was hardcoded
+    # to 5% of `epochs` in Trainer.__init__. A reference run that preserves
+    # an absolute warmup length under a reduced epoch budget (e.g. the 26e
+    # ablation battery: 100 epochs of warmup even at --epochs 700, not the
+    # mainline 2000) needs an absolute lr_warmup_epochs knob, not a ratio of
+    # *this* run's shorter budget.
+    config = TrainConfig(
+        csv=["unused.csv"], timestamp_col="time", target_cols=["target"],
+        epochs=700, lr_warmup_epochs=100,
+        model_kwargs={"latent_dim": 4, "hidden_dims": [4], "encoder_layers": 1, "decoder_layers": 1, "n_graph_heads": 1},
+    )
+    model = ImputationVAE_Graph(target_dim=1, aux_dim=0, window_size=8, **config.model_kwargs)
+    trainer = Trainer(model, train_loader=None, val_loader=None, config=config, device=torch.device("cpu"))
+    assert trainer.lr_scheduler.warmup_epochs == 100  # not int(700 * 0.05) == 35
+
+    default_config = TrainConfig(
+        csv=["unused.csv"], timestamp_col="time", target_cols=["target"], epochs=700,
+        model_kwargs={"latent_dim": 4, "hidden_dims": [4], "encoder_layers": 1, "decoder_layers": 1, "n_graph_heads": 1},
+    )
+    default_trainer = Trainer(
+        ImputationVAE_Graph(target_dim=1, aux_dim=0, window_size=8, **default_config.model_kwargs),
+        train_loader=None, val_loader=None, config=default_config, device=torch.device("cpu"),
+    )
+    assert default_trainer.lr_scheduler.warmup_epochs == 35  # unchanged default behavior
 
 
 def test_use_adaptive_lr_builds_plateau_scheduler_and_skips_cosine_after_warmup():

@@ -68,6 +68,16 @@ def build_parser():
     train_p.add_argument("--lr-reduce-patience", type=int, default=10)
     train_p.add_argument("--lr-reduce-threshold", type=float, default=1e-4)
     train_p.add_argument("--lr-reduce-cooldown", type=int, default=2)
+    train_p.add_argument(
+        "--lr-warmup-epochs", type=int, default=None,
+        help="Absolute LR warmup length. Overrides --lr-warmup-ratio. Use this (not the ratio) "
+             "when reproducing a reference run that preserves an absolute warmup length under a "
+             "reduced epoch budget, e.g. 100 epochs of warmup even when --epochs is 700, not 2000.",
+    )
+    train_p.add_argument("--lr-warmup-ratio", type=float, default=None,
+                         help="LR warmup as a fraction of --epochs. Defaults to 0.05 if neither this nor --lr-warmup-epochs is set.")
+    train_p.add_argument("--kl-warmup-epochs", type=int, default=None,
+                         help="Absolute KL warmup length. Overrides --kl-warmup-ratio.")
     train_p.add_argument("--kl-warmup-ratio", type=float, default=None)
     train_p.add_argument("--kl-strategy", choices=["linear", "cosine", "cyclical"], default="cosine")
     train_p.add_argument("--use-amp", action="store_true")
@@ -176,6 +186,9 @@ def main(argv=None):
             lr_reduce_patience=args.lr_reduce_patience,
             lr_reduce_threshold=args.lr_reduce_threshold,
             lr_reduce_cooldown=args.lr_reduce_cooldown,
+            lr_warmup_epochs=args.lr_warmup_epochs,
+            lr_warmup_ratio=args.lr_warmup_ratio,
+            kl_warmup_epochs=args.kl_warmup_epochs,
             kl_warmup_ratio=args.kl_warmup_ratio,
             kl_strategy=args.kl_strategy,
             use_amp=args.use_amp,
