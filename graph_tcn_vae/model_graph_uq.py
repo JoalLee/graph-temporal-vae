@@ -1107,9 +1107,9 @@ class CrossModalGraphLayer(nn.Module):
     Learns which auxiliary factors influence which target species.
     """
     
-    def __init__(self, target_dim, aux_dim, window_size, n_heads=4, head_dim=64, dropout=0.1, 
+    def __init__(self, target_dim, aux_dim, window_size, n_heads=4, head_dim=64, dropout=0.1,
                  use_temporal_cnn=True, disable_aux_bias=False,
-                 use_ffn=False, ffn_mult=4):
+                 use_ffn=False, ffn_mult=4, query_gate_mode='legacy_hard'):
         super().__init__()
         self.target_dim = target_dim
         self.aux_dim = aux_dim
@@ -1118,10 +1118,19 @@ class CrossModalGraphLayer(nn.Module):
         self.head_dim = head_dim
         self.d_model = n_heads * head_dim
 
-        # Soft gate toggle: when True, replaces hard 10% threshold with smooth
-        # sigmoid gate to allow gradient flow at any obs_rate (curriculum masking).
-        self.use_soft_gate = False
-        
+        # Query gate on sparsely-observed target features:
+        #   'legacy_hard': hard-mask queries below a 10% obs-rate threshold
+        #     (backward compatible; a missing target feature gets NO aux signal).
+        #   'soft': smooth sigmoid gate, allows gradient flow even at obs_rate=0
+        #     (used for curriculum masking / BERT-style cross-modal imputation).
+        #   'none': no gating at all -- missing target queries may still
+        #     retrieve evidence from observed auxiliary keys; reliability is
+        #     handled downstream rather than suppressing retrieval before it
+        #     occurs.
+        self.query_gate_mode = str(query_gate_mode)
+        if self.query_gate_mode not in {'legacy_hard', 'soft', 'none'}:
+            raise ValueError("query_gate_mode must be one of {'legacy_hard', 'soft', 'none'}")
+
         # Learnable Temperature
         self.tau_param = nn.Parameter(torch.zeros(1))
         
@@ -1242,11 +1251,11 @@ class CrossModalGraphLayer(nn.Module):
         # NOTE: obs_rate_expanded is row-constant [B, h, C_t, 1] relative to keys.
         # We must use a multiplicative gate AFTER softmax (or hard masking before)
         # to ensure the total information uptake is reduced for sparse queries.
-        if self.use_soft_gate:
+        if self.query_gate_mode == 'soft':
             # Soft sigmoid gate: allows gradient flow even at obs_rate=0
             soft_gate = torch.sigmoid(20.0 * (obs_rate_expanded - 0.05))
             attn_weights = F.softmax(attn_logits, dim=-1) * soft_gate
-        else:
+        elif self.query_gate_mode == 'legacy_hard':
             # Original hard threshold (backward compatible)
             threshold = 0.1
             attn_logits = attn_logits.masked_fill(obs_rate_expanded < threshold, -1e4)
@@ -1254,6 +1263,11 @@ class CrossModalGraphLayer(nn.Module):
             # Final verification: zero out fully-masked rows
             valid_row_mask = (obs_rate_expanded >= threshold).any(dim=-1, keepdim=True)
             attn_weights = attn_weights * valid_row_mask.float()
+        else:
+            # 'none': missing target queries may still retrieve evidence from
+            # observed auxiliary keys. Reliability is handled downstream
+            # rather than suppressing retrieval before it occurs.
+            attn_weights = F.softmax(attn_logits, dim=-1)
         
         attn = self.dropout(attn_weights)
         
@@ -2245,6 +2259,7 @@ class GraphEncoder(nn.Module):
                  use_tcn=True, n_input_graph_layers=1, use_parallel_graph=False,
                  use_temporal_cnn=True, n_chem=0, enable_cross_modal_floor=False,
                  disable_rel_scale=False, disable_prior_bias=False, disable_aux_bias=False,
+                 cross_modal_query_gate_mode='legacy_hard',
                  use_homogeneous=False, ignore_obs_mask=False,
                  use_graph_ffn=False, graph_ffn_mult=4,
                  use_token_graph_trunk=False, token_graph_dim=None,
@@ -2453,6 +2468,7 @@ class GraphEncoder(nn.Module):
                     dropout=dropout,
                     use_temporal_cnn=use_temporal_cnn,
                     disable_aux_bias=disable_aux_bias,
+                    query_gate_mode=cross_modal_query_gate_mode,
                     use_ffn=self.use_graph_ffn,
                     ffn_mult=self.graph_ffn_mult,
                 )
@@ -4521,6 +4537,7 @@ class ImputationVAE_Graph(nn.Module):
                  latent_logvar_max=None,
                  enable_cross_modal_floor=False,
                  disable_rel_scale=False, disable_prior_bias=False, disable_aux_bias=False,
+                 cross_modal_query_gate_mode='legacy_hard',
                  use_homogeneous=False, ignore_obs_mask=False,
                  use_graph_ffn=False, graph_ffn_mult=4,
                  use_token_graph_trunk=False, token_graph_dim=None,
@@ -4569,6 +4586,7 @@ class ImputationVAE_Graph(nn.Module):
                  prior_df_max=30.0):
         super().__init__()
         self.ignore_obs_mask = ignore_obs_mask
+        self.cross_modal_query_gate_mode = str(cross_modal_query_gate_mode)
 
         self.use_realnvp = use_realnvp
         if use_realnvp:
@@ -4771,6 +4789,7 @@ class ImputationVAE_Graph(nn.Module):
             disable_rel_scale=disable_rel_scale,
             disable_prior_bias=disable_prior_bias,
             disable_aux_bias=disable_aux_bias,
+            cross_modal_query_gate_mode=cross_modal_query_gate_mode,
             use_homogeneous=use_homogeneous,
             ignore_obs_mask=self.ignore_obs_mask,
             use_graph_ffn=self.use_graph_ffn,
@@ -5070,14 +5089,18 @@ class ImputationVAE_Graph(nn.Module):
         """Toggle BERT-style cross-modal imputation mode.
 
         When enabled, the CrossModalGraphLayer uses a soft sigmoid gate instead
-        of the hard 10% obs_rate threshold, allowing gradient flow even when a
-        modality is fully masked (required for curriculum masking).
+        of its configured query_gate_mode, allowing gradient flow even when a
+        modality is fully masked (required for curriculum masking). Disabling
+        reverts to whatever query_gate_mode the model was constructed with
+        (legacy_hard / soft / none), not a hardcoded default.
         The InputGraphLayer cross-modal floor is always active if the parameter
         was created (via enable_cross_modal_floor=True at construction).
         """
         if (hasattr(self.encoder, 'cross_modal_graph_layer')
                 and self.encoder.cross_modal_graph_layer is not None):
-            self.encoder.cross_modal_graph_layer.use_soft_gate = enable
+            self.encoder.cross_modal_graph_layer.query_gate_mode = (
+                'soft' if enable else self.cross_modal_query_gate_mode
+            )
 
     def forward(self, x, cond, mask, history=None, sample_latent=True):
         """
