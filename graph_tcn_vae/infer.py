@@ -127,6 +127,32 @@ def _weighted_quantile(values, weights, quantile):
     return float(np.interp(quantile * weights.sum(), centers, values))
 
 
+def summary_to_output_scale(mean_model, variance_model, quantile_values_model, transform):
+    """Map aggregated (model-space) summary statistics to the output scale.
+
+    This must run ONCE on the aggregated mean/variance/quantiles, not once
+    per MC sample before aggregation. ``expm1`` (the inverse of the log1p
+    target transform) is convex, so averaging already-exponentiated
+    heavy-tailed Student-t draws is biased high (Jensen's inequality) and
+    numerically unstable -- a single extreme draw dominates the arithmetic
+    mean once exponentiated, which is what produced R^2 << 0 on log1p-scale
+    targets before this was fixed. Matches the research pipeline: aggregate
+    the mean/quantiles in the linear model space, then apply the inverse
+    transform once to those summary statistics. Quantiles come out exact
+    under this ordering because the transform is monotonic; std uses a
+    first-order (delta-method) approximation, ``exp(mean) * std_model``,
+    matching the reference's own uncertainty propagation through expm1.
+    """
+    mean_out = inverse_target_values(mean_model, transform)
+    std_model = np.sqrt(np.maximum(variance_model, 0.0))
+    if transform == "log1p":
+        std_out = np.exp(mean_model) * std_model
+    else:
+        std_out = std_model
+    quantiles_out = {q: inverse_target_values(v, transform) for q, v in quantile_values_model.items()}
+    return mean_out, std_out, quantiles_out
+
+
 def aggregate_window_samples(
     window_samples,
     window_starts=None,
@@ -301,19 +327,23 @@ def impute(
                     samples_scaled * scaler_target.std_[None, None, None, :]
                     + scaler_target.mean_[None, None, None, :]
                 )
-                samples = inverse_target_values(samples_model, target_output_transform)
+                # Yield model-space (pre-output-transform) samples; the
+                # transform is applied once to the aggregated summary
+                # statistics below, not per MC sample -- see
+                # summary_to_output_scale.
                 for i, start in enumerate(batch_starts):
-                    yield start, samples[:, i]
+                    yield start, samples_model[:, i]
 
     aggregated = aggregate_window_samples(
         iter_window_samples(), total_length=n,
         position_weights=trapezoid_position_weights(window_size),
         quantiles=(0.05, 0.95),
     )
-    mean_out = aggregated["mean"]
-    std_out = np.sqrt(np.maximum(aggregated["variance"], 0.0))
-    q05_out = aggregated["quantiles"][0.05]
-    q95_out = aggregated["quantiles"][0.95]
+    mean_out, std_out, quantiles_out = summary_to_output_scale(
+        aggregated["mean"], aggregated["variance"], aggregated["quantiles"], target_output_transform
+    )
+    q05_out = quantiles_out[0.05]
+    q95_out = quantiles_out[0.95]
 
     # Restore observed values in the public/raw output space; there's no
     # imputation uncertainty there.  The input CSV may already be transformed

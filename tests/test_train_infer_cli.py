@@ -15,7 +15,12 @@ from graph_tcn_vae.data import (
     sample_anchor_constrained_heldout_mask,
     sample_dynamic_heldout_mask,
 )
-from graph_tcn_vae.infer import aggregate_window_samples, load_bundle, trapezoid_position_weights
+from graph_tcn_vae.infer import (
+    aggregate_window_samples,
+    load_bundle,
+    summary_to_output_scale,
+    trapezoid_position_weights,
+)
 from graph_tcn_vae.model_graph_uq import ImputationVAE_Graph
 from graph_tcn_vae.train import Trainer, train_from_config, vae_loss
 
@@ -100,6 +105,46 @@ def test_train_then_impute_round_trip(tmp_path):
     assert gap_rows["observed"].isna().all()
     assert np.isfinite(gap_rows["imputed_mean"]).all()
     assert (gap_rows["imputed_std"] > 0).all()
+
+
+def test_summary_to_output_scale_avoids_sample_then_transform_blowup():
+    # A Student-t draw can occasionally be extreme; transforming EACH sample
+    # with expm1 before averaging ("sample-then-transform") is biased high
+    # (Jensen's inequality, expm1 is convex) and numerically unstable -- one
+    # wild draw dominates the arithmetic mean once exponentiated. This is
+    # exactly what turned a real held-out R^2 on log1p-scale PSD targets into
+    # -2964 before this fix. summary_to_output_scale must instead aggregate
+    # in the linear model space and transform the summary statistic once.
+    model_space_samples = np.array([0.5, 0.6, 0.4, 0.55, 20.0])  # one wild outlier
+    naive_sample_then_transform_mean = np.expm1(model_space_samples).mean()
+
+    mean_out, std_out, quantiles_out = summary_to_output_scale(
+        mean_model=np.array([[model_space_samples.mean()]]),
+        variance_model=np.array([[model_space_samples.var()]]),
+        quantile_values_model={0.5: np.array([[np.median(model_space_samples)]])},
+        transform="log1p",
+    )
+
+    expected_mean = np.expm1(model_space_samples.mean())
+    assert mean_out[0, 0] == pytest.approx(expected_mean)
+    # Orders of magnitude smaller than the biased sample-then-transform mean.
+    assert mean_out[0, 0] < naive_sample_then_transform_mean / 100
+    assert quantiles_out[0.5][0, 0] == pytest.approx(np.expm1(np.median(model_space_samples)))
+    # Delta-method std propagation: exp(mean_model) * std_model.
+    expected_std = np.exp(model_space_samples.mean()) * model_space_samples.std()
+    assert std_out[0, 0] == pytest.approx(expected_std)
+
+
+def test_summary_to_output_scale_is_identity_for_no_transform():
+    mean_out, std_out, quantiles_out = summary_to_output_scale(
+        mean_model=np.array([[1.5, -2.0]]),
+        variance_model=np.array([[4.0, 9.0]]),
+        quantile_values_model={0.05: np.array([[0.1, -5.0]])},
+        transform="none",
+    )
+    assert np.array_equal(mean_out, np.array([[1.5, -2.0]]))
+    assert np.array_equal(std_out, np.array([[2.0, 3.0]]))
+    assert np.array_equal(quantiles_out[0.05], np.array([[0.1, -5.0]]))
 
 
 def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):

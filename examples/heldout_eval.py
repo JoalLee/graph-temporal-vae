@@ -35,7 +35,12 @@ from graph_tcn_vae.data import (
     sample_anchor_constrained_heldout_mask,
     transform_target_values,
 )
-from graph_tcn_vae.infer import aggregate_window_samples, load_bundle, trapezoid_position_weights
+from graph_tcn_vae.infer import (
+    aggregate_window_samples,
+    load_bundle,
+    summary_to_output_scale,
+    trapezoid_position_weights,
+)
 from graph_tcn_vae.utils import is_interactive
 
 
@@ -138,18 +143,22 @@ def main():
                     samples_scaled * scaler_target.std_[None, None, None, :]
                     + scaler_target.mean_[None, None, None, :]
                 )
-                samples = inverse_target_values(samples_model, target_output_transform)
+                # Model-space (pre-output-transform) samples; the transform
+                # is applied once to the aggregated mean/quantiles below, not
+                # per MC sample -- see summary_to_output_scale.
                 for i, start in enumerate(batch_starts):
-                    yield start, samples[:, i]
+                    yield start, samples_model[:, i]
 
     aggregated = aggregate_window_samples(
         iter_window_samples(), total_length=n,
         position_weights=trapezoid_position_weights(window_size),
         quantiles=(0.025, 0.975),
     )
-    mean_out = aggregated["mean"]
-    q025 = aggregated["quantiles"][0.025]
-    q975 = aggregated["quantiles"][0.975]
+    mean_out, _std_out, quantiles_out = summary_to_output_scale(
+        aggregated["mean"], aggregated["variance"], aggregated["quantiles"], target_output_transform
+    )
+    q025 = quantiles_out[0.025]
+    q975 = quantiles_out[0.975]
 
     observed_output = inverse_target_values(target_raw, target_output_transform)
 
