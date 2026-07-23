@@ -10,8 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import pandas as pd
+
+# Allow direct execution from the repository root, e.g.
+# ``python examples/train_26e_parity.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from graph_tcn_vae.config import TrainConfig
 from graph_tcn_vae.train import train_from_config
