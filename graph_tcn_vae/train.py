@@ -226,6 +226,21 @@ class Trainer:
             max(1, int(config.epochs * 0.05)),
             min_lr=config.lr_min,
         )
+        # Matches the 26e reference: linear warmup + cosine runs the whole
+        # schedule by default; use_adaptive_lr instead switches to
+        # ReduceLROnPlateau (monitoring held-out MSE) once warmup ends.
+        self.use_adaptive_lr = bool(config.use_adaptive_lr)
+        self.plateau_scheduler = None
+        if self.use_adaptive_lr:
+            self.plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=config.lr_reduce_factor,
+                patience=config.lr_reduce_patience,
+                threshold=config.lr_reduce_threshold,
+                cooldown=config.lr_reduce_cooldown,
+                min_lr=config.lr_min,
+            )
         self.amp_dtype = self._resolve_amp_dtype(config.amp_dtype)
         self.amp_enabled = bool(config.use_amp and self.amp_dtype is not None)
         self.grad_scaler = torch.amp.GradScaler(
@@ -370,7 +385,11 @@ class Trainer:
         epochs_without_improvement = 0
 
         for epoch in range(self.config.epochs):
-            self.lr_scheduler.step(epoch)
+            in_warmup = epoch < self.lr_scheduler.warmup_epochs
+            # Original behavior: cosine scheduler runs every epoch. Adaptive
+            # mode: warmup/cosine first, then plateau scheduler post-warmup.
+            if not self.use_adaptive_lr or in_warmup:
+                self.lr_scheduler.step(epoch)
             train_loss = self._run_epoch(self.train_loader, epoch, train=True)
 
             if self.val_loader is not None:
@@ -386,9 +405,15 @@ class Trainer:
                     f"val_ho_mse={val_metrics['ho_mse']:.4f} "
                     f"val_ho_crps={val_metrics['ho_crps'] if val_metrics['ho_crps'] is not None else 'skipped'}"
                 )
+                # Adaptive LR monitors held-out MSE specifically (task-aligned),
+                # independent of whichever metric selects the best checkpoint.
+                if self.use_adaptive_lr and not in_warmup:
+                    self.plateau_scheduler.step(val_metrics["ho_mse"])
             else:
                 val_metrics = {"ho_nll": train_loss, "ho_mse": train_loss, "ho_crps": None}
                 metric = train_loss
+                if self.use_adaptive_lr and not in_warmup:
+                    self.plateau_scheduler.step(train_loss)
 
             if metric is not None and metric < best_val - 1e-6:
                 best_val = metric

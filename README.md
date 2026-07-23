@@ -135,7 +135,9 @@ graph-tcn-vae train \
 
 `impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with the observed value in the configured output scale, plus `imputed_mean`, `imputed_std`, and a 5–95% predictive interval (`q05`/`q95`) from `compute_uncertainty`. Observed points are restored in that output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use sample-level overlap-add with a trapezoidal position envelope, so quantiles and cross-window disagreement are retained instead of averaging per-window quantiles.
 
-For the 26e Chem/PSD weighting protocol, set `--n-chem 32 --chem-feature-weight 12 --psd-feature-weight 1`. The defaults are 1/1 for a general dataset.
+For the 26e Chem/PSD weighting protocol, set `--n-chem 32 --chem-feature-weight 12 --psd-feature-weight 1 --loss-normalization window_feature_sum`. The defaults are 1/1 general-dataset weighting with `observed_mean` normalization.
+
+By default the learning rate follows linear warmup + cosine annealing for the whole run. The 26e reference instead switches to `ReduceLROnPlateau` (monitoring held-out MSE) once warmup ends; pass `--use-adaptive-lr` (plus `--lr-reduce-factor/--lr-reduce-patience/--lr-reduce-threshold/--lr-reduce-cooldown` to match a specific reference run) to reproduce that behavior.
 
 When auxiliary columns are configured, the CLI automatically appends one observedness channel per auxiliary column to `cond`. A missing auxiliary value is therefore represented as `(zero-filled value, mask=0)` and is not silently treated as a real standardized zero. The target `mask` remains target-only.
 

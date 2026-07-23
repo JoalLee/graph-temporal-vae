@@ -93,14 +93,25 @@ def load_bundle(path, device=None):
     }
 
 
-def trapezoid_position_weights(window_size):
-    """Position envelope used to downweight window edges during overlap-add."""
+def trapezoid_position_weights(window_size, edge_frac=0.2):
+    """Position envelope used to downweight window edges during overlap-add.
+
+    1 in the middle, linear ramp over ``edge_frac`` of the window at each
+    edge, matching the research trapezoidal_window_weights envelope: an
+    edge timestep has less surrounding context within that window's
+    representation, so it should contribute less to the overlap-add mix.
+    """
     if window_size < 1:
         raise ValueError("window_size must be positive")
     if window_size == 1:
         return np.ones(1, dtype=np.float64)
+    edge_len = max(1, int(round(window_size * edge_frac)))
+    if 2 * edge_len >= window_size:
+        edge_len = max(1, (window_size - 1) // 2)
     weights = np.ones(window_size, dtype=np.float64)
-    weights[[0, -1]] = 0.5
+    ramp = (np.arange(edge_len) + 1.0) / (edge_len + 1.0)
+    weights[:edge_len] = ramp
+    weights[-edge_len:] = ramp[::-1]
     return weights
 
 

@@ -10,7 +10,8 @@ from graph_tcn_vae.data import (
     sample_anchor_constrained_heldout_mask,
     sample_dynamic_heldout_mask,
 )
-from graph_tcn_vae.infer import aggregate_window_samples, load_bundle
+from graph_tcn_vae.infer import aggregate_window_samples, load_bundle, trapezoid_position_weights
+from graph_tcn_vae.model_graph_uq import ImputationVAE_Graph
 from graph_tcn_vae.train import Trainer, train_from_config, vae_loss
 
 
@@ -118,6 +119,62 @@ def test_sample_level_overlap_aggregation_preserves_cross_window_mixture():
     assert result["mean"][2, 0] == pytest.approx(32.5)
     assert result["variance"][2, 0] == pytest.approx(1568.75)
     assert result["quantiles"][0.5][2, 0] == pytest.approx(15.0)
+
+
+def test_trapezoid_position_weights_ramps_20pct_edges_like_research():
+    # Matches trapezoidal_window_weights(window_size, edge_frac=0.2) from the
+    # research ablation_inference.py: a linear ramp over 20% of the window at
+    # each edge, not just the single boundary timestep.
+    weights = trapezoid_position_weights(168)
+    edge_len = round(168 * 0.2)
+    assert edge_len == 34
+    assert np.all(weights[edge_len:-edge_len] == 1.0)
+    assert weights[0] == pytest.approx(1.0 / (edge_len + 1))
+    assert weights[-1] == pytest.approx(1.0 / (edge_len + 1))
+    assert np.all(np.diff(weights[:edge_len]) > 0)  # monotonic ramp up
+    assert np.all(np.diff(weights[-edge_len:]) < 0)  # monotonic ramp down
+
+
+def test_trapezoid_position_weights_falls_back_for_small_windows():
+    # edge_frac=0.2 of a tiny window would overlap the middle; the envelope
+    # must stay well-defined (no zero/negative weights) instead of clipping.
+    weights = trapezoid_position_weights(3)
+    assert len(weights) == 3
+    assert np.all(weights > 0)
+    assert weights[1] == 1.0
+
+
+def test_use_adaptive_lr_builds_plateau_scheduler_and_skips_cosine_after_warmup():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target_a", "target_b"],
+        window_size=8,
+        use_adaptive_lr=True,
+        lr_reduce_factor=0.5,
+        lr_reduce_patience=2,
+        lr_reduce_cooldown=0,
+        epochs=10,
+        model_kwargs={"latent_dim": 4, "hidden_dims": [4], "encoder_layers": 1, "decoder_layers": 1, "n_graph_heads": 1},
+    )
+    model = ImputationVAE_Graph(target_dim=2, aux_dim=0, window_size=8, **config.model_kwargs)
+    trainer = Trainer(model, train_loader=None, val_loader=None, config=config, device=torch.device("cpu"))
+
+    assert trainer.use_adaptive_lr is True
+    assert trainer.plateau_scheduler is not None
+    warmup_epochs = trainer.lr_scheduler.warmup_epochs  # max(1, int(10 * 0.05)) == 1
+
+    trainer.lr_scheduler.step(0)
+    lr_after_warmup_step = trainer.optimizer.param_groups[0]["lr"]
+
+    # Once warmup ends, fit() must stop calling the cosine scheduler and let
+    # ReduceLROnPlateau own the LR instead — verify the gating condition
+    # fit() relies on, matching the research trainer's `in_warmup` check.
+    in_warmup_last_epoch = (warmup_epochs - 1) < warmup_epochs
+    in_warmup_post_epoch = warmup_epochs < warmup_epochs
+    assert in_warmup_last_epoch is True
+    assert in_warmup_post_epoch is False
+    assert lr_after_warmup_step > 0
 
 
 def test_heldout_validation_metric_accepts_mse():

@@ -56,6 +56,14 @@ class TrainConfig:
     val_crps_dist_type: str = "gaussian"
     val_crps_use_inference_epoch: bool = True
     val_mc_batch_size: int = 1
+    # Linear warmup + cosine anneal runs for the whole schedule by default.
+    # The 26e reference instead switches to ReduceLROnPlateau (monitoring
+    # held-out MSE) once warmup ends; set use_adaptive_lr=True to match it.
+    use_adaptive_lr: bool = False
+    lr_reduce_factor: float = 0.5
+    lr_reduce_patience: int = 10
+    lr_reduce_threshold: float = 1e-4
+    lr_reduce_cooldown: int = 2
     kl_warmup_epochs: Optional[int] = None
     kl_warmup_ratio: Optional[float] = None
     kl_strategy: str = "cosine"
@@ -132,6 +140,12 @@ class TrainConfig:
             raise ValueError("val_mc_batch_size must be positive")
         if self.kl_warmup_ratio is not None and not 0 < self.kl_warmup_ratio <= 1:
             raise ValueError("kl_warmup_ratio must be in (0, 1]")
+        if not 0 < self.lr_reduce_factor < 1:
+            raise ValueError("lr_reduce_factor must be in (0, 1)")
+        if self.lr_reduce_patience < 0 or self.lr_reduce_cooldown < 0:
+            raise ValueError("lr_reduce_patience and lr_reduce_cooldown must be non-negative")
+        if self.lr_reduce_threshold < 0:
+            raise ValueError("lr_reduce_threshold must be non-negative")
         if self.kl_strategy not in {"linear", "cosine", "cyclical"}:
             raise ValueError("kl_strategy must be linear, cosine, or cyclical")
         if self.kl_cycles < 1 or not 0 < self.kl_cycle_ratio <= 1:

@@ -62,6 +62,12 @@ def build_parser():
     train_p.add_argument("--val-crps-every-n-epochs", type=int, default=1)
     train_p.add_argument("--val-crps-dist-type", choices=["gaussian", "student_t"], default="gaussian")
     train_p.add_argument("--val-mc-batch-size", type=int, default=1)
+    train_p.add_argument("--use-adaptive-lr", action="store_true",
+                         help="Switch to ReduceLROnPlateau (monitoring held-out MSE) after warmup, as in the 26e reference.")
+    train_p.add_argument("--lr-reduce-factor", type=float, default=0.5)
+    train_p.add_argument("--lr-reduce-patience", type=int, default=10)
+    train_p.add_argument("--lr-reduce-threshold", type=float, default=1e-4)
+    train_p.add_argument("--lr-reduce-cooldown", type=int, default=2)
     train_p.add_argument("--kl-warmup-ratio", type=float, default=None)
     train_p.add_argument("--kl-strategy", choices=["linear", "cosine", "cyclical"], default="cosine")
     train_p.add_argument("--use-amp", action="store_true")
@@ -165,6 +171,11 @@ def main(argv=None):
             val_crps_every_n_epochs=args.val_crps_every_n_epochs,
             val_crps_dist_type=args.val_crps_dist_type,
             val_mc_batch_size=args.val_mc_batch_size,
+            use_adaptive_lr=args.use_adaptive_lr,
+            lr_reduce_factor=args.lr_reduce_factor,
+            lr_reduce_patience=args.lr_reduce_patience,
+            lr_reduce_threshold=args.lr_reduce_threshold,
+            lr_reduce_cooldown=args.lr_reduce_cooldown,
             kl_warmup_ratio=args.kl_warmup_ratio,
             kl_strategy=args.kl_strategy,
             use_amp=args.use_amp,
