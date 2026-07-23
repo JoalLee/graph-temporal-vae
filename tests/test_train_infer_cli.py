@@ -336,6 +336,26 @@ def test_use_adaptive_lr_builds_plateau_scheduler_and_skips_cosine_after_warmup(
     assert lr_after_warmup_step > 0
 
 
+def test_trainer_uses_adamw_for_reference_weight_decay():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        weight_decay=0.01,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [4],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    model = ImputationVAE_Graph(target_dim=1, aux_dim=0, window_size=8, **config.model_kwargs)
+    trainer = Trainer(model, train_loader=None, val_loader=None, config=config, device=torch.device("cpu"))
+    assert isinstance(trainer.optimizer, torch.optim.AdamW)
+    assert trainer.optimizer.param_groups[0]["weight_decay"] == 0.01
+
+
 def test_heldout_validation_metric_accepts_mse():
     config = TrainConfig(
         csv=["unused.csv"],

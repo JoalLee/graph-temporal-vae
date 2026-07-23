@@ -54,6 +54,7 @@
   "use_graph_ffn": true,
   "graph_ffn_mult": 4,
   "use_homogeneous": true,
+  "cross_modal_query_gate_mode": "legacy_hard",
   "use_feature_logvar_bias": true,
   "feature_logvar_bias_scope": "psd",
   "feature_logvar_bias_init": 0.0,

@@ -84,6 +84,7 @@ def load_bundle(path, device=None):
         "target_cols": bundle["target_cols"],
         "aux_cols": bundle["aux_cols"],
         "window_size": bundle["window_size"],
+        "stride": bundle.get("stride", bundle.get("config", {}).get("stride")),
         "aux_missing_mode": bundle["aux_missing_mode"],
         "aux_mask_channel": bundle["aux_mask_channel"],
         "target_transform": bundle.get("target_transform", "none"),
@@ -272,7 +273,10 @@ def impute(
     if not ts_col:
         raise ValueError("timestamp_col not found in bundle config; pass timestamp_col= explicitly")
 
-    stride = stride or max(1, window_size // 2)
+    # Reuse the training window stride unless the caller explicitly overrides
+    # it.  The 26e reference uses stride=24; falling back to window//2 would
+    # silently change the overlap geometry during inference.
+    stride = stride or bundle.get("stride") or max(1, window_size // 2)
     stride = min(stride, window_size)
     if inference_batch_size < 1 or mc_batch_size < 1:
         raise ValueError("inference_batch_size and mc_batch_size must be positive")
@@ -298,8 +302,31 @@ def impute(
         f"{len(target_cols)} targets, {n_mc_samples} MC samples, stride={stride}, device={device}"
     )
 
-    def iter_window_samples():
+    def compute_window_predictions():
+        """Run the model once per window batch and split its output into two
+        separate per-window streams for the cross-window aggregator:
+
+        - mean_chunks: the decoder's own point-estimate mean (`compute_uncertainty`
+          result[0]), averaged only over MC-*dropout* draws -- no injected
+          Student-t/Gaussian noise. This is what the point-accuracy estimate
+          (`imputed_mean`) should be built from: it is exactly as stable as
+          the decoder's clamped-variance output, with no risk of a single
+          heavy-tailed noise draw dragging the aggregate.
+        - sample_chunks: the full generative draws (result[-2], mean + noise),
+          used ONLY for quantiles/std, where reflecting the full predictive
+          distribution (not just the epistemic spread of the mean) is
+          actually what's wanted.
+
+        Averaging the noisy draws for the point estimate too (what this
+        package used to do) is a real, not just theoretical, failure mode:
+        on a real held-out eval it produced psd_heldout_r2 in the thousands-
+        negative range, because a Student-t/Gaussian draw at even a
+        moderate multiple of predicted std, once passed through the log1p
+        output transform, can be enormous.
+        """
         model.eval()
+        mean_chunks = []
+        sample_chunks = []
         with torch.no_grad():
             batch_starts_list = range(0, len(starts), inference_batch_size)
             for batch_start in tqdm(batch_starts_list, desc="impute windows", total=n_batches, disable=not is_interactive()):
@@ -322,25 +349,31 @@ def impute(
                     return_samples=True,
                     mc_batch_size=mc_batch_size,
                 )
-                samples_scaled = result[-2].cpu().numpy()  # [MC, batch, window, features]
+                pred_mean_scaled = result[0].cpu().numpy()  # [batch, window, features], noise-free
+                samples_scaled = result[-2].cpu().numpy()  # [MC, batch, window, features], noisy
+                pred_mean_model = (
+                    pred_mean_scaled * scaler_target.std_[None, None, :]
+                    + scaler_target.mean_[None, None, :]
+                )
                 samples_model = (
                     samples_scaled * scaler_target.std_[None, None, None, :]
                     + scaler_target.mean_[None, None, None, :]
                 )
-                # Yield model-space (pre-output-transform) samples; the
-                # transform is applied once to the aggregated summary
-                # statistics below, not per MC sample -- see
-                # summary_to_output_scale.
                 for i, start in enumerate(batch_starts):
-                    yield start, samples_model[:, i]
+                    mean_chunks.append((start, pred_mean_model[i][None, :, :]))  # [1, window, features]
+                    sample_chunks.append((start, samples_model[:, i]))  # [MC, window, features]
+        return mean_chunks, sample_chunks
 
-    aggregated = aggregate_window_samples(
-        iter_window_samples(), total_length=n,
-        position_weights=trapezoid_position_weights(window_size),
-        quantiles=(0.05, 0.95),
+    mean_chunks, sample_chunks = compute_window_predictions()
+    position_weights = trapezoid_position_weights(window_size)
+    mean_agg = aggregate_window_samples(
+        mean_chunks, total_length=n, position_weights=position_weights, quantiles=()
+    )
+    dist_agg = aggregate_window_samples(
+        sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.05, 0.95)
     )
     mean_out, std_out, quantiles_out = summary_to_output_scale(
-        aggregated["mean"], aggregated["variance"], aggregated["quantiles"], target_output_transform
+        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], target_output_transform
     )
     q05_out = quantiles_out[0.05]
     q95_out = quantiles_out[0.95]

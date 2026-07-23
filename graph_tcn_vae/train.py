@@ -204,7 +204,11 @@ class Trainer:
         self.config = config
         self.device = device
 
-        self.optimizer = optim.Adam(
+        # The 26e reference trainer uses AdamW, not Adam.  Keeping the
+        # optimizer choice explicit here matters when weight_decay is part of
+        # a reproduction config: Adam and AdamW apply that regularization
+        # differently.
+        self.optimizer = optim.AdamW(
             self.model.parameters(), lr=config.lr, weight_decay=config.weight_decay
         )
         if config.kl_warmup_epochs is not None:
@@ -610,6 +614,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "target_cols": list(config.target_cols),
         "aux_cols": list(config.aux_cols),
         "window_size": config.window_size,
+        "stride": config.stride,
         "aux_missing_mode": "mask_channel" if config.aux_mask_channel else "legacy_zero_fill",
         "aux_mask_channel": config.aux_mask_channel,
         "target_transform": config.target_transform,

@@ -141,6 +141,28 @@ By default the learning rate follows linear warmup + cosine annealing for the wh
 
 When auxiliary columns are configured, the CLI automatically appends one observedness channel per auxiliary column to `cond`. A missing auxiliary value is therefore represented as `(zero-filled value, mask=0)` and is not silently treated as a real standardized zero. The target `mask` remains target-only.
 
+To reproduce the private 26e Chem/PSD reference input contract, first derive the
+five meteorological/BLH features and six cyclic time features from the raw
+source files, then use the explicit parity runner:
+
+```bash
+python examples/prepare_26e_input.py \
+  --chem data/chem_2024_2025_clean.csv \
+  --psd data/psd_2024_2025.csv \
+  --blh data/blh.csv \
+  -o data/experiment_input_raw_26e.csv
+
+python examples/train_26e_parity.py \
+  --input data/experiment_input_raw_26e.csv \
+  -o checkpoints/26e_parity.pt
+```
+
+This reference runner intentionally uses the full 15,336-row timeline (633
+windows at `window=168, stride=24`), `seed=42` for both training and the
+anchor-constrained held-out mask, `ho_mse` selection, AdamW with
+`weight_decay=0.01`, legacy dynamic masking, and the 26e Student-t/loss
+weighting schedule. It is separate from the general CLI defaults.
+
 Any `ImputationVAE_Graph` constructor flag (see `graph_tcn_vae/model_graph_uq.py`) can be set via `--model-config path/to/config.json`, which takes priority over the convenience flags (`--latent-dim`, `--hidden-dims`, `--encoder-layers`, `--decoder-layers`, `--n-graph-heads`, `--n-chem`, `--heteroscedastic`).
 
 The same functionality is available programmatically:

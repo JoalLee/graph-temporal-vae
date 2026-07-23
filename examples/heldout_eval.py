@@ -100,7 +100,10 @@ def main():
     aux_scaled = scaler_aux.transform(aux_raw) if aux_cols else aux_raw
     aux_observed = ~np.isnan(aux_raw)
 
-    stride = args.stride or max(1, window_size // 2)
+    # Prefer the training stride stored in the bundle.  The reference 26e
+    # protocol uses stride=24; window_size//2 would produce a different
+    # overlap geometry when --stride is omitted.
+    stride = args.stride or bundle.get("stride") or max(1, window_size // 2)
     stride = min(stride, window_size)
     starts = compute_window_starts(n, window_size, stride)
     if not starts:
@@ -114,8 +117,16 @@ def main():
         f"{args.n_mc_samples} MC samples, stride={stride}, device={device}"
     )
 
-    def iter_window_samples():
+    def compute_window_predictions():
+        # See infer.impute's compute_window_predictions for why this is two
+        # streams: mean_chunks (the decoder's own noise-free point estimate,
+        # MC-dropout-averaged only) drives the R^2/MAE point estimate;
+        # sample_chunks (full generative mean+noise draws) drives quantiles
+        # only. Averaging noisy draws for the point estimate is what turned
+        # a real held-out eval's psd_heldout_r2 into the thousands-negative.
         model.eval()
+        mean_chunks = []
+        sample_chunks = []
         with torch.no_grad():
             batch_starts_list = range(0, len(starts), args.inference_batch_size)
             for batch_start in tqdm(
@@ -138,24 +149,31 @@ def main():
                 result = model.compute_uncertainty(
                     x_t, cond_t, mask_t, n_samples=max(2, args.n_mc_samples), return_samples=True,
                 )
+                pred_mean_scaled = result[0].cpu().numpy()
                 samples_scaled = result[-2].cpu().numpy()
+                pred_mean_model = (
+                    pred_mean_scaled * scaler_target.std_[None, None, :]
+                    + scaler_target.mean_[None, None, :]
+                )
                 samples_model = (
                     samples_scaled * scaler_target.std_[None, None, None, :]
                     + scaler_target.mean_[None, None, None, :]
                 )
-                # Model-space (pre-output-transform) samples; the transform
-                # is applied once to the aggregated mean/quantiles below, not
-                # per MC sample -- see summary_to_output_scale.
                 for i, start in enumerate(batch_starts):
-                    yield start, samples_model[:, i]
+                    mean_chunks.append((start, pred_mean_model[i][None, :, :]))
+                    sample_chunks.append((start, samples_model[:, i]))
+        return mean_chunks, sample_chunks
 
-    aggregated = aggregate_window_samples(
-        iter_window_samples(), total_length=n,
-        position_weights=trapezoid_position_weights(window_size),
-        quantiles=(0.025, 0.975),
+    mean_chunks, sample_chunks = compute_window_predictions()
+    position_weights = trapezoid_position_weights(window_size)
+    mean_agg = aggregate_window_samples(
+        mean_chunks, total_length=n, position_weights=position_weights, quantiles=()
+    )
+    dist_agg = aggregate_window_samples(
+        sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.025, 0.975)
     )
     mean_out, _std_out, quantiles_out = summary_to_output_scale(
-        aggregated["mean"], aggregated["variance"], aggregated["quantiles"], target_output_transform
+        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], target_output_transform
     )
     q025 = quantiles_out[0.025]
     q975 = quantiles_out[0.975]
