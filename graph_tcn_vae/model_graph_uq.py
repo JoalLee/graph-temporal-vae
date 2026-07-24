@@ -15,6 +15,30 @@ import torch.nn.functional as F
 import numpy as np
 from torch.nn.utils import parametrizations as param
 
+# Staged split: the compatibility monolith still defines the historical
+# symbols below, while GraphEncoder/GraphDecoder/ImputationVAE_Graph build
+# their internals from extracted modules. Once the three top-level classes
+# have dedicated parity contracts, this file can become a thin re-export facade.
+from graph_tcn_vae.flows import RealNVP as _SplitRealNVP
+from graph_tcn_vae.graph_blocks import (
+    AxialObservedAttentionBlock as _SplitAxialObservedAttentionBlock,
+    DepthwiseTCN as _SplitDepthwiseTCN,
+    LocalContextMemoryAttention as _SplitLocalContextMemoryAttention,
+    MaskedTemporalCrossAttention as _SplitMaskedTemporalCrossAttention,
+    PreGraphPerFeatureTemporalAttention as _SplitPreGraphPerFeatureTemporalAttention,
+    TemporalAttentionPool as _SplitTemporalAttentionPool,
+    TemporalObservationRefiner as _SplitTemporalObservationRefiner,
+    TimeHybridEncoder as _SplitTimeHybridEncoder,
+)
+from graph_tcn_vae.graph_layers import (
+    CrossModalGraphLayer as _SplitCrossModalGraphLayer,
+    ExternalHistoryContext as _SplitExternalHistoryContext,
+    InputGraphLayer as _SplitInputGraphLayer,
+    LocalChunkGraphBranch as _SplitLocalChunkGraphBranch,
+    TokenGraphCrossBlock as _SplitTokenGraphCrossBlock,
+    TokenGraphSelfBlock as _SplitTokenGraphSelfBlock,
+)
+
 
 class TimeHybridEncoder(nn.Module):
     """Hybrid time encoder: learnable embeddings + cyclical sin/cos features.
@@ -2393,13 +2417,13 @@ class GraphEncoder(nn.Module):
 
             self.token_target_embed = nn.Linear(window_size, token_dim)
             self.token_target_embed_norm = nn.LayerNorm(token_dim)
-            self.token_shared_self_block = TokenGraphSelfBlock(
+            self.token_shared_self_block = _SplitTokenGraphSelfBlock(
                 d_model=token_dim,
                 n_heads=n_graph_heads,
                 dropout=dropout,
                 ffn_mult=self.graph_ffn_mult,
             )
-            self.token_branch_self_block = TokenGraphSelfBlock(
+            self.token_branch_self_block = _SplitTokenGraphSelfBlock(
                 d_model=token_dim,
                 n_heads=n_graph_heads,
                 dropout=dropout,
@@ -2412,7 +2436,7 @@ class GraphEncoder(nn.Module):
             if use_cross_modal_graph and target_dim is not None and aux_dim is not None and aux_dim > 0:
                 self.token_aux_embed = nn.Linear(window_size, token_dim)
                 self.token_aux_embed_norm = nn.LayerNorm(token_dim)
-                self.token_branch_cross_block = TokenGraphCrossBlock(
+                self.token_branch_cross_block = _SplitTokenGraphCrossBlock(
                     d_model=token_dim,
                     n_heads=n_graph_heads,
                     dropout=dropout,
@@ -2435,7 +2459,7 @@ class GraphEncoder(nn.Module):
             if use_input_graph_layer and n_input_graph_layers > 0:
                 n_graph_features = target_dim if target_dim is not None else input_dim
                 self.input_graph_layers = nn.ModuleList([
-                    InputGraphLayer(
+                    _SplitInputGraphLayer(
                         n_features=n_graph_features,
                         window_size=window_size,
                         n_heads=n_graph_heads,
@@ -2459,7 +2483,7 @@ class GraphEncoder(nn.Module):
 
             # Target-Aux Cross-Attention
             if use_cross_modal_graph and target_dim is not None and aux_dim is not None and aux_dim > 0:
-                self.cross_modal_graph_layer = CrossModalGraphLayer(
+                self.cross_modal_graph_layer = _SplitCrossModalGraphLayer(
                     target_dim=target_dim,
                     aux_dim=aux_dim,
                     window_size=window_size,
@@ -2520,15 +2544,15 @@ class GraphEncoder(nn.Module):
         required_layers = int(np.ceil(np.log2(window_size)))
         
         if self.use_temporal_cnn and self.use_pregraph_depthwise_tcn and target_dim is not None:
-            self.target_tcn = DepthwiseTCN(target_dim, num_layers=required_layers, kernel_size=3)
-            self.aux_tcn = DepthwiseTCN(aux_dim, num_layers=required_layers, kernel_size=3) if aux_dim is not None and aux_dim > 0 else nn.Identity()
+            self.target_tcn = _SplitDepthwiseTCN(target_dim, num_layers=required_layers, kernel_size=3)
+            self.aux_tcn = _SplitDepthwiseTCN(aux_dim, num_layers=required_layers, kernel_size=3) if aux_dim is not None and aux_dim > 0 else nn.Identity()
         else:
             self.target_tcn = nn.Identity()
             self.aux_tcn = nn.Identity()
 
         self.axial_observed_attn = None
         if self.use_axial_observed_attn and target_dim is not None:
-            self.axial_observed_attn = AxialObservedAttentionBlock(
+            self.axial_observed_attn = _SplitAxialObservedAttentionBlock(
                 n_features=target_dim,
                 window_size=window_size,
                 attn_dim=self.axial_attn_dim,
@@ -2543,7 +2567,7 @@ class GraphEncoder(nn.Module):
 
         self.pregraph_feature_temporal_attn = None
         if self.use_pregraph_feature_temporal_attn and target_dim is not None:
-            self.pregraph_feature_temporal_attn = PreGraphPerFeatureTemporalAttention(
+            self.pregraph_feature_temporal_attn = _SplitPreGraphPerFeatureTemporalAttention(
                 window_size=window_size,
                 attn_dim=self.pregraph_feature_temporal_attn_dim,
                 n_heads=self.pregraph_feature_temporal_attn_heads,
@@ -2563,7 +2587,7 @@ class GraphEncoder(nn.Module):
                     f"Unsupported local_chunk_graph_mode={self.local_chunk_graph_mode}; "
                     f"expected one of {sorted(valid_local_chunk_modes)}"
                 )
-            self.local_chunk_graph = LocalChunkGraphBranch(
+            self.local_chunk_graph = _SplitLocalChunkGraphBranch(
                 n_features=target_dim,
                 window_size=window_size,
                 chunk_size=self.local_chunk_graph_chunk_size,
@@ -2610,7 +2634,7 @@ class GraphEncoder(nn.Module):
         # self.avg_pool = nn.AdaptiveAvgPool1d(1) # [REPLACED]
         
         # Attention Pooling (New)
-        self.attn_pool = TemporalAttentionPool(hidden_dims[-1])
+        self.attn_pool = _SplitTemporalAttentionPool(hidden_dims[-1])
         self.latent_pooled_norm = (
             nn.LayerNorm(hidden_dims[-1]) if self.use_latent_pooled_norm else nn.Identity()
         )
@@ -2620,7 +2644,7 @@ class GraphEncoder(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dims[-1], latent_dim)
         self.temporal_refiner = None
         if self.use_temporal_refiner:
-            self.temporal_refiner = TemporalObservationRefiner(
+            self.temporal_refiner = _SplitTemporalObservationRefiner(
                 hidden_dim=hidden_dims[-1],
                 window_size=window_size,
                 attn_dim=self.temporal_refiner_dim,
@@ -3631,7 +3655,7 @@ class GraphDecoder(nn.Module):
             if self.use_local_context_map:
                 if self.local_context_fusion_mode == 'attn':
                     if self.local_context_attn_location in {'mid_tcn', 'both'}:
-                        self.local_context_attn_fusion = LocalContextMemoryAttention(
+                        self.local_context_attn_fusion = _SplitLocalContextMemoryAttention(
                             dec_dim=hidden,
                             ctx_dim=self.local_context_dim,
                             n_heads=self.local_context_attn_heads,
@@ -3653,7 +3677,7 @@ class GraphDecoder(nn.Module):
                             stage_lengths.append(window_size)
                         self.local_context_upsample_stage_lengths = tuple(stage_lengths)
                         self.local_context_upsample_attn_fusions = nn.ModuleList([
-                            LocalContextMemoryAttention(
+                            _SplitLocalContextMemoryAttention(
                                 dec_dim=hidden,
                                 ctx_dim=self.local_context_dim,
                                 n_heads=self.local_context_attn_heads,
@@ -3706,7 +3730,7 @@ class GraphDecoder(nn.Module):
             nn.init.constant_(self.z_skip_gate.bias, self.z_skip_gate_init)
         
         if self.use_decoder_cross_attn:
-            self.dec_cross_attn = MaskedTemporalCrossAttention(
+            self.dec_cross_attn = _SplitMaskedTemporalCrossAttention(
                 dec_dim=hidden, enc_dim=hidden_dims[-1], n_heads=n_cross_attn_heads, dropout=dropout
             )
             # Global per-channel gate keeps encoder retrieval as a refinement path,
@@ -4749,7 +4773,7 @@ class ImputationVAE_Graph(nn.Module):
         # Keep cond dimensionality stable by default (time_hybrid_dim=6).
         self.time_hybrid_encoder = None
         if use_hybrid_time_encoding and aux_dim >= (time_numeric_dim + time_cyc_dim):
-            self.time_hybrid_encoder = TimeHybridEncoder(
+            self.time_hybrid_encoder = _SplitTimeHybridEncoder(
                 out_dim=time_hybrid_dim,
                 hour_embed_dim=hour_embed_dim,
                 dow_embed_dim=dow_embed_dim,
@@ -4916,7 +4940,7 @@ class ImputationVAE_Graph(nn.Module):
         if self.use_external_history_context:
             if not self.use_local_context_map:
                 raise ValueError("use_external_history_context=True requires use_local_context_map=True")
-            self.external_history_context = ExternalHistoryContext(
+            self.external_history_context = _SplitExternalHistoryContext(
                 target_dim=target_dim,
                 cond_dim=aux_dim,
                 context_dim=self.local_context_dim,
