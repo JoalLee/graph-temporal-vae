@@ -233,13 +233,18 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
     predictions = pd.read_csv(predictions_path)
     expected_cols = {
         "timestamp", "feature", "family", "scaled_observed", "scaled_pred_mean",
-        "physical_observed", "physical_pred_mean", "physical_pred_std",
-        "physical_q025", "physical_q975",
+        "model_observed", "model_pred_mean", "physical_observed", "physical_pred_mean",
+        "physical_pred_std", "physical_q025", "physical_q975",
     }
     assert expected_cols <= set(predictions.columns)
     assert len(predictions) == results["chem_heldout_n"] + results["psd_heldout_n"]
     assert set(predictions["family"]) <= {"chem", "psd"}
     assert predictions["physical_pred_std"].gt(0).all()
+    # scaled_* must be the SAME z-score space for observed and predicted --
+    # a real (if imperfect) model should land in a comparable range, not be
+    # off by the several standard deviations a de-standardized value
+    # mislabeled as "scaled" would produce.
+    assert (predictions["scaled_pred_mean"] - predictions["scaled_observed"]).abs().median() < 5
 
 
 def test_sample_level_overlap_aggregation_preserves_cross_window_mixture():

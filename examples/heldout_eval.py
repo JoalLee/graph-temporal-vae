@@ -211,12 +211,22 @@ def main():
 
     if args.predictions_csv:
         # One row per held-out (timestamp, feature), at every level a
-        # transform-order bug could hide: the standardized (z-score) model
-        # input/output the network actually sees, and the fully
-        # de-standardized + inverse-transformed physical value the reported
-        # metrics are computed from. Comparing these by hand for a few rows
-        # is the fastest way to confirm the output transform was applied
-        # exactly once, in the right place.
+        # transform-order bug could hide:
+        #   scaled_*    -- z-score standardized space (what the network
+        #                  literally inputs/outputs before de-standardizing).
+        #   model_*     -- de-standardized, but BEFORE target_output_transform
+        #                  (e.g. still log1p space if target_transform=none
+        #                  and target_output_transform=log1p).
+        #   physical_*  -- fully inverse-transformed; what the reported
+        #                  metrics are computed from.
+        # mean_agg["mean"] is already de-standardized (mean_chunks holds
+        # pred_mean_model = pred_mean_scaled * std + mean), so the z-scored
+        # prediction is recovered by inverting that same affine map --
+        # aggregation is a weighted average, which commutes with any affine
+        # transform, so this is exactly the same value a separate aggregation
+        # pass over pred_mean_scaled would give.
+        model_pred_mean = mean_agg["mean"]
+        scaled_pred_mean = (model_pred_mean - scaler_target.mean_[None, :]) / scaler_target.std_[None, :]
         rows, cols = np.nonzero(heldout_mask)
         families = np.where(cols < n_chem, "chem", "psd")
         frames_out = pd.DataFrame({
@@ -224,7 +234,9 @@ def main():
             "feature": [target_cols[c] for c in cols],
             "family": families,
             "scaled_observed": target_scaled[rows, cols],
-            "scaled_pred_mean": mean_agg["mean"][rows, cols],
+            "scaled_pred_mean": scaled_pred_mean[rows, cols],
+            "model_observed": target_model_space[rows, cols],
+            "model_pred_mean": model_pred_mean[rows, cols],
             "physical_observed": observed_output[rows, cols],
             "physical_pred_mean": mean_out[rows, cols],
             "physical_pred_std": std_out[rows, cols],
