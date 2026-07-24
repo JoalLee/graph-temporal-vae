@@ -22,6 +22,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -64,7 +65,14 @@ def main():
     ap.add_argument("--n-mc-samples", type=int, default=50)
     ap.add_argument("--stride", type=int, default=None, help="Defaults to window_size // 2.")
     ap.add_argument("--inference-batch-size", type=int, default=4)
-    ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("-o", "--output", default=None, help="Path to write the aggregate metrics JSON.")
+    ap.add_argument(
+        "--predictions-csv", default=None,
+        help="Optional path to write one row per held-out (timestamp, feature): both the scaled "
+             "(standardized, pre-output-transform model space) and physical (post-transform) "
+             "observed value and prediction, so the reported metrics can be checked by hand -- "
+             "e.g. to rule out a double-applied output transform.",
+    )
     args = ap.parse_args()
 
     bundle = load_bundle(args.bundle)
@@ -172,7 +180,7 @@ def main():
     dist_agg = aggregate_window_samples(
         sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.025, 0.975)
     )
-    mean_out, _std_out, quantiles_out = summary_to_output_scale(
+    mean_out, std_out, quantiles_out = summary_to_output_scale(
         mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], target_output_transform
     )
     q025 = quantiles_out[0.025]
@@ -200,6 +208,31 @@ def main():
     if args.output:
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
+
+    if args.predictions_csv:
+        # One row per held-out (timestamp, feature), at every level a
+        # transform-order bug could hide: the standardized (z-score) model
+        # input/output the network actually sees, and the fully
+        # de-standardized + inverse-transformed physical value the reported
+        # metrics are computed from. Comparing these by hand for a few rows
+        # is the fastest way to confirm the output transform was applied
+        # exactly once, in the right place.
+        rows, cols = np.nonzero(heldout_mask)
+        families = np.where(cols < n_chem, "chem", "psd")
+        frames_out = pd.DataFrame({
+            "timestamp": frame.index[rows],
+            "feature": [target_cols[c] for c in cols],
+            "family": families,
+            "scaled_observed": target_scaled[rows, cols],
+            "scaled_pred_mean": mean_agg["mean"][rows, cols],
+            "physical_observed": observed_output[rows, cols],
+            "physical_pred_mean": mean_out[rows, cols],
+            "physical_pred_std": std_out[rows, cols],
+            "physical_q025": q025[rows, cols],
+            "physical_q975": q975[rows, cols],
+        })
+        frames_out.to_csv(args.predictions_csv, index=False)
+        print(f"wrote {len(frames_out)} held-out predictions to {args.predictions_csv}")
 
 
 if __name__ == "__main__":

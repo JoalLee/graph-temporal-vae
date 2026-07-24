@@ -206,6 +206,7 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
     ])
 
     output_path = tmp_path / "heldout_metrics.json"
+    predictions_path = tmp_path / "heldout_predictions.csv"
     script = Path(__file__).resolve().parents[1] / "examples" / "heldout_eval.py"
     proc = subprocess.run(
         [
@@ -216,6 +217,7 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
             "--n-mc-samples", "3",
             "--stride", "8",
             "-o", str(output_path),
+            "--predictions-csv", str(predictions_path),
         ],
         capture_output=True, text=True,
     )
@@ -227,6 +229,17 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
         assert results[f"{group}_heldout_n"] > 0
         assert np.isfinite(results[f"{group}_heldout_mae"])
         assert 0.0 <= results[f"{group}_heldout_picp95"] <= 1.0
+
+    predictions = pd.read_csv(predictions_path)
+    expected_cols = {
+        "timestamp", "feature", "family", "scaled_observed", "scaled_pred_mean",
+        "physical_observed", "physical_pred_mean", "physical_pred_std",
+        "physical_q025", "physical_q975",
+    }
+    assert expected_cols <= set(predictions.columns)
+    assert len(predictions) == results["chem_heldout_n"] + results["psd_heldout_n"]
+    assert set(predictions["family"]) <= {"chem", "psd"}
+    assert predictions["physical_pred_std"].gt(0).all()
 
 
 def test_sample_level_overlap_aggregation_preserves_cross_window_mixture():
