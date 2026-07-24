@@ -19,16 +19,23 @@ from torch.utils.data import DataLoader, get_worker_info
 from tqdm import tqdm
 
 from .config import TrainConfig
+from .contracts import DataSchema
 from .data import (
-    NaNAwareStandardScaler,
     WindowedTimeSeriesDataset,
     chronological_split_index,
     load_frame,
+    load_modality_frame,
     sample_anchor_constrained_heldout_mask,
     sample_dynamic_heldout_mask,
-    transform_target_values,
 )
 from .model_graph_uq import ImputationVAE_Graph
+from .preprocessing import (
+    fit_auxiliary_scaler,
+    fit_target_scaler,
+    target_output_transforms,
+    transform_auxiliary,
+    transform_targets,
+)
 from .utils import KLAnnealingScheduler, LRWarmupCosineScheduler, is_interactive, setup_device
 
 
@@ -56,6 +63,41 @@ def _student_t_nll(recon_mean, recon_logvar, target, var_min=1e-3, var_max=10.0,
     residual_sq = (target - recon_mean).square()
     return -const + 0.5 * torch.log(sigma_sq) + ((df + 1.0) / 2.0) * torch.log1p(
         residual_sq / (df * sigma_sq)
+    )
+
+
+def _pointwise_reconstruction_nll(
+    recon_mean,
+    recon_logvar,
+    target,
+    *,
+    model=None,
+    use_student_t_nll=False,
+    var_min=1e-3,
+    var_max=10.0,
+):
+    """Return the same pointwise likelihood loss for training and validation."""
+    if recon_logvar is None:
+        return (recon_mean - target).square()
+    if use_student_t_nll:
+        df = None
+        df_getter = getattr(model, "get_likelihood_df", None) if model is not None else None
+        if callable(df_getter):
+            df = df_getter(target.shape[-1], device=target.device, dtype=target.dtype)
+        return _student_t_nll(
+            recon_mean,
+            recon_logvar,
+            target,
+            var_min=var_min,
+            var_max=var_max,
+            df=df,
+        )
+    logvar_clamped = recon_logvar.clamp(
+        min=np.log(var_min), max=np.log(var_max)
+    )
+    variance = torch.exp(logvar_clamped)
+    return 0.5 * (
+        logvar_clamped + (target - recon_mean).square() / variance
     )
 
 
@@ -130,18 +172,17 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
     n_obs = metric_mask.sum().clamp(min=1.0)
 
     if recon_logvar is not None:
-        if use_student_t_nll:
-            df = None
-            df_getter = getattr(model, "get_likelihood_df", None) if model is not None else None
-            if callable(df_getter):
-                df = df_getter(target.shape[-1], device=target.device, dtype=target.dtype)
-            nll = _student_t_nll(recon_mean, recon_logvar, target, var_min, var_max, df)
-        else:
-            logvar_clamped = recon_logvar.clamp(min=np.log(var_min), max=np.log(var_max))
-            var = torch.exp(logvar_clamped)
-            nll = 0.5 * (logvar_clamped + (target - recon_mean) ** 2 / var)
+        point_nll = _pointwise_reconstruction_nll(
+            recon_mean,
+            recon_logvar,
+            target,
+            model=model,
+            use_student_t_nll=use_student_t_nll,
+            var_min=var_min,
+            var_max=var_max,
+        )
         recon = _reduce_window_feature_loss(
-            nll,
+            point_nll,
             metric_mask,
             loss_normalization,
             n_chem=n_chem,
@@ -170,14 +211,33 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
 
 
 def empirical_crps_components(samples, target, mask):
-    """Return empirical CRPS sum and selected-point count."""
+    """Return exact empirical CRPS sum without an ``MC x MC`` tensor."""
     mask = mask.float()
     count = mask.sum()
     if count == 0:
         return torch.zeros((), device=target.device), count
+    if samples.ndim != target.ndim + 1 or samples.shape[1:] != target.shape:
+        raise ValueError("samples must have shape [MC, *target.shape]")
+    n_samples = samples.shape[0]
+    if n_samples < 2:
+        raise ValueError("empirical CRPS requires at least two samples")
+
     first = (samples - target.unsqueeze(0)).abs().mean(dim=0)
-    pairwise = 0.5 * (samples[:, None] - samples[None, :]).abs().mean(dim=(0, 1))
-    score = first - pairwise
+    sorted_samples = torch.sort(samples, dim=0).values
+    ranks = torch.arange(
+        1,
+        n_samples + 1,
+        device=samples.device,
+        dtype=samples.dtype,
+    )
+    coefficient_shape = (n_samples,) + (1,) * target.ndim
+    coefficients = (
+        2.0 * ranks - n_samples - 1.0
+    ).reshape(coefficient_shape)
+    half_pairwise = (
+        sorted_samples * coefficients
+    ).sum(dim=0) / float(n_samples * n_samples)
+    score = first - half_pairwise
     return (score * mask).sum(), count
 
 
@@ -201,20 +261,52 @@ def masked_mse(prediction, target, mask):
     return total / count.clamp(min=1.0)
 
 
-def masked_nll_components(recon_mean, recon_logvar, target, mask):
-    """Return Gaussian NLL sum and selected-point count."""
-    if recon_logvar is None:
-        return masked_mse_components(recon_mean, target, mask)
-    variance = torch.exp(recon_logvar).clamp(min=1e-6)
-    nll = 0.5 * (recon_logvar + (target - recon_mean) ** 2 / variance)
+def masked_nll_components(
+    recon_mean,
+    recon_logvar,
+    target,
+    mask,
+    *,
+    model=None,
+    use_student_t_nll=False,
+    var_min=1e-3,
+    var_max=10.0,
+):
+    """Return likelihood-consistent NLL sum and selected-point count."""
+    point_nll = _pointwise_reconstruction_nll(
+        recon_mean,
+        recon_logvar,
+        target,
+        model=model,
+        use_student_t_nll=use_student_t_nll,
+        var_min=var_min,
+        var_max=var_max,
+    )
     mask = mask.float()
-    return (nll * mask).sum(), mask.sum()
+    return (point_nll * mask).sum(), mask.sum()
 
 
-def masked_nll(recon_mean, recon_logvar, target, mask):
-    """Gaussian reconstruction NLL over a held-out mask."""
+def masked_nll(
+    recon_mean,
+    recon_logvar,
+    target,
+    mask,
+    *,
+    model=None,
+    use_student_t_nll=False,
+    var_min=1e-3,
+    var_max=10.0,
+):
+    """Likelihood-consistent reconstruction NLL over a held-out mask."""
     total, count = masked_nll_components(
-        recon_mean, recon_logvar, target, mask
+        recon_mean,
+        recon_logvar,
+        target,
+        mask,
+        model=model,
+        use_student_t_nll=use_student_t_nll,
+        var_min=var_min,
+        var_max=var_max,
     )
     return total / count.clamp(min=1.0)
 
@@ -302,6 +394,13 @@ class Trainer:
         if hasattr(self.model, "current_epoch"):
             self.model.current_epoch = int(epoch)
 
+    def _variance_bounds(self):
+        decoder = getattr(self.model, "decoder", None)
+        return (
+            float(getattr(decoder, "var_min", 1e-3)),
+            float(getattr(decoder, "var_max", 10.0)),
+        )
+
     def _run_epoch(self, loader, epoch, train):
         self.model.train(train)
         self._set_epoch_state(epoch)
@@ -322,6 +421,7 @@ class Trainer:
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
+                    var_min, var_max = self._variance_bounds()
                     loss, _recon, _kl = vae_loss(
                         recon_mean,
                         recon_logvar,
@@ -340,6 +440,8 @@ class Trainer:
                         family_loss_scale=self.config.family_loss_scale,
                         chem_feature_weight=self.config.chem_feature_weight,
                         psd_feature_weight=self.config.psd_feature_weight,
+                        var_min=var_min,
+                        var_max=var_max,
                     )
 
                 if train:
@@ -385,8 +487,16 @@ class Trainer:
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
+                var_min, var_max = self._variance_bounds()
                 nll_sum, heldout_count = masked_nll_components(
-                    recon_mean.float(), recon_logvar, target, heldout_mask
+                    recon_mean.float(),
+                    recon_logvar,
+                    target,
+                    heldout_mask,
+                    model=self.model,
+                    use_student_t_nll=self.config.use_student_t_nll,
+                    var_min=var_min,
+                    var_max=var_max,
                 )
                 mse_sum, mse_count = masked_mse_components(
                     recon_mean.float(), target, heldout_mask
@@ -496,51 +606,84 @@ class Trainer:
 def train_from_config(config: TrainConfig, save_path: str) -> float:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    frame = load_frame(
-        config.csv,
-        config.timestamp_col,
-        config.target_cols,
-        config.aux_cols,
-        expected_frequency=config.expected_frequency,
-        time_grid_policy=config.time_grid_policy,
-        duplicate_timestamp_policy=config.duplicate_timestamp_policy,
-    )
 
-    target_raw = frame[config.target_cols].to_numpy(dtype=np.float64)
-    target_model_space = transform_target_values(target_raw, config.target_transform)
+    model_kwargs = dict(config.model_kwargs)
+    if config.modality_files is not None:
+        frame, data_schema = load_modality_frame(
+            config.modality_files,
+            config.timestamp_col,
+            expected_frequency=config.expected_frequency,
+            time_grid_policy=config.time_grid_policy,
+            duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+        )
+        configured_n_chem = model_kwargs.get("n_chem")
+        if configured_n_chem is not None and int(configured_n_chem) != data_schema.n_chem:
+            raise ValueError(
+                f"model n_chem={configured_n_chem} conflicts with discovered chemistry "
+                f"columns ({data_schema.n_chem})"
+            )
+        model_kwargs["n_chem"] = data_schema.n_chem
+    else:
+        frame = load_frame(
+            config.csv,
+            config.timestamp_col,
+            config.target_cols,
+            config.aux_cols,
+            expected_frequency=config.expected_frequency,
+            time_grid_policy=config.time_grid_policy,
+            duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+        )
+        n_chem = int(model_kwargs.get("n_chem", 0))
+        if not 0 <= n_chem <= len(config.target_cols):
+            raise ValueError("n_chem must be between 0 and the number of target columns")
+        data_schema = DataSchema(
+            timestamp_col=config.timestamp_col,
+            chemistry_cols=list(config.target_cols[:n_chem]),
+            psd_cols=list(config.target_cols[n_chem:]),
+            meteorology_cols=list(config.aux_cols),
+            frequency=frame.attrs.get("frequency"),
+            timezone=frame.attrs.get("timezone"),
+            time_grid_policy=config.time_grid_policy,
+            duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+        )
+        model_kwargs["n_chem"] = n_chem
+
+    preprocessing = config.preprocessing
+    target_cols = data_schema.target_cols
+    aux_cols = data_schema.auxiliary_cols
+    n_chem = data_schema.n_chem
+    target_raw = frame[target_cols].to_numpy(dtype=np.float64)
+    target_model_space = transform_targets(target_raw, data_schema, preprocessing)
     aux_raw = (
-        frame[config.aux_cols].to_numpy(dtype=np.float64)
-        if config.aux_cols
-        else np.zeros((len(frame), 0))
+        frame[aux_cols].to_numpy(dtype=np.float64)
+        if aux_cols
+        else np.zeros((len(frame), 0), dtype=np.float64)
     )
+    aux_model_space = transform_auxiliary(aux_raw, preprocessing)
 
     full_data_validation = config.val_fraction == 0.0
     split_idx = chronological_split_index(len(frame), config.val_fraction)
     if full_data_validation:
         train_target = val_target = target_model_space
-        train_aux = val_aux = aux_raw
+        train_aux = val_aux = aux_model_space
     else:
         train_target, val_target = target_model_space[:split_idx], target_model_space[split_idx:]
-        train_aux, val_aux = aux_raw[:split_idx], aux_raw[split_idx:]
+        train_aux, val_aux = aux_model_space[:split_idx], aux_model_space[split_idx:]
     train_aux_mask = ~np.isnan(train_aux)
     val_aux_mask = ~np.isnan(val_aux)
 
-    scaler_target_fit = target_model_space if config.scaler_fit_scope == "full" else train_target
-    scaler_aux_fit = aux_raw if config.scaler_fit_scope == "full" else train_aux
-    scaler_target = NaNAwareStandardScaler().fit(scaler_target_fit)
-    scaler_aux = NaNAwareStandardScaler().fit(scaler_aux_fit) if config.aux_cols else NaNAwareStandardScaler().fit(
-        np.zeros((1, 0))
-    )
+    scaler_target_fit = target_model_space if preprocessing.fit_scope == "full" else train_target
+    scaler_aux_fit = aux_model_space if preprocessing.fit_scope == "full" else train_aux
+    scaler_target = fit_target_scaler(scaler_target_fit, data_schema, preprocessing)
+    scaler_aux = fit_auxiliary_scaler(scaler_aux_fit, preprocessing)
 
     train_target_scaled = scaler_target.transform(train_target)
-    train_target_scaled[np.isnan(train_target)] = np.nan  # keep NaN as the missingness signal
+    train_target_scaled[np.isnan(train_target)] = np.nan
     val_target_scaled = scaler_target.transform(val_target)
     val_target_scaled[np.isnan(val_target)] = np.nan
+    train_aux_scaled = scaler_aux.transform(train_aux) if aux_cols else train_aux
+    val_aux_scaled = scaler_aux.transform(val_aux) if aux_cols else val_aux
 
-    train_aux_scaled = scaler_aux.transform(train_aux) if config.aux_cols else train_aux
-    val_aux_scaled = scaler_aux.transform(val_aux) if config.aux_cols else val_aux
-
-    n_chem = int(config.model_kwargs.get("n_chem", 0))
     dynamic_mask_config = {
         "mode": config.dynamic_masking_mode,
         "target_ratio": config.dynamic_mask_target_ratio,
@@ -578,24 +721,29 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
                     seed=config.selection_val_seed,
                     n_chem=n_chem,
                 )
-                train_fixed_mask = None
         else:
             val_selection_mask = sample_dynamic_heldout_mask(
                 ~np.isnan(val_target),
                 {**dynamic_mask_config, "ensure_nonempty": True},
                 seed=config.selection_val_seed,
             )
-            train_fixed_mask = None
     else:
         val_selection_mask = None
     if len(val_target) and val_selection_mask.sum() == 0:
         raise ValueError("Validation split has no observed target positions for selection-HO validation")
 
     train_dataset = WindowedTimeSeriesDataset(
-        train_target_scaled, train_aux_scaled, config.window_size, config.stride,
-        mode="train", denoise_prob=config.denoise_prob, seed=config.seed,
-        aux_mask=train_aux_mask, aux_mask_channel=config.aux_mask_channel,
-        dynamic_mask_config=dynamic_mask_config, fixed_mask=train_fixed_mask,
+        train_target_scaled,
+        train_aux_scaled,
+        config.window_size,
+        config.stride,
+        mode="train",
+        denoise_prob=config.denoise_prob,
+        seed=config.seed,
+        aux_mask=train_aux_mask,
+        aux_mask_channel=preprocessing.aux_mask_channel,
+        dynamic_mask_config=dynamic_mask_config,
+        fixed_mask=train_fixed_mask,
     )
     if len(train_dataset) == 0:
         raise ValueError(
@@ -603,9 +751,15 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         )
 
     val_dataset = WindowedTimeSeriesDataset(
-        val_target_scaled, val_aux_scaled, config.window_size, config.stride,
-        mode="val", seed=config.seed, aux_mask=val_aux_mask,
-        aux_mask_channel=config.aux_mask_channel, selection_mask=val_selection_mask,
+        val_target_scaled,
+        val_aux_scaled,
+        config.window_size,
+        config.stride,
+        mode="val",
+        seed=config.seed,
+        aux_mask=val_aux_mask,
+        aux_mask_channel=preprocessing.aux_mask_channel,
+        selection_mask=val_selection_mask,
     )
     if len(val_target) and config.val_fraction > 0 and len(val_dataset) == 0:
         raise ValueError(
@@ -632,10 +786,9 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         else None
     )
 
-    model_kwargs = dict(config.model_kwargs)
     model = ImputationVAE_Graph(
-        target_dim=len(config.target_cols),
-        aux_dim=(2 if config.aux_mask_channel else 1) * len(config.aux_cols),
+        target_dim=data_schema.target_dim,
+        aux_dim=(2 if preprocessing.aux_mask_channel else 1) * data_schema.aux_dim,
         window_size=config.window_size,
         **model_kwargs,
     )
@@ -645,38 +798,71 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
     print(
         f"[graph-tcn-vae] {len(frame)} rows -> {len(train_dataset)} train / "
         f"{len(val_dataset) if val_loader is not None else 0} val windows "
-        f"({len(train_loader)} batches/epoch), {len(config.target_cols)} targets "
-        f"({n_chem} chem + {len(config.target_cols) - n_chem} psd), {len(config.aux_cols)} aux cols, "
+        f"({len(train_loader)} batches/epoch), {data_schema.target_dim} targets "
+        f"({n_chem} chem + {len(data_schema.psd_cols)} psd), {data_schema.aux_dim} met cols, "
         f"{n_params:,} params, device={device}, epochs={config.epochs}, batch_size={config.batch_size}"
     )
     trainer = Trainer(model, train_loader, val_loader, config, device)
     best_val = trainer.fit()
 
+    input_transforms = {
+        "chemistry": preprocessing.chemistry.transform,
+        "psd": preprocessing.psd.transform,
+        "meteorology": preprocessing.meteorology.transform,
+    }
+    output_transforms = target_output_transforms(data_schema, preprocessing)
+    present_input_transforms = []
+    if data_schema.chemistry_cols:
+        present_input_transforms.append(input_transforms["chemistry"])
+    if data_schema.psd_cols:
+        present_input_transforms.append(input_transforms["psd"])
+    uniform_input_transform = (
+        present_input_transforms[0]
+        if len(set(present_input_transforms)) == 1
+        else "mixed"
+    )
+    uniform_output_transform = (
+        output_transforms[0]
+        if output_transforms and len(set(output_transforms)) == 1
+        else "mixed"
+    )
     bundle = {
-        "bundle_version": 2,
+        "bundle_version": 3,
+        "architecture_version": 1,
+        "state_dict_format_version": 1,
         "state_dict": trainer.model.state_dict(),
         "model_kwargs": model_kwargs,
-        "target_cols": list(config.target_cols),
-        "aux_cols": list(config.aux_cols),
+        "target_cols": list(target_cols),
+        "aux_cols": list(aux_cols),
         "window_size": config.window_size,
         "stride": config.stride,
-        "aux_missing_mode": "mask_channel" if config.aux_mask_channel else "legacy_zero_fill",
-        "aux_mask_channel": config.aux_mask_channel,
-        "target_transform": config.target_transform,
-        "target_output_transform": config.target_output_transform,
+        "aux_missing_mode": (
+            "mask_channel" if preprocessing.aux_mask_channel else "legacy_zero_fill"
+        ),
+        "aux_mask_channel": preprocessing.aux_mask_channel,
+        "target_transform": uniform_input_transform,
+        "target_output_transform": uniform_output_transform,
+        "target_output_transforms": output_transforms,
+        "preprocessing": preprocessing.to_dict(),
+        "data_schema": data_schema.to_dict(),
+        "data_interface": (
+            "modality_files" if config.modality_files is not None else "legacy_columns"
+        ),
         "time_grid": {
-            "frequency": frame.attrs.get("frequency"),
-            "timezone": frame.attrs.get("timezone"),
-            "policy": config.time_grid_policy,
-            "duplicate_timestamp_policy": config.duplicate_timestamp_policy,
+            "frequency": data_schema.frequency,
+            "timezone": data_schema.timezone,
+            "policy": data_schema.time_grid_policy,
+            "duplicate_timestamp_policy": data_schema.duplicate_timestamp_policy,
         },
         "selection_mask_protocol": f"fixed_{config.selection_mask_mode}_ho",
         "schema": {
-            "target_cols": list(config.target_cols),
-            "aux_value_cols": list(config.aux_cols),
-            "aux_mask_cols": [f"{col}__observed" for col in config.aux_cols],
-            "target_dim": len(config.target_cols),
-            "cond_dim": (2 if config.aux_mask_channel else 1) * len(config.aux_cols),
+            "target_cols": list(target_cols),
+            "aux_value_cols": list(aux_cols),
+            "aux_mask_cols": [f"{col}__observed" for col in aux_cols],
+            "target_dim": data_schema.target_dim,
+            "cond_dim": (
+                (2 if preprocessing.aux_mask_channel else 1) * data_schema.aux_dim
+            ),
         },
         "scaler_target": scaler_target.to_dict(),
         "scaler_aux": scaler_aux.to_dict(),
@@ -686,5 +872,4 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     torch.save(bundle, save_path)
-
     return best_val

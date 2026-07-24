@@ -1,0 +1,46 @@
+{
+  "timestamp_col": "time",
+  "modality_files": {
+    "chemistry": ["examples/data/multimodal_demo/chemistry.csv"],
+    "psd": ["examples/data/multimodal_demo/psd.csv"],
+    "meteorology": ["examples/data/multimodal_demo/meteorology.csv"]
+  },
+  "preprocessing": {
+    "chemistry": {
+      "transform": "log1p",
+      "scaler": "standard",
+      "output_transform": "log1p"
+    },
+    "psd": {
+      "transform": "log1p",
+      "scaler": "robust",
+      "output_transform": "log1p"
+    },
+    "meteorology": {
+      "transform": "none",
+      "scaler": "standard",
+      "output_transform": "none"
+    },
+    "fit_scope": "train",
+    "aux_mask_channel": true
+  },
+  "expected_frequency": "1h",
+  "time_grid_policy": "strict",
+  "duplicate_timestamp_policy": "error",
+  "window_size": 8,
+  "stride": 4,
+  "val_fraction": 0.34,
+  "batch_size": 4,
+  "epochs": 2,
+  "patience": 2,
+  "validation_metric": "ho_nll",
+  "model_kwargs": {
+    "latent_dim": 8,
+    "hidden_dims": [16, 16],
+    "encoder_layers": 1,
+    "decoder_layers": 1,
+    "n_graph_heads": 1,
+    "dropout": 0.0,
+    "heteroscedastic": true
+  }
+}

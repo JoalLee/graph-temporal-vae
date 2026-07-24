@@ -22,7 +22,18 @@ from graph_tcn_vae.infer import (
     trapezoid_position_weights,
 )
 from graph_tcn_vae.model_graph_uq import ImputationVAE_Graph
-from graph_tcn_vae.train import Trainer, train_from_config, vae_loss
+from graph_tcn_vae.train import (
+    Trainer,
+    _student_t_nll,
+    empirical_crps_components,
+    masked_nll_components,
+    train_from_config,
+    vae_loss,
+)
+from graph_tcn_vae.window_aggregation import (
+    StreamingWindowAggregator,
+    weighted_empirical_crps,
+)
 
 
 def _write_synthetic_csv(path, n=200, seed=0):
@@ -43,6 +54,165 @@ def _write_synthetic_csv(path, n=200, seed=0):
     df = pd.DataFrame({"time": ts, "target_a": a_missing, "target_b": b, "ws": ws, "at": at})
     df.to_csv(path, index=False)
     return df
+
+
+def _write_modality_csvs(tmp_path, n=96, seed=0):
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2024-01-01", periods=n, freq="h")
+    chem = pd.DataFrame({
+        "time": ts,
+        "SO2": rng.lognormal(mean=0.2, sigma=0.2, size=n),
+        "NO3-": rng.lognormal(mean=1.0, sigma=0.3, size=n),
+    })
+    psd = pd.DataFrame({
+        "time": ts,
+        "100.0": rng.lognormal(mean=4.0, sigma=0.2, size=n),
+        "12.0": rng.lognormal(mean=5.0, sigma=0.25, size=n),
+    })
+    met = pd.DataFrame({
+        "time": ts,
+        "AT": rng.normal(25.0, 2.0, size=n),
+        "RH": rng.uniform(40.0, 90.0, size=n),
+    })
+    chem.loc[20:25, "SO2"] = np.nan
+    psd.loc[40:47, ["100.0", "12.0"]] = np.nan
+    met.loc[10:12, "RH"] = np.nan
+    paths = {
+        "chem": tmp_path / "chem.csv",
+        "psd": tmp_path / "psd.csv",
+        "met": tmp_path / "met.csv",
+    }
+    chem.to_csv(paths["chem"], index=False)
+    psd.to_csv(paths["psd"], index=False)
+    met.to_csv(paths["met"], index=False)
+    return paths
+
+
+def test_multimodal_cli_discovers_schema_persists_preprocessing_and_imputes(tmp_path):
+    paths = _write_modality_csvs(tmp_path)
+    bundle_path = tmp_path / "multimodal.pt"
+    output_path = tmp_path / "multimodal_imputed.csv"
+
+    cli_main([
+        "train",
+        "--chem-csv", str(paths["chem"]),
+        "--psd-csv", str(paths["psd"]),
+        "--met-csv", str(paths["met"]),
+        "--timestamp-col", "time",
+        "--chem-transform", "log1p",
+        "--psd-transform", "log1p",
+        "--chem-scaler", "standard",
+        "--psd-scaler", "robust",
+        "--met-scaler", "minmax",
+        "--window-size", "16",
+        "--stride", "8",
+        "--val-fraction", "0.2",
+        "--batch-size", "4",
+        "--epochs", "1",
+        "--patience", "1",
+        "--latent-dim", "4",
+        "--hidden-dims", "8,8",
+        "--encoder-layers", "1",
+        "--decoder-layers", "1",
+        "--n-graph-heads", "1",
+        "-o", str(bundle_path),
+    ])
+
+    raw_bundle = torch.load(bundle_path, map_location="cpu", weights_only=True)
+    assert raw_bundle["bundle_version"] == 3
+    assert raw_bundle["architecture_version"] == 1
+    assert raw_bundle["data_schema"]["chemistry_cols"] == ["SO2", "NO3-"]
+    assert raw_bundle["data_schema"]["psd_cols"] == ["12.0", "100.0"]
+    assert raw_bundle["data_schema"]["psd_diameters_nm"] == [12.0, 100.0]
+    assert raw_bundle["model_kwargs"]["n_chem"] == 2
+    assert raw_bundle["preprocessing"]["chemistry"]["transform"] == "log1p"
+    assert raw_bundle["preprocessing"]["psd"]["scaler"] == "robust"
+    assert raw_bundle["preprocessing"]["meteorology"]["scaler"] == "minmax"
+    assert raw_bundle["scaler_target"]["feature_kinds"] == [
+        "standard", "standard", "robust", "robust"
+    ]
+
+    loaded = load_bundle(bundle_path, device=torch.device("cpu"))
+    assert loaded["data_schema"].target_cols == ["SO2", "NO3-", "12.0", "100.0"]
+    assert loaded["preprocessing"].psd.scaler == "robust"
+
+    cli_main([
+        "impute",
+        "--bundle", str(bundle_path),
+        "--chem-csv", str(paths["chem"]),
+        "--psd-csv", str(paths["psd"]),
+        "--met-csv", str(paths["met"]),
+        "--n-mc-samples", "3",
+        "--inference-batch-size", "2",
+        "-o", str(output_path),
+    ])
+    result = pd.read_csv(output_path)
+    assert set(result["feature"]) == {"SO2", "NO3-", "12.0", "100.0"}
+    assert {"q_lower", "q_upper", "interval_lower", "interval_upper", "q05", "q95"} <= set(result.columns)
+    assert result["interval_lower"].eq(0.05).all()
+    assert result["interval_upper"].eq(0.95).all()
+    assert result[result["is_imputed"]]["imputed_mean"].notna().all()
+
+
+def test_load_bundle_rejects_unknown_architecture_version(tmp_path):
+    paths = _write_modality_csvs(tmp_path, n=64)
+    bundle_path = tmp_path / "bundle.pt"
+    config = TrainConfig(
+        modality_files={
+            "chemistry": [str(paths["chem"])],
+            "psd": [str(paths["psd"])],
+            "meteorology": [str(paths["met"])],
+        },
+        window_size=8,
+        stride=4,
+        val_fraction=0.25,
+        epochs=1,
+        patience=1,
+        batch_size=4,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    train_from_config(config, str(bundle_path))
+    raw = torch.load(bundle_path, map_location="cpu", weights_only=True)
+    raw["architecture_version"] = 999
+    incompatible = tmp_path / "incompatible.pt"
+    torch.save(raw, incompatible)
+    with pytest.raises(ValueError, match="Unsupported architecture_version"):
+        load_bundle(incompatible, device=torch.device("cpu"))
+
+
+def test_nested_train_config_json_builds_public_contract():
+    config_path = Path(__file__).resolve().parents[1] / "examples" / "multimodal_train_config.example.json"
+    config = TrainConfig.from_json(config_path)
+    assert config.modality_files.chemistry == [
+        "examples/data/multimodal_demo/chemistry.csv"
+    ]
+    assert config.preprocessing.chemistry.transform == "log1p"
+    assert config.preprocessing.psd.scaler == "robust"
+    assert config.preprocessing.meteorology.scaler == "standard"
+
+
+def test_model_config_json_rejects_unknown_fields_early(tmp_path):
+    csv_path = tmp_path / "synthetic.csv"
+    _write_synthetic_csv(csv_path, n=40)
+    config_path = tmp_path / "bad_model.json"
+    config_path.write_text(json.dumps({"latent_dim": 4, "misspelled_graph_flag": True}))
+    with pytest.raises(TypeError, match="unexpected field"):
+        cli_main([
+            "train",
+            "--csv", str(csv_path),
+            "--target-cols", "target_a,target_b",
+            "--aux-cols", "ws,at",
+            "--window-size", "8",
+            "--epochs", "1",
+            "--model-config", str(config_path),
+            "-o", str(tmp_path / "bad.pt"),
+        ])
 
 
 def test_train_then_impute_round_trip(tmp_path):
@@ -311,12 +481,16 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
         assert np.isfinite(results[f"{group}_heldout_rmse"])
         assert 0.0 <= results[f"{group}_heldout_picp"] <= 100.0
         assert 0.0 <= results[f"{group}_heldout_r2"]  # clipped to >= 0
+        assert np.isfinite(
+            results[f"{group}_heldout_empirical_crps_model_space"]
+        )
         assert f"{group}_observed_r2" in results  # sanity-check reconstruction fidelity
 
     predictions = pd.read_csv(predictions_path)
     expected_cols = {
         "timestamp", "feature", "family", "scaled_observed", "scaled_pred_mean",
-        "model_observed", "model_pred_mean", "physical_observed", "physical_pred_mean",
+        "model_observed", "model_pred_mean", "model_empirical_crps",
+        "physical_observed", "physical_pred_mean",
         "physical_pred_std", "physical_q025", "physical_q975",
     }
     assert expected_cols <= set(predictions.columns)
@@ -352,6 +526,238 @@ def test_sample_level_overlap_aggregation_preserves_cross_window_mixture():
     assert result["mean"][2, 0] == pytest.approx(32.5)
     assert result["variance"][2, 0] == pytest.approx(1568.75)
     assert result["quantiles"][0.5][2, 0] == pytest.approx(15.0)
+
+
+def test_streaming_aggregation_matches_full_history_and_bounds_active_state():
+    rng = np.random.default_rng(7)
+    starts = [0, 2, 4, 6, 8]
+    window_size, n_mc, n_features, total_length = 4, 3, 2, 12
+    position_weights = np.array([0.5, 1.0, 1.0, 0.5])
+    windows = [rng.normal(size=(n_mc, window_size, n_features)) for _ in starts]
+
+    # Independent full-history reference matching the original implementation.
+    values_by_position = [[] for _ in range(total_length)]
+    weights_by_position = [[] for _ in range(total_length)]
+    for start, samples in zip(starts, windows):
+        for local_position, global_position in enumerate(
+            range(start, start + window_size)
+        ):
+            values_by_position[global_position].append(samples[:, local_position])
+            weights_by_position[global_position].append(
+                np.full(n_mc, position_weights[local_position])
+            )
+
+    reference_mean = np.full((total_length, n_features), np.nan)
+    reference_variance = np.full_like(reference_mean, np.nan)
+    reference_median = np.full_like(reference_mean, np.nan)
+    for position in range(total_length):
+        values = np.concatenate(values_by_position[position], axis=0)
+        weights = np.concatenate(weights_by_position[position], axis=0)
+        reference_mean[position] = np.average(values, axis=0, weights=weights)
+        reference_variance[position] = np.maximum(
+            np.average(values**2, axis=0, weights=weights)
+            - reference_mean[position] ** 2,
+            0.0,
+        )
+        for feature in range(n_features):
+            order = np.argsort(values[:, feature])
+            sorted_values = values[order, feature]
+            sorted_weights = weights[order]
+            centers = np.cumsum(sorted_weights) - 0.5 * sorted_weights
+            reference_median[position, feature] = np.interp(
+                0.5 * sorted_weights.sum(), centers, sorted_values
+            )
+
+    aggregator = StreamingWindowAggregator(
+        total_length=total_length,
+        window_size=window_size,
+        n_features=n_features,
+        position_weights=position_weights,
+        quantiles=(0.5,),
+    )
+    for start, samples in zip(starts, windows):
+        aggregator.add(start, samples)
+    result = aggregator.finish()
+
+    np.testing.assert_allclose(result["mean"], reference_mean)
+    np.testing.assert_allclose(result["variance"], reference_variance)
+    np.testing.assert_allclose(result["quantiles"][0.5], reference_median)
+    assert result["peak_active_positions"] <= window_size
+
+
+def test_weighted_empirical_crps_matches_direct_pairwise_definition():
+    values = np.array(
+        [[0.0, 3.0], [1.0, 2.0], [4.0, -1.0], [8.0, 5.0]],
+        dtype=np.float64,
+    )
+    weights = np.array([0.5, 1.0, 2.0, 0.25], dtype=np.float64)
+    target = np.array([2.0, 1.5], dtype=np.float64)
+    probabilities = weights / weights.sum()
+    first = np.sum(
+        probabilities[:, None] * np.abs(values - target[None, :]), axis=0
+    )
+    pairwise = 0.5 * np.sum(
+        probabilities[:, None, None]
+        * probabilities[None, :, None]
+        * np.abs(values[:, None, :] - values[None, :, :]),
+        axis=(0, 1),
+    )
+
+    actual = weighted_empirical_crps(values, weights, target)
+    np.testing.assert_allclose(actual, first - pairwise, atol=1e-12)
+
+
+def test_torch_empirical_crps_matches_direct_pairwise_definition():
+    samples = torch.tensor(
+        [
+            [[[0.0, 3.0], [1.0, 2.0]]],
+            [[[1.0, 2.0], [2.0, 4.0]]],
+            [[[4.0, -1.0], [5.0, 0.0]]],
+            [[[8.0, 5.0], [6.0, 3.0]]],
+        ]
+    )
+    target = torch.tensor([[[2.0, 1.5], [3.0, 2.0]]])
+    mask = torch.tensor([[[1.0, 0.0], [1.0, 1.0]]])
+    direct_first = (samples - target.unsqueeze(0)).abs().mean(dim=0)
+    direct_pairwise = 0.5 * (
+        samples[:, None] - samples[None, :]
+    ).abs().mean(dim=(0, 1))
+    expected = ((direct_first - direct_pairwise) * mask).sum()
+
+    actual, count = empirical_crps_components(samples, target, mask)
+    assert count.item() == 3
+    torch.testing.assert_close(actual, expected)
+
+
+def test_streaming_aggregator_scores_crps_when_timestamp_is_finalized():
+    position_weights = np.array([0.5, 1.0, 0.5])
+    first = np.array([[[0.0], [1.0], [2.0]], [[2.0], [3.0], [4.0]]])
+    second = np.array([[[10.0], [11.0], [12.0]], [[14.0], [15.0], [16.0]]])
+    targets = np.array([[0.0], [4.0], [0.0], [0.0]])
+    score_mask = np.array([[False], [True], [False], [False]])
+
+    aggregator = StreamingWindowAggregator(
+        total_length=4,
+        window_size=3,
+        n_features=1,
+        position_weights=position_weights,
+        quantiles=(),
+        crps_targets=targets,
+        crps_mask=score_mask,
+    )
+    aggregator.add(0, first)
+    aggregator.add(1, second)
+    result = aggregator.finish()
+
+    values = np.array([[1.0], [3.0], [10.0], [14.0]])
+    weights = np.array([1.0, 1.0, 0.5, 0.5])
+    expected = weighted_empirical_crps(values, weights, np.array([4.0]))[0]
+    assert result["crps"][1, 0] == pytest.approx(expected)
+    assert np.isnan(result["crps"][[0, 2, 3], 0]).all()
+
+
+def test_validation_nll_uses_gaussian_or_model_student_t_likelihood():
+    recon_mean = torch.tensor([[[0.0, 0.5]]])
+    recon_logvar = torch.tensor([[[np.log(1e-6), np.log(20.0)]]])
+    target = torch.tensor([[[1.0, -1.0]]])
+    mask = torch.ones_like(target)
+    var_min, var_max = 0.2, 2.0
+
+    gaussian_sum, count = masked_nll_components(
+        recon_mean,
+        recon_logvar,
+        target,
+        mask,
+        var_min=var_min,
+        var_max=var_max,
+    )
+    clamped = recon_logvar.clamp(min=np.log(var_min), max=np.log(var_max))
+    expected_gaussian = 0.5 * (
+        clamped + (target - recon_mean).square() / clamped.exp()
+    )
+    assert count.item() == 2
+    assert gaussian_sum.item() == pytest.approx(expected_gaussian.sum().item())
+
+    class FixedDfModel:
+        def get_likelihood_df(self, num_features, device=None, dtype=None):
+            assert num_features == 2
+            return torch.tensor([5.0, 8.0], device=device, dtype=dtype)
+
+    df = torch.tensor([5.0, 8.0])
+    student_sum, _ = masked_nll_components(
+        recon_mean,
+        recon_logvar,
+        target,
+        mask,
+        model=FixedDfModel(),
+        use_student_t_nll=True,
+        var_min=var_min,
+        var_max=var_max,
+    )
+    expected_student = _student_t_nll(
+        recon_mean,
+        recon_logvar,
+        target,
+        var_min=var_min,
+        var_max=var_max,
+        df=df,
+    )
+    assert student_sum.item() == pytest.approx(expected_student.sum().item())
+    assert student_sum.item() != pytest.approx(gaussian_sum.item())
+
+
+def test_trainer_validation_wires_student_t_df_and_decoder_variance_bounds():
+    class FixedValidationModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.decoder = torch.nn.Identity()
+            self.decoder.var_min = 0.25
+            self.decoder.var_max = 1.5
+
+        def get_likelihood_df(self, num_features, device=None, dtype=None):
+            return torch.full((num_features,), 7.0, device=device, dtype=dtype)
+
+        def forward(self, input_x, cond, input_mask):
+            recon_mean = torch.zeros_like(input_x) + self.anchor * 0.0
+            recon_logvar = torch.full_like(input_x, np.log(10.0))
+            latent = torch.zeros((input_x.shape[0], 1), device=input_x.device)
+            return recon_mean, recon_logvar, latent, latent, None
+
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["a", "b"],
+        validation_metric="ho_nll",
+        use_student_t_nll=True,
+    )
+    model = FixedValidationModel()
+    trainer = Trainer(
+        model,
+        train_loader=None,
+        val_loader=None,
+        config=config,
+        device=torch.device("cpu"),
+    )
+    target = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    batch = {
+        "input_x": torch.zeros_like(target),
+        "cond": torch.zeros((1, 2, 0)),
+        "input_mask": torch.zeros_like(target),
+        "target": target,
+        "obs_mask": torch.ones_like(target),
+        "heldout_mask": torch.ones_like(target),
+    }
+    metrics = trainer._run_validation([batch], epoch=0)
+    expected = _student_t_nll(
+        torch.zeros_like(target),
+        torch.full_like(target, np.log(10.0)),
+        target,
+        var_min=0.25,
+        var_max=1.5,
+        df=torch.full((2,), 7.0),
+    ).mean()
+    assert metrics["ho_nll"] == pytest.approx(expected.item())
 
 
 def test_trapezoid_position_weights_ramps_20pct_edges_like_research():

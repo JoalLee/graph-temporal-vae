@@ -116,27 +116,53 @@ For imputation models:
 
 ## Training and Inference
 
-The `graph-tcn-vae` command trains `ImputationVAE_Graph` on your own CSV data and saves a single self-contained checkpoint **bundle** (weights + model kwargs + column names + the training-fit normalization stats), so later `impute` runs need nothing else to reproduce the exact model.
+The `graph-tcn-vae` command trains `ImputationVAE_Graph` and saves a self-contained checkpoint **bundle** containing weights, the resolved data schema, preprocessing choices, fitted affine statistics, architecture versions, and model settings. Inference reuses this contract and never re-fits preprocessing.
 
-Column selection is name-based: point `--target-cols` at the variables you want imputed/predicted and `--aux-cols` at conditioning variables (meteorology, engineered time features, etc.). Multiple `--csv` paths are outer-joined on `--timestamp-col`, so co-located instruments can live in separate files.
+### Multimodal data contract
+
+The preferred interface supplies each measurement modality separately:
+
+- `--chem-csv`: every non-timestamp column is a chemistry target; file/column order is preserved;
+- `--psd-csv`: every non-timestamp column is a PSD target; column names must be positive particle diameters in nm and are sorted numerically;
+- `--met-csv`: every non-timestamp column is an auxiliary conditioning variable;
+- `--timestamp-col`: shared timestamp column, default `time`;
+- missing measurements are represented by empty CSV cells/`NaN`.
+
+At least one of Chem or PSD is required. Files are outer-joined on timestamp, Chem targets are placed before PSD targets, and `n_chem` is inferred automatically. The exact discovered columns and ordering are stored in `DataSchema` and enforced on future inference data.
 
 ```bash
-graph-tcn-vae train \
-  --csv path/to/data.csv \
+graph-tcn-vae validate-data \
+  --chem-csv data/chemistry.csv \
+  --psd-csv data/psd.csv \
+  --met-csv data/meteorology.csv \
   --timestamp-col time \
-  --target-cols species_a,species_b,species_c \
-  --aux-cols wind_speed,wind_dir,temperature \
+  --expected-frequency 1h
+
+graph-tcn-vae train \
+  --chem-csv data/chemistry.csv \
+  --psd-csv data/psd.csv \
+  --met-csv data/meteorology.csv \
+  --chem-transform log1p --chem-scaler standard \
+  --psd-transform log1p --psd-scaler robust \
+  --met-transform none --met-scaler standard \
   --window-size 48 --stride 24 \
   --epochs 200 \
   -o checkpoints/run1.pt
 
 graph-tcn-vae impute \
   --bundle checkpoints/run1.pt \
-  --csv path/to/new_data.csv \
+  --chem-csv data/new_chemistry.csv \
+  --psd-csv data/new_psd.csv \
+  --met-csv data/new_meteorology.csv \
+  --inference-config examples/inference_config.example.json \
   -o imputed.csv
 ```
 
-`--target-transform` describes the values in the input CSV: `log1p` applies one log1p transform before scaling/training, while `none` leaves the CSV values unchanged. `--target-output-transform` describes the public output scale and defaults to `--target-transform`. This separation is important when the input CSV is already log1p-preprocessed, as in the 26e experiment artifact:
+The legacy `--csv --target-cols --aux-cols` interface remains supported for general tabular datasets and old scripts.
+
+Each modality independently selects an input transform (`none` or `log1p`) and affine scaler (`standard`, `robust`, `minmax`, or `none`). `standard` uses mean/standard deviation, `robust` uses median/IQR, and `minmax` uses minimum/range. `--scaler-fit-scope train` is the leakage-safe default; `full` exists only for protocols that intentionally fit preprocessing on the complete timeline.
+
+`--chem-output-transform` and `--psd-output-transform` define how de-standardized model values are mapped to the public output scale. They normally match their input transform. The separate setting is needed when a CSV already contains log1p values:
 
 ```bash
 graph-tcn-vae train \
@@ -148,7 +174,7 @@ graph-tcn-vae train \
   -o checkpoints/pretransformed_run.pt
 ```
 
-`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with the observed value in the configured output scale, plus `imputed_mean`, `imputed_std`, and a 5–95% predictive interval (`q05`/`q95`) from `compute_uncertainty`. Observed points are restored in that output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use sample-level overlap-add with a trapezoidal position envelope, so quantiles and cross-window disagreement are retained instead of averaging per-window quantiles. Aggregation always happens in the linear model space (before `--target-output-transform`); the transform is applied once to the aggregated mean/quantiles afterward (`summary_to_output_scale`), not per MC sample -- averaging already-`expm1`-transformed heavy-tailed draws is biased high and can blow up on a single extreme sample.
+`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with `observed`, `is_imputed`, `imputed_mean`, `imputed_std`, `q_lower`, `q_upper`, and the interval probabilities. The default 5–95% interval also provides compatibility aliases `q05`/`q95`. Observed points are restored in the configured output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use exact sample-level overlap-add with a trapezoidal position envelope. The bounded-memory aggregator keeps samples only for timestamps that can still be covered by a later window, then finalizes and releases them. Aggregation occurs before each feature's output transform, avoiding biased sample-wise exponentiation.
 
 For the 26e Chem/PSD weighting protocol, set `--n-chem 32 --chem-feature-weight 12 --psd-feature-weight 1 --loss-normalization window_feature_sum`. The defaults are 1/1 general-dataset weighting with `observed_mean` normalization.
 
@@ -181,27 +207,52 @@ input is an already log1p-transformed artifact, pass
 `--target-transform none`; the preparation helper above writes raw targets and
 therefore uses the runner default `--target-transform log1p`.
 
-Any `ImputationVAE_Graph` constructor flag (see `graph_tcn_vae/model_graph_uq.py`) can be set via `--model-config path/to/config.json`, which takes priority over the convenience flags (`--latent-dim`, `--hidden-dims`, `--encoder-layers`, `--decoder-layers`, `--n-graph-heads`, `--n-chem`, `--heteroscedastic`).
+Any validated `ModelConfig` field (see `graph_tcn_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`.
 
 The same functionality is available programmatically:
 
 ```python
-from graph_tcn_vae import TrainConfig, train_from_config, load_bundle, impute
+from graph_tcn_vae import (
+    InferenceConfig,
+    ModalityFiles,
+    ModalityPreprocessing,
+    PreprocessingConfig,
+    TrainConfig,
+    impute,
+    train_from_config,
+)
 
+files = ModalityFiles(
+    chemistry=["data/chemistry.csv"],
+    psd=["data/psd.csv"],
+    meteorology=["data/meteorology.csv"],
+)
+preprocessing = PreprocessingConfig(
+    chemistry=ModalityPreprocessing(transform="log1p", scaler="standard"),
+    psd=ModalityPreprocessing(transform="log1p", scaler="robust"),
+    meteorology=ModalityPreprocessing(transform="none", scaler="standard"),
+)
 config = TrainConfig(
-    csv=["path/to/data.csv"],
+    modality_files=files,
     timestamp_col="time",
-    target_cols=["species_a", "species_b"],
-    aux_cols=["wind_speed", "temperature"],
+    preprocessing=preprocessing,
+    window_size=48,
+    stride=24,
 )
 train_from_config(config, "checkpoints/run1.pt")
 
-impute(["path/to/new_data.csv"], "checkpoints/run1.pt", "imputed.csv")
+impute(
+    None,
+    "checkpoints/run1.pt",
+    "imputed.csv",
+    modality_files=files,
+    inference_config=InferenceConfig(n_mc_samples=50),
+)
 ```
 
-Training uses dynamic contiguous held-out masking on observed target values. The validation mask is generated once from the same protocol and then held fixed for early stopping, preventing epoch-to-epoch mask noise from changing the selection target. `--validation-metric ho_nll` is the calibration-aware default; `ho_mse` selects directly on point-estimation error, while `ho_crps` is available with configurable MC sample count and evaluation interval. This is still a general-purpose reference implementation, not a reproduction of any specific thesis training run; W&B logging and extensive gate/attention diagnostics remain research-specific.
+Training uses dynamic contiguous held-out masking on observed target values. The validation mask is generated once from the same protocol and then held fixed for early stopping, preventing epoch-to-epoch mask noise from changing the selection target. `--validation-metric ho_nll` is the calibration-aware default and now follows the configured training likelihood: Gaussian training uses Gaussian held-out NLL, while `--use-student-t-nll` uses the same Student-t formulation, model likelihood degrees of freedom, and decoder variance bounds during validation. `ho_mse` selects directly on point-estimation error, while `ho_crps` is available with configurable MC sample count and evaluation interval; empirical CRPS is evaluated with an exact sorted-sample formula rather than an `MC × MC` pairwise tensor. This is still a general-purpose reference implementation, not a reproduction of any specific thesis training run; W&B logging and extensive gate/attention diagnostics remain research-specific.
 
-`impute` always reports zero uncertainty at genuinely observed points, so it cannot answer "how accurate is this model on data it never saw?" `examples/heldout_eval.py` fills that gap: it regenerates the exact fixed held-out mask a bundle was trained with (same `--n-chem`/ratio/seed), forces those points to look unobserved at inference time, and reports R²/MAE/PICP against their true values, split by Chem/PSD:
+`impute` always reports zero uncertainty at genuinely observed points, so it cannot answer "how accurate is this model on data it never saw?" `examples/heldout_eval.py` fills that gap: it regenerates the exact fixed held-out mask a bundle was trained with (same `--n-chem`/ratio/seed), forces those points to look unobserved at inference time, and reports R²/MAE/PICP against their true values, split by Chem/PSD. It preserves the existing physical-output Gaussian CRPS for reference comparability and additionally reports `empirical_crps_model_space`, computed exactly from the bounded-memory overlap mixture using a sorted weighted-sample formula:
 
 ```bash
 python examples/heldout_eval.py \

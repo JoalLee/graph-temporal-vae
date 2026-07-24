@@ -29,21 +29,26 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from graph_tcn_vae.contracts import ModalityFiles
 from graph_tcn_vae.data import (
     compute_window_starts,
-    inverse_target_values,
     load_frame,
+    load_modality_frame,
     make_condition,
     sample_anchor_constrained_heldout_mask,
-    transform_target_values,
 )
 from graph_tcn_vae.infer import (
-    aggregate_window_samples,
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
 )
+from graph_tcn_vae.preprocessing import (
+    observed_targets_to_output,
+    transform_auxiliary,
+    transform_targets,
+)
 from graph_tcn_vae.utils import is_interactive
+from graph_tcn_vae.window_aggregation import StreamingWindowAggregator
 
 # Same category definitions as the research repo's ablation_heldout_eval.py
 # (CHEM_GROUPS / PSD_GROUPS), so per-category macro-averages are directly
@@ -104,8 +109,17 @@ def category_indices(target_cols, n_chem):
     return cats
 
 
-def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
-                            q_lo_cols=None, q_hi_cols=None, min_points=10, clip_r2=True):
+def _macro_average_metrics(
+    y_true_cols,
+    y_pred_cols,
+    mask_cols,
+    sigma_cols=None,
+    q_lo_cols=None,
+    q_hi_cols=None,
+    empirical_crps_model_space_cols=None,
+    min_points=10,
+    clip_r2=True,
+):
     """Per-feature R^2/MAE/RMSE/SMAPE(/CRPS/PICP), then average across
     features -- matches the research repo's ablation_heldout_eval.py
     compute_heldout_metrics exactly (see its 'Macro-average: compute
@@ -121,8 +135,11 @@ def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
     than macro-averaged, even with mediocre or negative per-feature fit on
     most other features. sigma_cols/q_lo_cols/q_hi_cols are optional so this
     also serves the plain R^2/MAE-only use (e.g. the "observed" comparison).
+    ``empirical_crps_model_space_cols`` is kept separate from the Gaussian
+    physical-output CRPS so the two score definitions cannot be confused.
     """
-    r2_list, mae_list, rmse_list, smape_list, crps_list, picp_list = [], [], [], [], [], []
+    r2_list, mae_list, rmse_list, smape_list = [], [], [], []
+    crps_list, empirical_crps_list, picp_list = [], [], []
     for j in range(y_true_cols.shape[1]):
         col_mask = mask_cols[:, j]
         if col_mask.sum() < min_points:
@@ -134,6 +151,8 @@ def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
             valid &= np.isfinite(sigma_cols[col_mask, j])
         if q_lo_cols is not None:
             valid &= np.isfinite(q_lo_cols[col_mask, j]) & np.isfinite(q_hi_cols[col_mask, j])
+        if empirical_crps_model_space_cols is not None:
+            valid &= np.isfinite(empirical_crps_model_space_cols[col_mask, j])
         if valid.sum() < min_points:
             continue
         y_true_v, y_pred_v = y_true[valid], y_pred[valid]
@@ -154,6 +173,10 @@ def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
             z = (y_true_v - y_pred_v) / sigma_v
             crps = sigma_v * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
             crps_list.append(float(np.mean(crps)))
+        if empirical_crps_model_space_cols is not None:
+            empirical_crps_list.append(
+                float(np.mean(empirical_crps_model_space_cols[col_mask, j][valid]))
+            )
         if q_lo_cols is not None:
             q_lo_v = q_lo_cols[col_mask, j][valid]
             q_hi_v = q_hi_cols[col_mask, j][valid]
@@ -167,6 +190,8 @@ def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
         out["smape"] = float(np.mean(smape_list))
     if crps_list:
         out["crps"] = float(np.mean(crps_list))
+    if empirical_crps_list:
+        out["empirical_crps_model_space"] = float(np.mean(empirical_crps_list))
     if picp_list:
         out["picp"] = float(np.mean(picp_list)) * 100.0
     return out
@@ -175,8 +200,11 @@ def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bundle", required=True)
-    ap.add_argument("--csv", required=True, help="Comma-separated CSV path(s).")
-    ap.add_argument("--n-chem", type=int, required=True, help="First N target columns treated as the Chem modality.")
+    ap.add_argument("--csv", default=None, help="Legacy comma-separated CSV path(s).")
+    ap.add_argument("--chem-csv", default=None)
+    ap.add_argument("--psd-csv", default=None)
+    ap.add_argument("--met-csv", default=None)
+    ap.add_argument("--n-chem", type=int, default=None, help="Defaults to the bundle data schema.")
     ap.add_argument("--selection-mask-ratio", type=float, default=0.1)
     ap.add_argument("--selection-val-seed", type=int, default=42)
     ap.add_argument("--n-mc-samples", type=int, default=50)
@@ -195,26 +223,46 @@ def main():
     bundle = load_bundle(args.bundle)
     model = bundle["model"]
     device = bundle["device"]
-    target_cols = bundle["target_cols"]
-    aux_cols = bundle["aux_cols"]
+    data_schema = bundle["data_schema"]
+    preprocessing = bundle["preprocessing"]
+    target_cols = data_schema.target_cols
+    aux_cols = data_schema.auxiliary_cols
     window_size = bundle["window_size"]
     scaler_target = bundle["scaler_target"]
     scaler_aux = bundle["scaler_aux"]
-    aux_mask_channel = bool(bundle.get("aux_mask_channel", False))
-    target_transform = bundle.get("target_transform", "none")
-    target_output_transform = bundle.get("target_output_transform", target_transform)
-    ts_col = bundle["timestamp_col"]
+    aux_mask_channel = preprocessing.aux_mask_channel
+    output_transforms = bundle["target_output_transforms"]
+    ts_col = data_schema.timestamp_col
 
-    csv_paths = [v.strip() for v in args.csv.split(",") if v.strip()]
-    frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
+    modality_files = None
+    if args.chem_csv or args.psd_csv or args.met_csv:
+        if args.csv:
+            raise ValueError("Use modality CSV flags or --csv, not both")
+        modality_files = ModalityFiles(
+            chemistry=[v.strip() for v in (args.chem_csv or "").split(",") if v.strip()],
+            psd=[v.strip() for v in (args.psd_csv or "").split(",") if v.strip()],
+            meteorology=[v.strip() for v in (args.met_csv or "").split(",") if v.strip()],
+        )
+        frame, _ = load_modality_frame(
+            modality_files, ts_col, expected_schema=data_schema
+        )
+    else:
+        if not args.csv:
+            raise ValueError("Provide --csv or modality-specific CSV flags")
+        csv_paths = [v.strip() for v in args.csv.split(",") if v.strip()]
+        frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
     n = len(frame)
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
-    target_model_space = transform_target_values(target_raw, target_transform)
+    target_model_space = transform_targets(target_raw, data_schema, preprocessing)
     aux_raw = frame[aux_cols].to_numpy(dtype=np.float64) if aux_cols else np.zeros((n, 0))
+    aux_model_space = transform_auxiliary(aux_raw, preprocessing)
     obs_mask_full = ~np.isnan(target_raw)
 
     heldout_mask = sample_anchor_constrained_heldout_mask(
-        obs_mask_full, ratio=args.selection_mask_ratio, seed=args.selection_val_seed, n_chem=args.n_chem,
+        obs_mask_full,
+        ratio=args.selection_mask_ratio,
+        seed=args.selection_val_seed,
+        n_chem=data_schema.n_chem if args.n_chem is None else args.n_chem,
     ).astype(bool)
 
     # Force held-out points to look unobserved to the model, exactly as
@@ -222,7 +270,7 @@ def main():
     input_obs_mask = (obs_mask_full & ~heldout_mask).astype(np.float32)
 
     target_scaled = np.nan_to_num(scaler_target.transform(target_model_space), nan=0.0)
-    aux_scaled = scaler_aux.transform(aux_raw) if aux_cols else aux_raw
+    aux_scaled = scaler_aux.transform(aux_model_space) if aux_cols else aux_model_space
     aux_observed = ~np.isnan(aux_raw)
 
     # Prefer the training stride stored in the bundle.  The reference 26e
@@ -242,78 +290,106 @@ def main():
         f"{args.n_mc_samples} MC samples, stride={stride}, device={device}"
     )
 
-    def compute_window_predictions():
-        # See infer.impute's compute_window_predictions for why this is two
-        # streams: mean_chunks (the decoder's own noise-free point estimate,
-        # MC-dropout-averaged only) drives the R^2/MAE point estimate;
-        # sample_chunks (full generative mean+noise draws) drives quantiles
-        # only. Averaging noisy draws for the point estimate is what turned
-        # a real held-out eval's psd_heldout_r2 into the thousands-negative.
-        model.eval()
-        mean_chunks = []
-        sample_chunks = []
-        with torch.no_grad():
-            batch_starts_list = range(0, len(starts), args.inference_batch_size)
-            for batch_start in tqdm(
-                batch_starts_list, desc="heldout-eval windows", total=n_batches, disable=not is_interactive()
-            ):
-                batch_starts = starts[batch_start:batch_start + args.inference_batch_size]
-                masks = np.stack([input_obs_mask[s:s + window_size] for s in batch_starts])
-                xs = np.stack([
-                    target_scaled[s:s + window_size] * masks[i] for i, s in enumerate(batch_starts)
-                ])
-                conds = np.stack([
-                    make_condition(
-                        aux_scaled[s:s + window_size], aux_observed[s:s + window_size], aux_mask_channel
-                    )
-                    for s in batch_starts
-                ])
-                x_t = torch.from_numpy(xs).float().to(device)
-                cond_t = torch.from_numpy(conds).float().to(device)
-                mask_t = torch.from_numpy(masks).float().to(device)
-                result = model.compute_uncertainty(
-                    x_t, cond_t, mask_t, n_samples=max(2, args.n_mc_samples), return_samples=True,
-                )
-                pred_mean_scaled = result[0].cpu().numpy()
-                samples_scaled = result[-2].cpu().numpy()
-                pred_mean_model = (
-                    pred_mean_scaled * scaler_target.std_[None, None, :]
-                    + scaler_target.mean_[None, None, :]
-                )
-                samples_model = (
-                    samples_scaled * scaler_target.std_[None, None, None, :]
-                    + scaler_target.mean_[None, None, None, :]
-                )
-                for i, start in enumerate(batch_starts):
-                    mean_chunks.append((start, pred_mean_model[i][None, :, :]))
-                    sample_chunks.append((start, samples_model[:, i]))
-        return mean_chunks, sample_chunks
-
-    mean_chunks, sample_chunks = compute_window_predictions()
+    # Two bounded-memory aggregators preserve the established two-stream
+    # semantics: clean decoder means drive point metrics, while generative
+    # draws drive uncertainty summaries.  The distribution aggregator also
+    # computes exact weighted empirical CRPS in de-standardized model space
+    # for every naturally observed target, including the fixed held-out set.
     position_weights = trapezoid_position_weights(window_size)
-    mean_agg = aggregate_window_samples(
-        mean_chunks, total_length=n, position_weights=position_weights, quantiles=()
+    mean_aggregator = StreamingWindowAggregator(
+        total_length=n,
+        window_size=window_size,
+        n_features=len(target_cols),
+        position_weights=position_weights,
+        quantiles=(),
     )
-    # 0.05/0.95 (90% interval) matches the research repo's compute_heldout_metrics
-    # PICP definition exactly; 0.025/0.975 (95% interval) is kept for
-    # --predictions-csv, which is a separate, wider diagnostic interval.
-    dist_agg = aggregate_window_samples(
-        sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.025, 0.05, 0.95, 0.975)
+    distribution_aggregator = StreamingWindowAggregator(
+        total_length=n,
+        window_size=window_size,
+        n_features=len(target_cols),
+        position_weights=position_weights,
+        quantiles=(0.025, 0.05, 0.95, 0.975),
+        crps_targets=target_model_space,
+        crps_mask=obs_mask_full,
     )
+
+    model.eval()
+    with torch.no_grad():
+        batch_starts_list = range(0, len(starts), args.inference_batch_size)
+        for batch_start in tqdm(
+            batch_starts_list,
+            desc="heldout-eval windows",
+            total=n_batches,
+            disable=not is_interactive(),
+        ):
+            batch_starts = starts[
+                batch_start:batch_start + args.inference_batch_size
+            ]
+            masks = np.stack([
+                input_obs_mask[start:start + window_size]
+                for start in batch_starts
+            ])
+            xs = np.stack([
+                target_scaled[start:start + window_size] * masks[index]
+                for index, start in enumerate(batch_starts)
+            ])
+            conds = np.stack([
+                make_condition(
+                    aux_scaled[start:start + window_size],
+                    aux_observed[start:start + window_size],
+                    aux_mask_channel,
+                )
+                for start in batch_starts
+            ])
+            x_t = torch.from_numpy(xs).float().to(device)
+            cond_t = torch.from_numpy(conds).float().to(device)
+            mask_t = torch.from_numpy(masks).float().to(device)
+            result = model.compute_uncertainty(
+                x_t,
+                cond_t,
+                mask_t,
+                n_samples=max(2, args.n_mc_samples),
+                return_samples=True,
+            )
+            pred_mean_scaled = result[0].cpu().numpy()
+            samples_scaled = result[-2].cpu().numpy()
+            pred_mean_model = (
+                pred_mean_scaled * scaler_target.std_[None, None, :]
+                + scaler_target.mean_[None, None, :]
+            )
+            samples_model = (
+                samples_scaled * scaler_target.std_[None, None, None, :]
+                + scaler_target.mean_[None, None, None, :]
+            )
+            for index, start in enumerate(batch_starts):
+                mean_aggregator.add(
+                    start, pred_mean_model[index][None, :, :]
+                )
+                distribution_aggregator.add(start, samples_model[:, index])
+
+    mean_agg = mean_aggregator.finish()
+    # 0.05/0.95 (90% interval) matches the research repo's PICP definition;
+    # 0.025/0.975 is retained for the wider predictions CSV diagnostic.
+    dist_agg = distribution_aggregator.finish()
     mean_out, std_out, quantiles_out = summary_to_output_scale(
-        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], target_output_transform
+        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], output_transforms
     )
     q025, q05, q95, q975 = quantiles_out[0.025], quantiles_out[0.05], quantiles_out[0.95], quantiles_out[0.975]
 
-    observed_output = inverse_target_values(target_raw, target_output_transform)
+    observed_output = observed_targets_to_output(target_raw, data_schema, preprocessing)
 
-    n_chem = args.n_chem
+    n_chem = data_schema.n_chem if args.n_chem is None else args.n_chem
+    if bundle.get("data_interface") == "modality_files" and n_chem != data_schema.n_chem:
+        raise ValueError(
+            f"--n-chem={n_chem} conflicts with bundle schema n_chem={data_schema.n_chem}"
+        )
     results = {}
     for cat_name, cols in category_indices(target_cols, n_chem):
         y_true_g = observed_output[:, cols]
         y_pred_g = mean_out[:, cols]
         sigma_g = std_out[:, cols]
         q05_g, q95_g = q05[:, cols], q95[:, cols]
+        empirical_crps_g = dist_agg["crps"][:, cols]
 
         # Primary metric: per-feature R^2/MAE/RMSE/SMAPE/CRPS/PICP, negative
         # R^2 clipped to 0, then averaged across the features in this
@@ -322,7 +398,13 @@ def main():
         # own reported "chem_r2"/"psd_r2" means.
         held_mask_g = heldout_mask[:, cols]
         held = _macro_average_metrics(
-            y_true_g, y_pred_g, held_mask_g, sigma_cols=sigma_g, q_lo_cols=q05_g, q_hi_cols=q95_g,
+            y_true_g,
+            y_pred_g,
+            held_mask_g,
+            sigma_cols=sigma_g,
+            q_lo_cols=q05_g,
+            q_hi_cols=q95_g,
+            empirical_crps_model_space_cols=empirical_crps_g,
         )
         for key, value in held.items():
             results[f"{cat_name}_heldout_{key}"] = value
@@ -332,7 +414,14 @@ def main():
         # The reference does NOT clip this R^2 to 0 (only the held-out one).
         obs_mask_g = (obs_mask_full[:, cols] & ~heldout_mask[:, cols])
         obs = _macro_average_metrics(
-            y_true_g, y_pred_g, obs_mask_g, sigma_cols=sigma_g, q_lo_cols=q05_g, q_hi_cols=q95_g, clip_r2=False,
+            y_true_g,
+            y_pred_g,
+            obs_mask_g,
+            sigma_cols=sigma_g,
+            q_lo_cols=q05_g,
+            q_hi_cols=q95_g,
+            empirical_crps_model_space_cols=empirical_crps_g,
+            clip_r2=False,
         )
         for key, value in obs.items():
             results[f"{cat_name}_observed_{key}"] = value
@@ -382,6 +471,7 @@ def main():
             "scaled_pred_mean": scaled_pred_mean[rows, cols],
             "model_observed": target_model_space[rows, cols],
             "model_pred_mean": model_pred_mean[rows, cols],
+            "model_empirical_crps": dist_agg["crps"][rows, cols],
             "physical_observed": observed_output[rows, cols],
             "physical_pred_mean": mean_out[rows, cols],
             "physical_pred_std": std_out[rows, cols],

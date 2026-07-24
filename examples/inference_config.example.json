@@ -1,0 +1,9 @@
+{
+  "stride": 4,
+  "n_mc_samples": 20,
+  "inference_batch_size": 4,
+  "mc_batch_size": 1,
+  "interval_lower": 0.05,
+  "interval_upper": 0.95,
+  "support_context_window": 72
+}

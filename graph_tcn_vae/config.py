@@ -3,13 +3,21 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .contracts import ModalityFiles, PreprocessingConfig
+from .model_config import ModelConfig
+from .preprocessing import preprocessing_from_legacy
+
 
 @dataclass
 class TrainConfig:
-    csv: List[str]
-    timestamp_col: str
-    target_cols: List[str]
+    # Legacy single/merged-CSV interface. New callers should prefer
+    # ``modality_files`` so Chem, PSD, and meteorology are explicit roles.
+    csv: List[str] = field(default_factory=list)
+    timestamp_col: str = "time"
+    target_cols: List[str] = field(default_factory=list)
     aux_cols: List[str] = field(default_factory=list)
+    modality_files: Optional[ModalityFiles] = None
+    preprocessing: Optional[PreprocessingConfig] = None
     # Transform applied to values read from the CSV before scaling/training.
     # For an already-log1p-preprocessed experiment CSV, use "none" here.
     target_transform: str = "none"
@@ -105,17 +113,33 @@ class TrainConfig:
     def __post_init__(self):
         if isinstance(self.csv, str):
             self.csv = [self.csv]
+        self.csv = list(self.csv)
         self.target_cols = list(self.target_cols)
         self.aux_cols = list(self.aux_cols)
-        if not self.csv:
-            raise ValueError("At least one CSV path is required")
-        if not self.target_cols:
-            raise ValueError("At least one target column is required")
-        overlap = sorted(set(self.target_cols) & set(self.aux_cols))
-        if overlap:
-            raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")
+        if isinstance(self.modality_files, dict):
+            self.modality_files = ModalityFiles.from_dict(self.modality_files)
+        if isinstance(self.preprocessing, dict):
+            self.preprocessing = PreprocessingConfig.from_dict(self.preprocessing)
+        if self.modality_files is not None:
+            if self.csv or self.target_cols or self.aux_cols:
+                raise ValueError(
+                    "Use either modality_files or the legacy csv/target_cols/aux_cols interface, not both"
+                )
+        else:
+            if not self.csv:
+                raise ValueError("At least one CSV path is required")
+            if not self.target_cols:
+                raise ValueError("At least one target column is required")
+            overlap = sorted(set(self.target_cols) & set(self.aux_cols))
+            if overlap:
+                raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")
         for derived in ("target_dim", "aux_dim", "window_size"):
             self.model_kwargs.pop(derived, None)
+        unknown_model_fields = set(self.model_kwargs) - ModelConfig.field_names()
+        if unknown_model_fields:
+            raise TypeError(
+                f"model_kwargs contain unexpected field(s): {sorted(unknown_model_fields)}"
+            )
         if self.validation_metric not in {"ho_nll", "ho_mse", "ho_crps"}:
             raise ValueError("validation_metric must be 'ho_nll', 'ho_mse', or 'ho_crps'")
         if self.val_crps_dist_type not in {"gaussian", "student_t"}:
@@ -126,6 +150,16 @@ class TrainConfig:
             self.target_output_transform = self.target_transform
         if self.target_output_transform not in {"none", "log1p"}:
             raise ValueError("target_output_transform must be 'none' or 'log1p'")
+        if self.preprocessing is None:
+            self.preprocessing = preprocessing_from_legacy(
+                target_transform=self.target_transform,
+                target_output_transform=self.target_output_transform,
+                scaler_fit_scope=self.scaler_fit_scope,
+                aux_mask_channel=self.aux_mask_channel,
+            )
+        else:
+            self.scaler_fit_scope = self.preprocessing.fit_scope
+            self.aux_mask_channel = self.preprocessing.aux_mask_channel
         if self.scaler_fit_scope not in {"train", "full"}:
             raise ValueError("scaler_fit_scope must be 'train' or 'full'")
         if self.time_grid_policy not in {"strict", "reindex", "row_order"}:

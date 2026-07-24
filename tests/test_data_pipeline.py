@@ -2,6 +2,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from graph_tcn_vae.contracts import (
+    DataSchema,
+    ModalityFiles,
+    ModalityPreprocessing,
+    PreprocessingConfig,
+)
 from graph_tcn_vae.data import (
     NaNAwareStandardScaler,
     WindowedTimeSeriesDataset,
@@ -9,7 +15,14 @@ from graph_tcn_vae.data import (
     compute_window_starts,
     inverse_target_values,
     load_frame,
+    load_modality_frame,
     transform_target_values,
+)
+from graph_tcn_vae.preprocessing import (
+    NaNAwareAffineScaler,
+    fit_target_scaler,
+    observed_targets_to_output,
+    transform_targets,
 )
 
 
@@ -163,6 +176,115 @@ def test_load_frame_missing_column_raises(tmp_path):
 
     with pytest.raises(ValueError):
         load_frame([path], "time", target_cols=["a", "missing"], aux_cols=[])
+
+
+def test_load_modality_frame_discovers_roles_and_sorts_psd_bins(tmp_path):
+    ts = pd.date_range("2024-01-01", periods=6, freq="h")
+    chem_path = tmp_path / "chem.csv"
+    psd_path = tmp_path / "psd.csv"
+    met_path = tmp_path / "met.csv"
+    pd.DataFrame({"time": ts, "SO2": np.arange(6), "NO3-": np.arange(6) + 1}).to_csv(
+        chem_path, index=False
+    )
+    pd.DataFrame({"time": ts, "100.0": np.arange(6) + 2, "12.0": np.arange(6) + 3}).to_csv(
+        psd_path, index=False
+    )
+    pd.DataFrame({"time": ts, "AT": np.arange(6) + 20, "RH": np.arange(6) + 50}).to_csv(
+        met_path, index=False
+    )
+
+    frame, schema = load_modality_frame(
+        ModalityFiles(chemistry=[chem_path], psd=[psd_path], meteorology=[met_path]),
+        timestamp_col="time",
+    )
+
+    assert schema.chemistry_cols == ["SO2", "NO3-"]
+    assert schema.psd_cols == ["12.0", "100.0"]
+    assert schema.psd_diameters_nm == [12.0, 100.0]
+    assert schema.meteorology_cols == ["AT", "RH"]
+    assert schema.target_cols == ["SO2", "NO3-", "12.0", "100.0"]
+    assert list(frame.columns) == schema.target_cols + schema.meteorology_cols
+    assert schema.n_chem == 2
+
+
+def test_load_modality_frame_enforces_training_schema_at_inference(tmp_path):
+    ts = pd.date_range("2024-01-01", periods=4, freq="h")
+    chem_path = tmp_path / "chem.csv"
+    pd.DataFrame({"time": ts, "SO2": [1, 2, 3, 4]}).to_csv(chem_path, index=False)
+    files = ModalityFiles(chemistry=[chem_path])
+    _frame, schema = load_modality_frame(files, "time")
+
+    changed_path = tmp_path / "changed.csv"
+    pd.DataFrame({"time": ts, "SO2": [1, 2, 3, 4], "NO": [0, 0, 0, 0]}).to_csv(
+        changed_path, index=False
+    )
+    with pytest.raises(ValueError, match="extra=.*NO"):
+        load_modality_frame(
+            ModalityFiles(chemistry=[changed_path]),
+            "time",
+            expected_schema=schema,
+        )
+
+
+def test_load_modality_frame_rejects_non_numeric_psd_column_names(tmp_path):
+    ts = pd.date_range("2024-01-01", periods=3, freq="h")
+    psd_path = tmp_path / "psd.csv"
+    pd.DataFrame({"time": ts, "small_bin": [1, 2, 3]}).to_csv(psd_path, index=False)
+    with pytest.raises(ValueError, match="not a numeric particle diameter"):
+        load_modality_frame(ModalityFiles(psd=[psd_path]), "time")
+
+
+def test_modality_preprocessing_supports_independent_transform_and_scaler_modes():
+    schema = DataSchema(
+        chemistry_cols=["SO2"],
+        psd_cols=["12.0", "100.0"],
+        psd_diameters_nm=[12.0, 100.0],
+    )
+    config = PreprocessingConfig(
+        chemistry=ModalityPreprocessing(transform="log1p", scaler="standard"),
+        psd=ModalityPreprocessing(transform="none", scaler="robust"),
+        meteorology=ModalityPreprocessing(transform="none", scaler="minmax"),
+    )
+    raw = np.array([[0.0, 1.0, 10.0], [3.0, 3.0, 20.0], [8.0, 100.0, 30.0]])
+    model_space = transform_targets(raw, schema, config)
+    assert np.allclose(model_space[:, 0], np.log1p(raw[:, 0]))
+    assert np.array_equal(model_space[:, 1:], raw[:, 1:])
+
+    scaler = fit_target_scaler(model_space, schema, config)
+    assert scaler.feature_kinds_ == ["standard", "robust", "robust"]
+    restored = scaler.inverse_transform(scaler.transform(model_space))
+    assert np.allclose(restored, model_space)
+
+
+def test_observed_output_contract_avoids_double_log1p_inverse():
+    schema = DataSchema(chemistry_cols=["SO2"])
+    physical_config = PreprocessingConfig(
+        chemistry=ModalityPreprocessing(
+            transform="log1p", scaler="standard", output_transform="log1p"
+        )
+    )
+    physical = np.array([[0.0], [9.0]])
+    assert np.allclose(
+        observed_targets_to_output(physical, schema, physical_config), physical
+    )
+
+    pretransformed_config = PreprocessingConfig(
+        chemistry=ModalityPreprocessing(
+            transform="none", scaler="standard", output_transform="log1p"
+        )
+    )
+    logged = np.log1p(physical)
+    assert np.allclose(
+        observed_targets_to_output(logged, schema, pretransformed_config), physical
+    )
+
+
+def test_affine_scaler_state_round_trip_preserves_scaler_kind():
+    values = np.array([[1.0, 10.0], [2.0, 20.0], [100.0, 30.0]])
+    scaler = NaNAwareAffineScaler("robust").fit(values)
+    restored = NaNAwareAffineScaler.from_dict(scaler.to_dict())
+    assert restored.kind == "robust"
+    assert np.allclose(restored.transform(values), scaler.transform(values))
 
 
 def test_windowed_dataset_shapes_and_mask():

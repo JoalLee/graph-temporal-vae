@@ -12,3 +12,13 @@ It contains:
 The excerpt is intentionally small so a user can validate the schema, run a short training job, save a checkpoint bundle, and execute imputation without downloading the full research dataset.
 
 This file is a workflow demonstration, not a benchmark dataset. A model trained on 96 hours is not scientifically adequate for aerosol reconstruction, uncertainty calibration, or comparison with the reported 26e research results.
+
+## Multimodal interface example
+
+`multimodal_demo/` contains the same public input contract in three deliberately tiny files:
+
+- `chemistry.csv`: named chemical targets;
+- `psd.csv`: PSD targets whose column names are particle diameters in nm;
+- `meteorology.csv`: auxiliary conditioning variables.
+
+The files are used by `examples/multimodal_train_config.example.json` to demonstrate automatic column discovery, PSD diameter sorting, per-modality preprocessing, and versioned schema persistence. They contain only 24 rows and are strictly an interface smoke test.

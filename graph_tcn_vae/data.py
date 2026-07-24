@@ -13,6 +13,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from .contracts import DataSchema, ModalityFiles
+
 
 SUPPORTED_TARGET_TRANSFORMS = {"none", "log1p"}
 
@@ -254,6 +256,144 @@ def load_frame(
     merged.attrs["timezone"] = str(merged.index.tz) if merged.index.tz is not None else None
     merged.attrs["time_grid_policy"] = time_grid_policy
     return merged
+
+
+def _discover_modality_columns(paths, timestamp_col, modality):
+    """Return non-timestamp columns in deterministic file/column order."""
+    columns = []
+    sources = {}
+    for path in paths:
+        header = pd.read_csv(path, nrows=0)
+        if timestamp_col not in header.columns:
+            raise ValueError(f"'{timestamp_col}' not found in columns of {path}")
+        discovered = [column for column in header.columns if column != timestamp_col]
+        if not discovered:
+            raise ValueError(f"{modality} CSV {path} contains no value columns")
+        for column in discovered:
+            if column in sources:
+                raise ValueError(
+                    f"Column {column!r} appears in multiple {modality} CSVs: "
+                    f"{sources[column]} and {path}"
+                )
+            sources[column] = str(path)
+            columns.append(column)
+    return columns
+
+
+def _resolve_psd_columns(columns):
+    parsed = []
+    for column in columns:
+        try:
+            diameter = float(column)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"PSD column {column!r} is not a numeric particle diameter in nm"
+            ) from exc
+        if not np.isfinite(diameter) or diameter <= 0:
+            raise ValueError(f"PSD diameter must be positive and finite, got {column!r}")
+        parsed.append((diameter, column))
+    parsed.sort(key=lambda item: item[0])
+    diameters = [item[0] for item in parsed]
+    if any(b <= a for a, b in zip(diameters, diameters[1:])):
+        raise ValueError("PSD CSV contains duplicate particle diameters")
+    return [item[1] for item in parsed], diameters
+
+
+def load_modality_frame(
+    files,
+    timestamp_col="time",
+    *,
+    expected_schema=None,
+    expected_frequency=None,
+    time_grid_policy="strict",
+    duplicate_timestamp_policy="error",
+):
+    """Load Chem, PSD, and meteorology CSVs without manual column lists.
+
+    Chemistry and meteorology preserve file/column order. PSD columns must be
+    numeric diameters in nm and are sorted into strictly increasing diameter
+    order. When ``expected_schema`` is supplied (inference), exact column sets
+    are enforced and the training-time order is reused.
+    """
+    if isinstance(files, dict):
+        files = ModalityFiles.from_dict(files)
+    if not isinstance(files, ModalityFiles):
+        raise TypeError("files must be a ModalityFiles instance or compatible dict")
+    if isinstance(expected_schema, dict):
+        expected_schema = DataSchema.from_dict(expected_schema)
+
+    chemistry_cols = _discover_modality_columns(
+        files.chemistry, timestamp_col, "chemistry"
+    ) if files.chemistry else []
+    psd_discovered = _discover_modality_columns(
+        files.psd, timestamp_col, "PSD"
+    ) if files.psd else []
+    psd_cols, psd_diameters = _resolve_psd_columns(psd_discovered) if psd_discovered else ([], [])
+    meteorology_cols = _discover_modality_columns(
+        files.meteorology, timestamp_col, "meteorology"
+    ) if files.meteorology else []
+
+    if expected_schema is not None:
+        if timestamp_col != expected_schema.timestamp_col:
+            raise ValueError(
+                f"timestamp_col={timestamp_col!r} does not match bundle schema "
+                f"{expected_schema.timestamp_col!r}"
+            )
+        discovered_by_modality = {
+            "chemistry": chemistry_cols,
+            "psd": psd_cols,
+            "meteorology": meteorology_cols,
+        }
+        expected_by_modality = {
+            "chemistry": expected_schema.chemistry_cols,
+            "psd": expected_schema.psd_cols,
+            "meteorology": expected_schema.meteorology_cols,
+        }
+        for modality, expected in expected_by_modality.items():
+            discovered = discovered_by_modality[modality]
+            missing = sorted(set(expected) - set(discovered))
+            extra = sorted(set(discovered) - set(expected))
+            if missing or extra:
+                raise ValueError(
+                    f"{modality} columns do not match training schema: "
+                    f"missing={missing}, extra={extra}"
+                )
+        chemistry_cols = list(expected_schema.chemistry_cols)
+        psd_cols = list(expected_schema.psd_cols)
+        psd_diameters = list(expected_schema.psd_diameters_nm)
+        meteorology_cols = list(expected_schema.meteorology_cols)
+        expected_frequency = expected_schema.frequency or expected_frequency
+        time_grid_policy = expected_schema.time_grid_policy
+        duplicate_timestamp_policy = expected_schema.duplicate_timestamp_policy
+
+    target_cols = [*chemistry_cols, *psd_cols]
+    frame = load_frame(
+        files.all_paths,
+        timestamp_col,
+        target_cols,
+        meteorology_cols,
+        expected_frequency=expected_frequency,
+        time_grid_policy=time_grid_policy,
+        duplicate_timestamp_policy=duplicate_timestamp_policy,
+    )
+    schema = DataSchema(
+        timestamp_col=timestamp_col,
+        chemistry_cols=chemistry_cols,
+        psd_cols=psd_cols,
+        meteorology_cols=meteorology_cols,
+        frequency=frame.attrs.get("frequency"),
+        timezone=frame.attrs.get("timezone"),
+        time_grid_policy=time_grid_policy,
+        duplicate_timestamp_policy=duplicate_timestamp_policy,
+        psd_diameters_nm=psd_diameters,
+    )
+    frame = frame[[*schema.target_cols, *schema.auxiliary_cols]]
+    frame.attrs.update(
+        frequency=schema.frequency,
+        timezone=schema.timezone,
+        time_grid_policy=schema.time_grid_policy,
+    )
+    return frame, schema
 
 
 def compute_window_starts(n, window_size, stride):
