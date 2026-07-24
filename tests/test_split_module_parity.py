@@ -1,107 +1,211 @@
-"""Behavioral parity contracts for the staged model_graph_uq split.
+"""Compatibility contracts for the split Graph-TCN-VAE implementation."""
 
-The public monolith remains the compatibility reference until GraphEncoder,
-GraphDecoder, and ImputationVAE_Graph are moved.  These tests prevent the
-new graph_blocks/graph_layers modules from drifting while the migration is in
-progress.
-"""
+import inspect
 
 import torch
 
-from graph_tcn_vae import model_graph_uq as legacy
-from graph_tcn_vae.graph_blocks.tcn import DepthwiseTCN
-from graph_tcn_vae.graph_blocks.time_encoding import TimeHybridEncoder
-from graph_tcn_vae.graph_layers.cross_modal_graph import CrossModalGraphLayer
-from graph_tcn_vae.graph_layers.input_graph import InputGraphLayer
+from graph_tcn_vae import model_graph_uq as facade
+from graph_tcn_vae.flows import AffineCouplingLayer, RealNVP, ReverseLayer
+from graph_tcn_vae.graph_blocks import (
+    AxialObservedAttentionBlock,
+    DepthwiseTCN,
+    LocalContextMemoryAttention,
+    MaskedTemporalCrossAttention,
+    PreGraphPerFeatureTemporalAttention,
+    RotarySelfAttention,
+    TemporalAttentionPool,
+    TemporalObservationRefiner,
+    TimeHybridEncoder,
+    WindowTokenFFN,
+)
+from graph_tcn_vae.graph_layers import (
+    CrossModalGraphLayer,
+    ExternalHistoryContext,
+    InputGraphLayer,
+    LocalChunkGraphBranch,
+    TokenGraphCrossBlock,
+    TokenGraphFFN,
+    TokenGraphSelfBlock,
+)
+from graph_tcn_vae.graph_model import (
+    GraphDecoder,
+    GraphEncoder,
+    ImputationVAE_Graph,
+)
+from graph_tcn_vae.model_config import ModelConfig
+from graph_tcn_vae.vanilla_vae import VanillaVAE
 
 
-def _assert_same_state_and_output(old_cls, new_cls, kwargs, inputs):
-    torch.manual_seed(123)
-    old = old_cls(**kwargs).eval()
-    torch.manual_seed(123)
-    new = new_cls(**kwargs).eval()
-
-    assert old.state_dict().keys() == new.state_dict().keys()
-    for name, old_value in old.state_dict().items():
-        torch.testing.assert_close(old_value, new.state_dict()[name])
-
-    with torch.no_grad():
-        old_output = old(*inputs)
-        new_output = new(*inputs)
-
-    if isinstance(old_output, tuple):
-        assert isinstance(new_output, tuple)
-        assert len(old_output) == len(new_output)
-        for old_value, new_value in zip(old_output, new_output):
-            if old_value is None:
-                assert new_value is None
-            else:
-                torch.testing.assert_close(old_value, new_value)
-    else:
-        torch.testing.assert_close(old_output, new_output)
-
-
-def test_time_hybrid_encoder_matches_monolith():
-    cyc = torch.tensor(
-        [[[0.0, 1.0, 0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]]]
-    )
-    _assert_same_state_and_output(
-        legacy.TimeHybridEncoder,
-        TimeHybridEncoder,
-        {"out_dim": 6, "dropout": 0.0},
-        (cyc,),
-    )
+def test_model_graph_uq_facade_reexports_split_symbols():
+    expected = {
+        "AffineCouplingLayer": AffineCouplingLayer,
+        "AxialObservedAttentionBlock": AxialObservedAttentionBlock,
+        "CrossModalGraphLayer": CrossModalGraphLayer,
+        "DepthwiseTCN": DepthwiseTCN,
+        "ExternalHistoryContext": ExternalHistoryContext,
+        "GraphDecoder": GraphDecoder,
+        "GraphEncoder": GraphEncoder,
+        "ImputationVAE_Graph": ImputationVAE_Graph,
+        "InputGraphLayer": InputGraphLayer,
+        "LocalChunkGraphBranch": LocalChunkGraphBranch,
+        "LocalContextMemoryAttention": LocalContextMemoryAttention,
+        "MaskedTemporalCrossAttention": MaskedTemporalCrossAttention,
+        "ModelConfig": ModelConfig,
+        "PreGraphPerFeatureTemporalAttention": PreGraphPerFeatureTemporalAttention,
+        "RealNVP": RealNVP,
+        "ReverseLayer": ReverseLayer,
+        "RotarySelfAttention": RotarySelfAttention,
+        "TemporalAttentionPool": TemporalAttentionPool,
+        "TemporalObservationRefiner": TemporalObservationRefiner,
+        "TimeHybridEncoder": TimeHybridEncoder,
+        "TokenGraphCrossBlock": TokenGraphCrossBlock,
+        "TokenGraphFFN": TokenGraphFFN,
+        "TokenGraphSelfBlock": TokenGraphSelfBlock,
+        "VanillaVAE": VanillaVAE,
+        "WindowTokenFFN": WindowTokenFFN,
+    }
+    for name, implementation in expected.items():
+        assert getattr(facade, name) is implementation
+        assert name in facade.__all__
 
 
-def test_depthwise_tcn_matches_monolith():
-    x = torch.randn(2, 4, 16)
-    _assert_same_state_and_output(
-        legacy.DepthwiseTCN,
-        DepthwiseTCN,
-        {"channels": 4, "num_layers": 3, "kernel_size": 3},
-        (x,),
-    )
-
-
-def test_input_graph_layer_matches_monolith_default_semantics():
-    x = torch.randn(2, 5, 12)
-    mask = (torch.rand(2, 12, 5) > 0.2).float()
-    kwargs = {
-        "n_features": 5,
+def _small_26e_style_kwargs():
+    return {
+        "target_dim": 7,
+        "aux_dim": 11,
         "window_size": 12,
-        "n_heads": 1,
-        "head_dim": 8,
+        "latent_dim": 8,
+        "hidden_dims": [12, 12],
+        "encoder_layers": 2,
+        "decoder_layers": 2,
         "dropout": 0.0,
-        "aux_dim": 2,
-        "n_chem": 2,
+        "heteroscedastic": True,
+        "n_graph_heads": 1,
+        "n_chem": 3,
+        "use_input_graph_layer": True,
+        "use_cross_modal_graph": True,
+        "use_tcn": True,
+        "n_input_graph_layers": 2,
+        "use_progressive_decoder": True,
+        "decoder_initial_steps": 3,
+        "cond_film_last_n": 2,
+        "cond_film_gamma_scale": 0.3,
+        "use_parallel_graph": True,
+        "use_realnvp": True,
+        "realnvp_layers": 2,
+        "use_temporal_cnn": True,
+        "use_hybrid_time_encoding": True,
+        "time_numeric_dim": 5,
+        "time_cyc_dim": 6,
+        "time_hybrid_dim": 6,
+        "use_dual_output_heads": True,
+        "use_detached_variance_pathway": True,
+        "variance_path_use_latent": True,
+        "variance_head_hidden_dim": 16,
+        "use_local_context_map": True,
+        "local_context_dim": 4,
+        "local_context_steps": 3,
+        "local_context_observe_aware": True,
+        "local_context_injection_mode": "post_upsample",
+        "use_pregraph_feature_temporal_attn": True,
+        "pregraph_feature_temporal_attn_dim": 8,
+        "pregraph_feature_temporal_attn_heads": 1,
+        "pregraph_feature_temporal_attn_chunk_size": 0,
+        "use_decoder_final_norm": True,
+        "use_latent_pooled_norm": True,
+        "use_graph_ffn": True,
         "use_homogeneous": True,
-        "use_ffn": True,
+        "use_feature_logvar_bias": True,
+        "feature_logvar_bias_scope": "psd",
     }
-    _assert_same_state_and_output(
-        legacy.InputGraphLayer,
-        InputGraphLayer,
-        kwargs,
-        (x, mask),
-    )
 
 
-def test_cross_modal_graph_layer_matches_monolith_default_semantics():
-    target = torch.randn(2, 5, 12)
-    aux = torch.randn(2, 3, 12)
-    target_mask = (torch.rand(2, 12, 5) > 0.2).float()
+def test_split_model_strict_state_round_trip_and_deterministic_forward():
+    kwargs = _small_26e_style_kwargs()
+    torch.manual_seed(123)
+    source = facade.ImputationVAE_Graph(**kwargs).eval()
+    torch.manual_seed(999)
+    restored = ImputationVAE_Graph(**kwargs).eval()
+    restored.load_state_dict(source.state_dict(), strict=True)
+
+    x = torch.randn(2, 12, 7)
+    cond = torch.randn(2, 12, 11)
+    mask = (torch.rand(2, 12, 7) > 0.2).float()
+    with torch.no_grad():
+        source_output = source(x, cond, mask, sample_latent=False)
+        restored_output = restored(x, cond, mask, sample_latent=False)
+
+    for source_value, restored_value in zip(source_output, restored_output):
+        if source_value is None:
+            assert restored_value is None
+        else:
+            torch.testing.assert_close(source_value, restored_value)
+
+
+def test_runtime_model_uses_split_module_paths():
+    model = facade.ImputationVAE_Graph(**_small_26e_style_kwargs())
+    assert type(model).__module__ == "graph_tcn_vae.graph_model.vae"
+    assert type(model.encoder).__module__ == "graph_tcn_vae.graph_model.encoder"
+    assert type(model.decoder).__module__ == "graph_tcn_vae.graph_model.decoder"
+    assert type(model.flow).__module__ == "graph_tcn_vae.flows"
+
+
+def test_model_config_matches_legacy_constructor_defaults():
+    signature = inspect.signature(ImputationVAE_Graph.__init__)
+    optional = {
+        name: parameter
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", "target_dim", "aux_dim", "window_size"}
+    }
+    config = ModelConfig()
+    assert set(optional) == ModelConfig.field_names()
+    for name, parameter in optional.items():
+        assert getattr(config, name) == parameter.default
+
+
+def test_from_config_matches_direct_constructor_state():
+    model_options = _small_26e_style_kwargs()
+    dimensions = {
+        key: model_options.pop(key)
+        for key in ("target_dim", "aux_dim", "window_size")
+    }
+    config = ModelConfig.from_dict(model_options)
+
+    torch.manual_seed(123)
+    direct = ImputationVAE_Graph(**dimensions, **model_options)
+    torch.manual_seed(123)
+    configured = ImputationVAE_Graph.from_config(**dimensions, config=config)
+
+    assert direct.state_dict().keys() == configured.state_dict().keys()
+    for name, value in direct.state_dict().items():
+        torch.testing.assert_close(value, configured.state_dict()[name])
+
+
+def test_vanilla_vae_strict_state_round_trip():
     kwargs = {
-        "target_dim": 5,
-        "aux_dim": 3,
-        "window_size": 12,
-        "n_heads": 1,
-        "head_dim": 8,
-        "dropout": 0.0,
-        "use_ffn": True,
-        "query_gate_mode": "legacy_hard",
+        "input_dim": 5,
+        "window_size": 8,
+        "latent_dim": 4,
+        "hidden_dims": [12, 8],
+        "target_dim": 3,
+        "chem_dim": 1,
+        "psd_dim": 2,
+        "use_realnvp": True,
+        "realnvp_layers": 2,
     }
-    _assert_same_state_and_output(
-        legacy.CrossModalGraphLayer,
-        CrossModalGraphLayer,
-        kwargs,
-        (target, aux, target_mask),
-    )
+    torch.manual_seed(123)
+    source = facade.VanillaVAE(**kwargs).eval()
+    restored = VanillaVAE(**kwargs).eval()
+    restored.load_state_dict(source.state_dict(), strict=True)
+
+    x = torch.randn(2, 8, 3)
+    cond = torch.randn(2, 8, 2)
+    mask = (torch.rand(2, 8, 3) > 0.2).float()
+    with torch.no_grad():
+        source_output = source(x, cond, mask, sample_latent=False)
+        restored_output = restored(x, cond, mask, sample_latent=False)
+    for source_value, restored_value in zip(source_output, restored_output):
+        if source_value is None:
+            assert restored_value is None
+        else:
+            torch.testing.assert_close(source_value, restored_value)
