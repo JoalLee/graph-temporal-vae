@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 import subprocess
 import sys
 from pathlib import Path
@@ -8,8 +9,11 @@ import pandas as pd
 import pytest
 import torch
 
+from graph_tcn_vae.api import fit_multimodal, impute_multimodal
+from graph_tcn_vae.bundle import inspect_bundle
 from graph_tcn_vae.cli import main as cli_main
 from graph_tcn_vae.config import TrainConfig
+from graph_tcn_vae.contracts import InferenceConfig
 from graph_tcn_vae.data import (
     WindowedTimeSeriesDataset,
     sample_anchor_constrained_heldout_mask,
@@ -88,6 +92,25 @@ def _write_modality_csvs(tmp_path, n=96, seed=0):
     return paths
 
 
+def _small_multimodal_train_config():
+    return TrainConfig(
+        timestamp_col="time",
+        window_size=8,
+        stride=4,
+        val_fraction=0.25,
+        epochs=1,
+        patience=1,
+        batch_size=4,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+
+
 def test_multimodal_cli_discovers_schema_persists_preprocessing_and_imputes(tmp_path):
     paths = _write_modality_csvs(tmp_path)
     bundle_path = tmp_path / "multimodal.pt"
@@ -152,6 +175,138 @@ def test_multimodal_cli_discovers_schema_persists_preprocessing_and_imputes(tmp_
     assert result["interval_lower"].eq(0.05).all()
     assert result["interval_upper"].eq(0.95).all()
     assert result[result["is_imputed"]]["imputed_mean"].notna().all()
+
+
+def test_high_level_dataframe_interface_trains_inspects_and_imputes(tmp_path, capsys):
+    paths = _write_modality_csvs(tmp_path, n=48)
+    chemistry = pd.read_csv(paths["chem"])
+    psd = pd.read_csv(paths["psd"])
+    meteorology = pd.read_csv(paths["met"])
+    bundle_path = tmp_path / "dataframe_bundle.pt"
+
+    loaded = fit_multimodal(
+        chemistry=chemistry,
+        psd=psd,
+        meteorology=meteorology,
+        output=bundle_path,
+        config=_small_multimodal_train_config(),
+    )
+    assert loaded["data_interface"] == "in_memory_modalities"
+    assert loaded["data_schema"].target_cols == ["SO2", "NO3-", "12.0", "100.0"]
+    assert loaded["training_config"]["csv"] == []
+    assert loaded["training_config"]["modality_files"] is None
+
+    result = impute_multimodal(
+        chemistry=chemistry,
+        psd=psd,
+        meteorology=meteorology,
+        bundle=loaded,
+        config=InferenceConfig(
+            n_mc_samples=3,
+            inference_batch_size=2,
+        ),
+    )
+    assert len(result) == 48 * 4
+    assert set(result["feature"]) == {"SO2", "NO3-", "12.0", "100.0"}
+    assert result[result["is_imputed"]]["imputed_mean"].notna().all()
+
+    summary = inspect_bundle(bundle_path)
+    assert summary["valid"] is True
+    assert summary["dimensions"] == {
+        "targets": 4,
+        "chemistry": 2,
+        "psd": 2,
+        "meteorology": 2,
+        "condition": 4,
+    }
+    assert summary["psd"]["range"] == {
+        "minimum_nm": 12.0,
+        "maximum_nm": 100.0,
+    }
+
+    capsys.readouterr()
+    cli_main(["inspect-bundle", "--bundle", str(bundle_path)])
+    cli_summary = json.loads(capsys.readouterr().out)
+    assert cli_summary["valid"] is True
+    assert cli_summary["versions"]["bundle"] == 3
+
+
+def test_validate_data_against_bundle_schema(tmp_path, capsys):
+    paths = _write_modality_csvs(tmp_path, n=48)
+    bundle_path = tmp_path / "schema_bundle.pt"
+    config = _small_multimodal_train_config()
+    config.modality_files = {
+        "chemistry": [str(paths["chem"])],
+        "psd": [str(paths["psd"])],
+        "meteorology": [str(paths["met"])],
+    }
+    # Re-run dataclass normalization after assigning a test source.
+    config = TrainConfig(**config.to_dict())
+    train_from_config(config, str(bundle_path))
+
+    capsys.readouterr()
+    cli_main([
+        "validate-data",
+        "--bundle", str(bundle_path),
+        "--chem-csv", str(paths["chem"]),
+        "--psd-csv", str(paths["psd"]),
+        "--met-csv", str(paths["met"]),
+    ])
+    report = json.loads(capsys.readouterr().out)
+    assert report["valid"] is True
+    assert report["data_schema"]["psd_cols"] == ["12.0", "100.0"]
+    assert set(report["modality_missing_fraction"]) == {
+        "chemistry", "psd", "meteorology"
+    }
+
+
+def test_bundle_integrity_rejects_scaler_preprocessing_and_state_dict_mismatch(tmp_path):
+    paths = _write_modality_csvs(tmp_path, n=48)
+    bundle_path = tmp_path / "integrity_bundle.pt"
+    config = TrainConfig(
+        modality_files={
+            "chemistry": [str(paths["chem"])],
+            "psd": [str(paths["psd"])],
+            "meteorology": [str(paths["met"])],
+        },
+        window_size=8,
+        stride=4,
+        val_fraction=0.25,
+        epochs=1,
+        patience=1,
+        batch_size=4,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    train_from_config(config, str(bundle_path))
+    raw = torch.load(bundle_path, map_location="cpu", weights_only=True)
+
+    bad_scale = deepcopy(raw)
+    bad_scale["scaler_target"]["scale"][0] = 0.0
+    bad_scale["scaler_target"]["std"][0] = 0.0
+    bad_scale_path = tmp_path / "bad_scale.pt"
+    torch.save(bad_scale, bad_scale_path)
+    with pytest.raises(ValueError, match="scale values must be positive"):
+        load_bundle(bad_scale_path, device=torch.device("cpu"))
+
+    bad_preprocessing = deepcopy(raw)
+    bad_preprocessing["preprocessing"]["chemistry"]["scaler"] = "robust"
+    bad_preprocessing_path = tmp_path / "bad_preprocessing.pt"
+    torch.save(bad_preprocessing, bad_preprocessing_path)
+    with pytest.raises(ValueError, match="feature kinds do not match preprocessing"):
+        load_bundle(bad_preprocessing_path, device=torch.device("cpu"))
+
+    bad_state = deepcopy(raw)
+    bad_state["state_dict"].pop(next(iter(bad_state["state_dict"])))
+    bad_state_path = tmp_path / "bad_state.pt"
+    torch.save(bad_state, bad_state_path)
+    with pytest.raises(ValueError, match="state_dict is incompatible"):
+        load_bundle(bad_state_path, device=torch.device("cpu"))
 
 
 def test_load_bundle_rejects_unknown_architecture_version(tmp_path):

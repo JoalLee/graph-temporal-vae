@@ -120,16 +120,17 @@ class TrainConfig:
             self.modality_files = ModalityFiles.from_dict(self.modality_files)
         if isinstance(self.preprocessing, dict):
             self.preprocessing = PreprocessingConfig.from_dict(self.preprocessing)
+        has_legacy_source = bool(self.csv or self.target_cols or self.aux_cols)
         if self.modality_files is not None:
-            if self.csv or self.target_cols or self.aux_cols:
+            if has_legacy_source:
                 raise ValueError(
                     "Use either modality_files or the legacy csv/target_cols/aux_cols interface, not both"
                 )
-        else:
+        elif has_legacy_source:
             if not self.csv:
-                raise ValueError("At least one CSV path is required")
+                raise ValueError("Legacy data input requires at least one CSV path")
             if not self.target_cols:
-                raise ValueError("At least one target column is required")
+                raise ValueError("Legacy data input requires at least one target column")
             overlap = sorted(set(self.target_cols) & set(self.aux_cols))
             if overlap:
                 raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")

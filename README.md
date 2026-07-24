@@ -156,7 +156,17 @@ graph-tcn-vae impute \
   --met-csv data/new_meteorology.csv \
   --inference-config examples/inference_config.example.json \
   -o imputed.csv
+
+graph-tcn-vae inspect-bundle --bundle checkpoints/run1.pt
+
+graph-tcn-vae validate-data \
+  --bundle checkpoints/run1.pt \
+  --chem-csv data/new_chemistry.csv \
+  --psd-csv data/new_psd.csv \
+  --met-csv data/new_meteorology.csv
 ```
+
+`inspect-bundle` performs full integrity validation, strict state-dict loading, and reports versions, dimensions, columns, PSD diameter range, preprocessing, and model size. Passing `--bundle` to `validate-data` checks new files against the exact training-time modality schema, frequency, timezone, and column sets.
 
 The legacy `--csv --target-cols --aux-cols` interface remains supported for general tabular datasets and old scripts.
 
@@ -209,46 +219,55 @@ therefore uses the runner default `--target-transform log1p`.
 
 Any validated `ModelConfig` field (see `graph_tcn_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`.
 
-The same functionality is available programmatically:
+The preferred Python interface accepts paths, pandas DataFrames, or mixtures of both:
 
 ```python
+import pandas as pd
 from graph_tcn_vae import (
     InferenceConfig,
-    ModalityFiles,
     ModalityPreprocessing,
     PreprocessingConfig,
     TrainConfig,
-    impute,
-    train_from_config,
+    fit_multimodal,
+    impute_multimodal,
+    inspect_bundle,
 )
 
-files = ModalityFiles(
-    chemistry=["data/chemistry.csv"],
-    psd=["data/psd.csv"],
-    meteorology=["data/meteorology.csv"],
-)
+chem = pd.read_csv("data/chemistry.csv")
+psd = pd.read_csv("data/psd.csv")
+met = pd.read_csv("data/meteorology.csv")
+
 preprocessing = PreprocessingConfig(
     chemistry=ModalityPreprocessing(transform="log1p", scaler="standard"),
     psd=ModalityPreprocessing(transform="log1p", scaler="robust"),
     meteorology=ModalityPreprocessing(transform="none", scaler="standard"),
 )
 config = TrainConfig(
-    modality_files=files,
     timestamp_col="time",
     preprocessing=preprocessing,
     window_size=48,
     stride=24,
 )
-train_from_config(config, "checkpoints/run1.pt")
 
-impute(
-    None,
-    "checkpoints/run1.pt",
-    "imputed.csv",
-    modality_files=files,
-    inference_config=InferenceConfig(n_mc_samples=50),
+bundle = fit_multimodal(
+    chemistry=chem,
+    psd=psd,
+    meteorology=met,
+    output="checkpoints/run1.pt",
+    config=config,
 )
+
+result = impute_multimodal(
+    chemistry=chem,
+    psd=psd,
+    meteorology=met,
+    bundle=bundle,
+    config=InferenceConfig(n_mc_samples=50),
+)
+print(inspect_bundle("checkpoints/run1.pt"))
 ```
+
+The lower-level `TrainConfig`/`train_from_config` and `impute` functions remain available for custom pipelines.
 
 Training uses dynamic contiguous held-out masking on observed target values. The validation mask is generated once from the same protocol and then held fixed for early stopping, preventing epoch-to-epoch mask noise from changing the selection target. `--validation-metric ho_nll` is the calibration-aware default and now follows the configured training likelihood: Gaussian training uses Gaussian held-out NLL, while `--use-student-t-nll` uses the same Student-t formulation, model likelihood degrees of freedom, and decoder variance bounds during validation. `ho_mse` selects directly on point-estimation error, while `ho_crps` is available with configurable MC sample count and evaluation interval; empirical CRPS is evaluated with an exact sorted-sample formula rather than an `MC × MC` pairwise tensor. This is still a general-purpose reference implementation, not a reproduction of any specific thesis training run; W&B logging and extensive gate/attention diagnostics remain research-specific.
 

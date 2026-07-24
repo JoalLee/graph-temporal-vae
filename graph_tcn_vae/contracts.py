@@ -23,6 +23,15 @@ def _normalize_paths(values: Optional[Sequence[str]]) -> List[str]:
     return [str(value) for value in values if str(value)]
 
 
+def _normalize_sources(values):
+    """Normalize one or many path/DataFrame-like runtime sources."""
+    if values is None:
+        return []
+    if isinstance(values, (str, Path)) or hasattr(values, "columns"):
+        return [values]
+    return list(values)
+
+
 @dataclass
 class ModalityFiles:
     """Runtime CSV paths grouped by measurement modality.
@@ -51,6 +60,43 @@ class ModalityFiles:
 
     @property
     def all_paths(self) -> List[str]:
+        return [*self.chemistry, *self.psd, *self.meteorology]
+
+
+@dataclass
+class ModalityInputs:
+    """Runtime modality sources for the high-level Python interface.
+
+    Each modality may contain CSV paths, ``pathlib.Path`` objects, pandas
+    ``DataFrame`` objects, or a mixture of them. Unlike :class:`ModalityFiles`,
+    this object is runtime-only and is never serialized into a checkpoint.
+    """
+
+    chemistry: List[Any] = field(default_factory=list)
+    psd: List[Any] = field(default_factory=list)
+    meteorology: List[Any] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.chemistry = _normalize_sources(self.chemistry)
+        self.psd = _normalize_sources(self.psd)
+        self.meteorology = _normalize_sources(self.meteorology)
+        if not self.chemistry and not self.psd:
+            raise ValueError("At least one target modality source is required: chemistry or psd")
+
+    @classmethod
+    def from_dict(cls, values: Dict[str, Any]) -> "ModalityInputs":
+        return cls(**values)
+
+    @classmethod
+    def from_files(cls, files: ModalityFiles) -> "ModalityInputs":
+        return cls(
+            chemistry=files.chemistry,
+            psd=files.psd,
+            meteorology=files.meteorology,
+        )
+
+    @property
+    def all_sources(self) -> List[Any]:
         return [*self.chemistry, *self.psd, *self.meteorology]
 
 

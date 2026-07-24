@@ -13,6 +13,7 @@ import os
 from contextlib import nullcontext
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, get_worker_info
@@ -603,12 +604,46 @@ class Trainer:
         return best_val
 
 
-def train_from_config(config: TrainConfig, save_path: str) -> float:
+def train_from_config(
+    config: TrainConfig,
+    save_path: str,
+    *,
+    prepared_data=None,
+) -> float:
+    """Train from a config and optionally preloaded ``(frame, DataSchema)``.
+
+    ``prepared_data`` is the internal seam used by the high-level DataFrame
+    interface. It keeps runtime data out of the serialized training config.
+    """
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
     model_kwargs = dict(config.model_kwargs)
-    if config.modality_files is not None:
+    if prepared_data is not None:
+        if not isinstance(prepared_data, tuple) or len(prepared_data) != 2:
+            raise TypeError("prepared_data must be a (DataFrame, DataSchema) tuple")
+        frame, data_schema = prepared_data
+        if isinstance(data_schema, dict):
+            data_schema = DataSchema.from_dict(data_schema)
+        if not isinstance(frame, pd.DataFrame) or not isinstance(data_schema, DataSchema):
+            raise TypeError("prepared_data must contain a pandas DataFrame and DataSchema")
+        missing_columns = [
+            column
+            for column in [*data_schema.target_cols, *data_schema.auxiliary_cols]
+            if column not in frame.columns
+        ]
+        if missing_columns:
+            raise ValueError(f"Prepared frame is missing schema columns: {missing_columns}")
+        frame = frame[[*data_schema.target_cols, *data_schema.auxiliary_cols]].copy()
+        configured_n_chem = model_kwargs.get("n_chem")
+        if configured_n_chem is not None and int(configured_n_chem) != data_schema.n_chem:
+            raise ValueError(
+                f"model n_chem={configured_n_chem} conflicts with prepared chemistry "
+                f"columns ({data_schema.n_chem})"
+            )
+        model_kwargs["n_chem"] = data_schema.n_chem
+        data_interface = "in_memory_modalities"
+    elif config.modality_files is not None:
         frame, data_schema = load_modality_frame(
             config.modality_files,
             config.timestamp_col,
@@ -623,7 +658,8 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
                 f"columns ({data_schema.n_chem})"
             )
         model_kwargs["n_chem"] = data_schema.n_chem
-    else:
+        data_interface = "modality_files"
+    elif config.csv:
         frame = load_frame(
             config.csv,
             config.timestamp_col,
@@ -647,6 +683,12 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
             duplicate_timestamp_policy=config.duplicate_timestamp_policy,
         )
         model_kwargs["n_chem"] = n_chem
+        data_interface = "legacy_columns"
+    else:
+        raise ValueError(
+            "TrainConfig contains no data source; provide modality_files, legacy CSV fields, "
+            "or prepared_data"
+        )
 
     preprocessing = config.preprocessing
     target_cols = data_schema.target_cols
@@ -845,9 +887,7 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "target_output_transforms": output_transforms,
         "preprocessing": preprocessing.to_dict(),
         "data_schema": data_schema.to_dict(),
-        "data_interface": (
-            "modality_files" if config.modality_files is not None else "legacy_columns"
-        ),
+        "data_interface": data_interface,
         "time_grid": {
             "frequency": data_schema.frequency,
             "timezone": data_schema.timezone,

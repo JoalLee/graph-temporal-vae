@@ -1,10 +1,13 @@
 """Graph-enhanced TCN-VAE model architectures."""
 
+from .api import fit_multimodal, impute_multimodal, validate_multimodal_data
+from .bundle import inspect_bundle
 from .config import TrainConfig
 from .contracts import (
     DataSchema,
     InferenceConfig,
     ModalityFiles,
+    ModalityInputs,
     ModalityPreprocessing,
     PreprocessingConfig,
 )
@@ -20,6 +23,7 @@ __all__ = [
     "DataSchema",
     "InferenceConfig",
     "ModalityFiles",
+    "ModalityInputs",
     "ModalityPreprocessing",
     "PreprocessingConfig",
     "ImputationVAE",
@@ -28,6 +32,10 @@ __all__ = [
     "ModelConfig",
     "PredictionVAE_Graph",
     "TrainConfig",
+    "fit_multimodal",
+    "impute_multimodal",
+    "validate_multimodal_data",
+    "inspect_bundle",
     "train_from_config",
     "load_bundle",
     "impute",

@@ -2,6 +2,8 @@
 import argparse
 import json
 
+from .api import validate_multimodal_data
+from .bundle import inspect_bundle
 from .config import TrainConfig
 from .contracts import (
     InferenceConfig,
@@ -10,7 +12,7 @@ from .contracts import (
     PreprocessingConfig,
 )
 from .data import load_frame, load_modality_frame
-from .infer import impute as run_impute
+from .infer import impute as run_impute, load_bundle
 from .model_config import ModelConfig
 from .train import train_from_config
 
@@ -173,8 +175,13 @@ def build_parser():
     )
     infer_p.add_argument("-o", "--output", required=True)
 
+    inspect_p = sub.add_parser(
+        "inspect-bundle", help="Validate and summarize a checkpoint bundle."
+    )
+    inspect_p.add_argument("--bundle", required=True)
+
     validate_p = sub.add_parser(
-        "validate-data", help="Validate CSV schema and timestamp-grid assumptions without training."
+        "validate-data", help="Validate schema, time grid, and missingness without training."
     )
     validate_p.add_argument("--csv", default=None, help="Legacy comma-separated CSV path(s).")
     validate_p.add_argument("--target-cols", default=None)
@@ -182,7 +189,12 @@ def build_parser():
     validate_p.add_argument("--chem-csv", default=None)
     validate_p.add_argument("--psd-csv", default=None)
     validate_p.add_argument("--met-csv", default=None)
-    validate_p.add_argument("--timestamp-col", default="time")
+    validate_p.add_argument("--timestamp-col", default=None)
+    validate_p.add_argument(
+        "--bundle",
+        default=None,
+        help="Optional checkpoint whose training schema must match the supplied data.",
+    )
     validate_p.add_argument("--expected-frequency", default=None)
     validate_p.add_argument(
         "--time-grid-policy", choices=["strict", "reindex", "row_order"], default="strict"
@@ -363,44 +375,71 @@ def main(argv=None):
         )
         print(f"wrote imputed output to {args.output}")
 
+    elif args.command == "inspect-bundle":
+        print(json.dumps(inspect_bundle(args.bundle), indent=2, sort_keys=True))
+
     elif args.command == "validate-data":
         modality_files = _modality_files_from_args(args)
         if modality_files is not None and (args.csv or args.target_cols or args.aux_cols):
             parser.error("Use modality CSV flags or legacy CSV flags, not both")
+
+        loaded = load_bundle(args.bundle) if args.bundle else None
+        expected_schema = loaded["data_schema"] if loaded else None
+        timestamp_col = (
+            args.timestamp_col
+            or (expected_schema.timestamp_col if expected_schema is not None else "time")
+        )
         if modality_files is not None:
-            frame, schema = load_modality_frame(
-                modality_files,
-                args.timestamp_col,
+            report = validate_multimodal_data(
+                data=modality_files,
+                timestamp_col=timestamp_col,
                 expected_frequency=args.expected_frequency,
                 time_grid_policy=args.time_grid_policy,
                 duplicate_timestamp_policy=args.duplicate_timestamp_policy,
+                expected_schema=expected_schema,
             )
-            target_cols = schema.target_cols
-            schema_output = schema.to_dict()
         else:
-            if not args.csv or not args.target_cols:
-                parser.error("Legacy validation requires --csv and --target-cols")
-            target_cols = _csv_list(args.target_cols)
+            if not args.csv:
+                parser.error("Provide modality CSV flags or legacy --csv")
+            if loaded is not None:
+                target_cols = loaded["target_cols"]
+                aux_cols = loaded["aux_cols"]
+            else:
+                if not args.target_cols:
+                    parser.error("Legacy validation without --bundle requires --target-cols")
+                target_cols = _csv_list(args.target_cols)
+                aux_cols = _csv_list(args.aux_cols)
             frame = load_frame(
                 _csv_list(args.csv),
-                args.timestamp_col,
+                timestamp_col,
                 target_cols,
-                _csv_list(args.aux_cols),
-                expected_frequency=args.expected_frequency,
-                time_grid_policy=args.time_grid_policy,
-                duplicate_timestamp_policy=args.duplicate_timestamp_policy,
+                aux_cols,
+                expected_frequency=(
+                    expected_schema.frequency if expected_schema is not None
+                    else args.expected_frequency
+                ),
+                time_grid_policy=(
+                    expected_schema.time_grid_policy if expected_schema is not None
+                    else args.time_grid_policy
+                ),
+                duplicate_timestamp_policy=(
+                    expected_schema.duplicate_timestamp_policy if expected_schema is not None
+                    else args.duplicate_timestamp_policy
+                ),
             )
-            schema_output = None
-        missing_fraction = frame[target_cols].isna().mean().to_dict()
-        print(json.dumps({
-            "rows": len(frame),
-            "start": str(frame.index.min()),
-            "end": str(frame.index.max()),
-            "frequency": frame.attrs.get("frequency"),
-            "timezone": frame.attrs.get("timezone"),
-            "data_schema": schema_output,
-            "target_missing_fraction": missing_fraction,
-        }, indent=2, sort_keys=True))
+            report = {
+                "valid": True,
+                "rows": len(frame),
+                "start": str(frame.index.min()),
+                "end": str(frame.index.max()),
+                "frequency": frame.attrs.get("frequency"),
+                "timezone": frame.attrs.get("timezone"),
+                "data_schema": expected_schema.to_dict() if expected_schema else None,
+                "target_missing_fraction": frame[target_cols].isna().mean().to_dict(),
+                "auxiliary_missing_fraction": frame[aux_cols].isna().mean().to_dict()
+                if aux_cols else {},
+            }
+        print(json.dumps(report, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

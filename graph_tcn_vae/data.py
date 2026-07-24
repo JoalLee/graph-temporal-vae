@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .contracts import DataSchema, ModalityFiles
+from .contracts import DataSchema, ModalityFiles, ModalityInputs
 
 
 SUPPORTED_TARGET_TRANSFORMS = {"none", "log1p"}
@@ -125,6 +125,39 @@ def _resolve_time_grid(index, expected_frequency=None):
     return pd.tseries.frequencies.to_offset(mode.iloc[0])
 
 
+def _source_label(source, index=None):
+    if isinstance(source, pd.DataFrame):
+        suffix = f":{index}" if index is not None else ""
+        return f"<dataframe{suffix}>"
+    return str(source)
+
+
+def _read_tabular_source(source, *, header_only=False):
+    if isinstance(source, pd.DataFrame):
+        return source.iloc[:0].copy() if header_only else source.copy()
+    return pd.read_csv(source, nrows=0 if header_only else None)
+
+
+def _prepare_timestamp_index(df, timestamp_col, source_label):
+    if timestamp_col in df.columns:
+        raw_timestamps = df[timestamp_col]
+        try:
+            timestamps = pd.to_datetime(raw_timestamps, errors="raise")
+        except Exception as exc:
+            raise ValueError(f"Invalid timestamps in {source_label}: {exc}") from exc
+        if timestamps.isna().any():
+            raise ValueError(f"Missing timestamps found in {source_label}")
+        return df.assign(**{timestamp_col: timestamps}).set_index(timestamp_col)
+    if isinstance(df.index, pd.DatetimeIndex):
+        indexed = df.copy()
+        indexed.index = pd.to_datetime(indexed.index, errors="raise")
+        indexed.index.name = timestamp_col
+        if indexed.index.isna().any():
+            raise ValueError(f"Missing timestamps found in {source_label}")
+        return indexed
+    raise ValueError(f"'{timestamp_col}' not found in columns of {source_label}")
+
+
 def load_frame(
     csv_paths,
     timestamp_col,
@@ -141,7 +174,7 @@ def load_frame(
     ``reindex`` (insert missing grid rows as NaN), or ``row_order`` (legacy
     behavior; timestamps are sorted but row spacing is not validated).
     """
-    if isinstance(csv_paths, (str, Path)):
+    if isinstance(csv_paths, (str, Path, pd.DataFrame)):
         csv_paths = [csv_paths]
     csv_paths = list(csv_paths)
     if not csv_paths:
@@ -165,22 +198,16 @@ def load_frame(
     required = target_cols + aux_cols
     selected_frames = []
     sources = {}
-    for path in csv_paths:
-        df = pd.read_csv(path)
-        if timestamp_col not in df.columns:
-            raise ValueError(f"'{timestamp_col}' not found in columns of {path}")
-        try:
-            timestamps = pd.to_datetime(df[timestamp_col], errors="raise")
-        except Exception as exc:
-            raise ValueError(f"Invalid timestamps in {path}: {exc}") from exc
-        if timestamps.isna().any():
-            raise ValueError(f"Missing timestamps found in {path}")
-        df = df.assign(**{timestamp_col: timestamps}).set_index(timestamp_col)
+    for source_index, source in enumerate(csv_paths):
+        label = _source_label(source, source_index)
+        df = _prepare_timestamp_index(
+            _read_tabular_source(source), timestamp_col, label
+        )
         duplicate_count = int(df.index.duplicated(keep=False).sum())
         if duplicate_count:
             if duplicate_timestamp_policy == "error":
                 raise ValueError(
-                    f"{path} contains {duplicate_count} rows with duplicate timestamps"
+                    f"{label} contains {duplicate_count} rows with duplicate timestamps"
                 )
             df = df[~df.index.duplicated(keep="first")]
 
@@ -188,10 +215,10 @@ def load_frame(
         for column in present:
             if column in sources:
                 raise ValueError(
-                    f"Column {column!r} appears in multiple CSVs: "
-                    f"{sources[column]} and {path}"
+                    f"Column {column!r} appears in multiple CSVs/sources: "
+                    f"{sources[column]} and {label}"
                 )
-            sources[column] = str(path)
+            sources[column] = label
         if present:
             selected_frames.append(df[present])
 
@@ -258,24 +285,29 @@ def load_frame(
     return merged
 
 
-def _discover_modality_columns(paths, timestamp_col, modality):
-    """Return non-timestamp columns in deterministic file/column order."""
+def _discover_modality_columns(sources_input, timestamp_col, modality):
+    """Return non-timestamp columns in deterministic source/column order."""
     columns = []
     sources = {}
-    for path in paths:
-        header = pd.read_csv(path, nrows=0)
-        if timestamp_col not in header.columns:
-            raise ValueError(f"'{timestamp_col}' not found in columns of {path}")
-        discovered = [column for column in header.columns if column != timestamp_col]
+    for source_index, source in enumerate(sources_input):
+        label = _source_label(source, source_index)
+        table = _read_tabular_source(source, header_only=True)
+        has_timestamp_column = timestamp_col in table.columns
+        has_datetime_index = isinstance(table.index, pd.DatetimeIndex)
+        if not has_timestamp_column and not has_datetime_index:
+            raise ValueError(f"'{timestamp_col}' not found in columns of {label}")
+        discovered = [
+            column for column in table.columns if column != timestamp_col
+        ]
         if not discovered:
-            raise ValueError(f"{modality} CSV {path} contains no value columns")
+            raise ValueError(f"{modality} source {label} contains no value columns")
         for column in discovered:
             if column in sources:
                 raise ValueError(
-                    f"Column {column!r} appears in multiple {modality} CSVs: "
-                    f"{sources[column]} and {path}"
+                    f"Column {column!r} appears in multiple {modality} sources: "
+                    f"{sources[column]} and {label}"
                 )
-            sources[column] = str(path)
+            sources[column] = label
             columns.append(column)
     return columns
 
@@ -316,9 +348,13 @@ def load_modality_frame(
     are enforced and the training-time order is reused.
     """
     if isinstance(files, dict):
-        files = ModalityFiles.from_dict(files)
-    if not isinstance(files, ModalityFiles):
-        raise TypeError("files must be a ModalityFiles instance or compatible dict")
+        files = ModalityInputs.from_dict(files)
+    elif isinstance(files, ModalityFiles):
+        files = ModalityInputs.from_files(files)
+    if not isinstance(files, ModalityInputs):
+        raise TypeError(
+            "files must be ModalityFiles, ModalityInputs, or a compatible dict"
+        )
     if isinstance(expected_schema, dict):
         expected_schema = DataSchema.from_dict(expected_schema)
 
@@ -366,9 +402,19 @@ def load_modality_frame(
         time_grid_policy = expected_schema.time_grid_policy
         duplicate_timestamp_policy = expected_schema.duplicate_timestamp_policy
 
+    all_modality_columns = [*chemistry_cols, *psd_cols, *meteorology_cols]
+    cross_modality_duplicates = sorted(
+        {column for column in all_modality_columns if all_modality_columns.count(column) > 1}
+    )
+    if cross_modality_duplicates:
+        raise ValueError(
+            "Columns cannot appear in multiple modalities: "
+            f"{cross_modality_duplicates}"
+        )
+
     target_cols = [*chemistry_cols, *psd_cols]
     frame = load_frame(
-        files.all_paths,
+        files.all_sources,
         timestamp_col,
         target_cols,
         meteorology_cols,
@@ -376,13 +422,19 @@ def load_modality_frame(
         time_grid_policy=time_grid_policy,
         duplicate_timestamp_policy=duplicate_timestamp_policy,
     )
+    actual_timezone = frame.attrs.get("timezone")
+    if expected_schema is not None and actual_timezone != expected_schema.timezone:
+        raise ValueError(
+            "timezone does not match training schema: "
+            f"expected={expected_schema.timezone!r}, actual={actual_timezone!r}"
+        )
     schema = DataSchema(
         timestamp_col=timestamp_col,
         chemistry_cols=chemistry_cols,
         psd_cols=psd_cols,
         meteorology_cols=meteorology_cols,
         frequency=frame.attrs.get("frequency"),
-        timezone=frame.attrs.get("timezone"),
+        timezone=actual_timezone,
         time_grid_policy=time_grid_policy,
         duplicate_timestamp_policy=duplicate_timestamp_policy,
         psd_diameters_nm=psd_diameters,

@@ -7,8 +7,15 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from .contracts import DataSchema, InferenceConfig, ModalityFiles, PreprocessingConfig
+from .contracts import (
+    DataSchema,
+    InferenceConfig,
+    ModalityFiles,
+    ModalityInputs,
+    PreprocessingConfig,
+)
 from .data import compute_window_starts, load_frame, load_modality_frame, make_condition
+from .model_config import ModelConfig
 from .model_graph_uq import ImputationVAE_Graph
 from .preprocessing import (
     NaNAwareAffineScaler,
@@ -23,6 +30,30 @@ from .utils import is_interactive, setup_device
 from .window_aggregation import StreamingWindowAggregator, aggregate_ordered_windows
 
 
+def _validate_scaler_state(state, expected_features, label):
+    center = state.get("center", state.get("mean"))
+    scale = state.get("scale", state.get("std"))
+    if center is None or scale is None:
+        raise ValueError(f"{label} scaler must contain center/scale statistics")
+    center = np.asarray(center, dtype=np.float64)
+    scale = np.asarray(scale, dtype=np.float64)
+    if center.ndim != 1 or scale.ndim != 1:
+        raise ValueError(f"{label} scaler statistics must be one-dimensional")
+    if len(center) != expected_features or len(scale) != expected_features:
+        raise ValueError(
+            f"{label} scaler dimension does not match schema: "
+            f"expected={expected_features}, center={len(center)}, scale={len(scale)}"
+        )
+    if not np.isfinite(center).all() or not np.isfinite(scale).all():
+        raise ValueError(f"{label} scaler statistics must be finite")
+    if np.any(scale <= 0):
+        raise ValueError(f"{label} scaler scale values must be positive")
+    feature_kinds = list(state.get("feature_kinds", []))
+    if feature_kinds and len(feature_kinds) != expected_features:
+        raise ValueError(f"{label} scaler feature_kinds length does not match schema")
+    return feature_kinds
+
+
 def _validate_bundle(bundle):
     required = {
         "state_dict", "model_kwargs", "target_cols", "aux_cols", "window_size",
@@ -31,6 +62,17 @@ def _validate_bundle(bundle):
     missing = sorted(required - set(bundle))
     if missing:
         raise ValueError(f"Invalid checkpoint bundle; missing keys: {missing}")
+    bundle_version = int(bundle.get("bundle_version", 1))
+    if bundle_version not in {1, 2, 3}:
+        raise ValueError(f"Unsupported bundle_version={bundle_version}")
+    if not isinstance(bundle["state_dict"], dict) or not bundle["state_dict"]:
+        raise ValueError("Checkpoint state_dict must be a non-empty mapping")
+    if not isinstance(bundle["window_size"], int) or bundle["window_size"] < 1:
+        raise ValueError("Checkpoint window_size must be a positive integer")
+    stride = bundle.get("stride", bundle.get("config", {}).get("stride"))
+    if stride is not None and (not isinstance(stride, int) or not 1 <= stride <= bundle["window_size"]):
+        raise ValueError("Checkpoint stride must be between 1 and window_size")
+    ModelConfig.from_dict(bundle["model_kwargs"])
     if not bundle["target_cols"]:
         raise ValueError("Checkpoint bundle must contain at least one target column")
     if bundle["aux_missing_mode"] not in {"legacy_zero_fill", "mask_channel"}:
@@ -42,18 +84,21 @@ def _validate_bundle(bundle):
             "Unsupported target_output_transform: "
             f"{bundle.get('target_output_transform')!r}"
         )
-    target_scaler_state = bundle["scaler_target"]
-    aux_scaler_state = bundle["scaler_aux"]
-    target_center = target_scaler_state.get("center")
-    if target_center is None:
-        target_center = target_scaler_state["mean"]
-    aux_center = aux_scaler_state.get("center")
-    if aux_center is None:
-        aux_center = aux_scaler_state["mean"]
-    if len(target_center) != len(bundle["target_cols"]):
-        raise ValueError("Target scaler schema does not match target_cols")
-    if len(aux_center) != len(bundle["aux_cols"]):
-        raise ValueError("Aux scaler schema does not match aux_cols")
+    target_cols = list(bundle["target_cols"])
+    aux_cols = list(bundle["aux_cols"])
+    if len(set(target_cols)) != len(target_cols):
+        raise ValueError("Checkpoint target_cols contain duplicates")
+    if len(set(aux_cols)) != len(aux_cols):
+        raise ValueError("Checkpoint aux_cols contain duplicates")
+    overlap = sorted(set(target_cols) & set(aux_cols))
+    if overlap:
+        raise ValueError(f"Checkpoint columns appear as both target and auxiliary: {overlap}")
+    target_feature_kinds = _validate_scaler_state(
+        bundle["scaler_target"], len(target_cols), "Target"
+    )
+    aux_feature_kinds = _validate_scaler_state(
+        bundle["scaler_aux"], len(aux_cols), "Auxiliary"
+    )
     if bundle.get("architecture_version", 1) != 1:
         raise ValueError(
             f"Unsupported architecture_version={bundle.get('architecture_version')}"
@@ -64,6 +109,8 @@ def _validate_bundle(bundle):
         )
     if "data_schema" in bundle:
         resolved = DataSchema.from_dict(bundle["data_schema"])
+        if resolved.schema_version != 1:
+            raise ValueError(f"Unsupported data schema_version={resolved.schema_version}")
         if resolved.target_cols != list(bundle["target_cols"]):
             raise ValueError("data_schema target order does not match target_cols")
         if resolved.auxiliary_cols != list(bundle["aux_cols"]):
@@ -72,6 +119,28 @@ def _validate_bundle(bundle):
             raise ValueError("model n_chem does not match data_schema chemistry columns")
         if len(bundle.get("target_output_transforms", [])) != resolved.target_dim:
             raise ValueError("target_output_transforms must match data_schema target dimension")
+        preprocessing = PreprocessingConfig.from_dict(bundle["preprocessing"])
+        expected_output_transforms = target_output_transforms(resolved, preprocessing)
+        if list(bundle["target_output_transforms"]) != expected_output_transforms:
+            raise ValueError(
+                "target_output_transforms do not match the stored preprocessing contract"
+            )
+        expected_target_kinds = (
+            [preprocessing.chemistry.scaler] * len(resolved.chemistry_cols)
+            + [preprocessing.psd.scaler] * len(resolved.psd_cols)
+        )
+        if target_feature_kinds and target_feature_kinds != expected_target_kinds:
+            raise ValueError("Target scaler feature kinds do not match preprocessing")
+        expected_aux_kinds = [preprocessing.meteorology.scaler] * resolved.aux_dim
+        if aux_feature_kinds and aux_feature_kinds != expected_aux_kinds:
+            raise ValueError("Auxiliary scaler feature kinds do not match preprocessing")
+        if bool(bundle["aux_mask_channel"]) != preprocessing.aux_mask_channel:
+            raise ValueError("aux_mask_channel does not match preprocessing contract")
+        expected_aux_mode = (
+            "mask_channel" if preprocessing.aux_mask_channel else "legacy_zero_fill"
+        )
+        if bundle["aux_missing_mode"] != expected_aux_mode:
+            raise ValueError("aux_missing_mode does not match preprocessing contract")
     schema = bundle.get("schema")
     if schema is not None:
         expected_cond_dim = len(bundle["aux_cols"]) * (2 if bundle["aux_mask_channel"] else 1)
@@ -133,6 +202,9 @@ def load_bundle(path, device=None):
             scaler_fit_scope=bundle.get("config", {}).get("scaler_fit_scope", "train"),
             aux_mask_channel=bundle["aux_mask_channel"],
         )
+    bundle.setdefault("data_schema", data_schema.to_dict())
+    bundle.setdefault("preprocessing", preprocessing.to_dict())
+    bundle.setdefault("data_interface", "legacy_columns")
     bundle.setdefault(
         "target_output_transforms",
         target_output_transforms(data_schema, preprocessing),
@@ -146,7 +218,12 @@ def load_bundle(path, device=None):
         window_size=bundle["window_size"],
         **bundle["model_kwargs"],
     )
-    model.load_state_dict(bundle["state_dict"])
+    try:
+        model.load_state_dict(bundle["state_dict"], strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Checkpoint state_dict is incompatible with the stored model/schema configuration"
+        ) from exc
     model.to(device)
     model.eval()
 
@@ -170,6 +247,8 @@ def load_bundle(path, device=None):
         "architecture_version": bundle["architecture_version"],
         "state_dict_format_version": bundle["state_dict_format_version"],
         "schema": bundle.get("schema"),
+        "model_kwargs": dict(bundle["model_kwargs"]),
+        "training_config": dict(bundle.get("config", {})),
         "timestamp_col": data_schema.timestamp_col,
         "time_grid": bundle.get("time_grid", {}),
         "device": device,
@@ -343,7 +422,7 @@ def _compute_support_diagnostics(obs_mask, context_window=72):
 def impute(
     csv_paths,
     bundle,
-    output_csv,
+    output_csv=None,
     stride=None,
     n_mc_samples=50,
     timestamp_col=None,
@@ -407,7 +486,9 @@ def impute(
         raise ValueError("stride cannot exceed window_size")
 
     if isinstance(modality_files, dict):
-        modality_files = ModalityFiles.from_dict(modality_files)
+        modality_files = ModalityInputs.from_dict(modality_files)
+    elif isinstance(modality_files, ModalityFiles):
+        modality_files = ModalityInputs.from_files(modality_files)
     if modality_files is not None:
         frame, _ = load_modality_frame(
             modality_files,
@@ -567,7 +648,8 @@ def impute(
             "heuristic_risk_tier": support["heuristic_risk_tier"][:, j],
         }))
     result_df = pd.concat(frames, ignore_index=True)
-    output_path = Path(output_csv)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    result_df.to_csv(output_path, index=False)
+    if output_csv is not None:
+        output_path = Path(output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result_df.to_csv(output_path, index=False)
     return result_df

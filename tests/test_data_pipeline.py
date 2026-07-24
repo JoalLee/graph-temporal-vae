@@ -5,6 +5,7 @@ import pytest
 from graph_tcn_vae.contracts import (
     DataSchema,
     ModalityFiles,
+    ModalityInputs,
     ModalityPreprocessing,
     PreprocessingConfig,
 )
@@ -232,6 +233,79 @@ def test_load_modality_frame_rejects_non_numeric_psd_column_names(tmp_path):
     pd.DataFrame({"time": ts, "small_bin": [1, 2, 3]}).to_csv(psd_path, index=False)
     with pytest.raises(ValueError, match="not a numeric particle diameter"):
         load_modality_frame(ModalityFiles(psd=[psd_path]), "time")
+
+
+def test_load_modality_frame_accepts_dataframes_and_datetime_index():
+    ts = pd.date_range("2024-01-01", periods=6, freq="h")
+    chemistry = pd.DataFrame({"SO2": np.arange(6, dtype=float)}, index=ts)
+    psd = pd.DataFrame({"100.0": np.arange(6) + 2, "12.0": np.arange(6) + 3}, index=ts)
+    meteorology = pd.DataFrame({"time": ts, "AT": np.arange(6) + 20})
+
+    frame, schema = load_modality_frame(
+        ModalityInputs(
+            chemistry=chemistry,
+            psd=psd,
+            meteorology=meteorology,
+        ),
+        "time",
+    )
+
+    assert schema.target_cols == ["SO2", "12.0", "100.0"]
+    assert schema.meteorology_cols == ["AT"]
+    assert frame.index.name == "time"
+    assert len(frame) == 6
+
+
+def test_load_modality_frame_supports_chem_only_and_psd_only():
+    ts = pd.date_range("2024-01-01", periods=4, freq="h")
+    chem_frame, chem_schema = load_modality_frame(
+        ModalityInputs(chemistry=pd.DataFrame({"time": ts, "SO2": [1, 2, 3, 4]})),
+        "time",
+    )
+    assert chem_schema.chemistry_cols == ["SO2"]
+    assert chem_schema.psd_cols == []
+    assert list(chem_frame.columns) == ["SO2"]
+
+    psd_frame, psd_schema = load_modality_frame(
+        ModalityInputs(psd=pd.DataFrame({"time": ts, "100": [1, 2, 3, 4], "10": [2, 3, 4, 5]})),
+        "time",
+    )
+    assert psd_schema.chemistry_cols == []
+    assert psd_schema.psd_cols == ["10", "100"]
+    assert list(psd_frame.columns) == ["10", "100"]
+
+
+def test_load_modality_frame_rejects_duplicate_numeric_psd_diameters():
+    ts = pd.date_range("2024-01-01", periods=3, freq="h")
+    psd = pd.DataFrame({"time": ts, "12": [1, 2, 3], "12.0": [2, 3, 4]})
+    with pytest.raises(ValueError, match="duplicate particle diameters"):
+        load_modality_frame(ModalityInputs(psd=psd), "time")
+
+
+def test_load_modality_frame_rejects_cross_modality_column_collision():
+    ts = pd.date_range("2024-01-01", periods=3, freq="h")
+    chemistry = pd.DataFrame({"time": ts, "SO2": [1, 2, 3]})
+    meteorology = pd.DataFrame({"time": ts, "SO2": [4, 5, 6]})
+    with pytest.raises(ValueError, match="multiple modalities"):
+        load_modality_frame(
+            ModalityInputs(chemistry=chemistry, meteorology=meteorology),
+            "time",
+        )
+
+
+def test_load_modality_frame_rejects_inference_timezone_mismatch():
+    utc = pd.date_range("2024-01-01", periods=4, freq="h", tz="UTC")
+    _frame, schema = load_modality_frame(
+        ModalityInputs(chemistry=pd.DataFrame({"time": utc, "SO2": [1, 2, 3, 4]})),
+        "time",
+    )
+    naive = pd.date_range("2024-01-01", periods=4, freq="h")
+    with pytest.raises(ValueError, match="timezone does not match"):
+        load_modality_frame(
+            ModalityInputs(chemistry=pd.DataFrame({"time": naive, "SO2": [1, 2, 3, 4]})),
+            "time",
+            expected_schema=schema,
+        )
 
 
 def test_modality_preprocessing_supports_independent_transform_and_scaler_modes():
