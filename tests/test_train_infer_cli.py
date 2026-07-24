@@ -107,6 +107,51 @@ def test_train_then_impute_round_trip(tmp_path):
     assert (gap_rows["imputed_std"] > 0).all()
 
 
+def _load_heldout_eval_module():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "heldout_eval.py"
+    spec = importlib.util.spec_from_file_location("heldout_eval", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_macro_average_r2_mae_matches_research_repo_methodology():
+    # Matches ablation_heldout_eval.py exactly: per-feature R^2 (not pooled
+    # across features), negative clipped to 0 before averaging, a feature
+    # needs >= min_points held-out points to count at all. Pooling instead
+    # (what this script did before) is dominated by whichever feature has
+    # the largest magnitude/variance -- feature 0 below has huge values and
+    # a near-perfect fit, feature 1 has small values and a bad (negative)
+    # fit; pooled R^2 would be dragged near 1.0 by feature 0's huge SS_tot,
+    # but the reference-matching macro-average must land near 0.5
+    # (mean of ~1.0 and clip(negative, 0) = 0.0).
+    heldout_eval = _load_heldout_eval_module()
+
+    n = 20
+    y_true = np.zeros((n, 2))
+    y_pred = np.zeros((n, 2))
+    mask = np.ones((n, 2), dtype=bool)
+
+    rng = np.random.default_rng(0)
+    y_true[:, 0] = rng.uniform(1000, 2000, n)
+    y_pred[:, 0] = y_true[:, 0] + rng.normal(0, 1, n)  # near-perfect fit, huge scale
+
+    y_true[:, 1] = rng.uniform(0, 1, n)
+    y_pred[:, 1] = rng.uniform(0, 1, n)  # unrelated to y_true -- ~R^2 <= 0
+
+    result = heldout_eval._macro_average_r2_mae(y_true, y_pred, mask, min_points=10)
+    assert result["n_features"] == 2
+    assert 0.3 < result["r2"] < 0.7  # NOT near 1.0, which pooling would give
+
+    # A feature below the min_points threshold must not count at all.
+    sparse_mask = mask.copy()
+    sparse_mask[5:, 1] = False  # only 5 held-out points for feature 1
+    result_sparse = heldout_eval._macro_average_r2_mae(y_true, y_pred, sparse_mask, min_points=10)
+    assert result_sparse["n_features"] == 1
+
+
 def test_two_stream_aggregation_keeps_mean_stable_despite_noisy_outlier_samples():
     # Mirrors infer.impute's compute_window_predictions design: the point
     # estimate must be built from the clean per-window mean stream

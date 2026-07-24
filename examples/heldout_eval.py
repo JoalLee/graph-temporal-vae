@@ -55,6 +55,41 @@ def _mae(y_true, y_pred):
     return float(np.mean(np.abs(y_true - y_pred)))
 
 
+def _macro_average_r2_mae(y_true_cols, y_pred_cols, mask_cols, min_points=10):
+    """Per-feature R^2/MAE, then average -- matches the research repo's
+    ablation_heldout_eval.py exactly (see the 'Macro-average: compute
+    per-feature then average' comment there): R^2 is computed separately
+    for each feature (not pooled across all features' held-out points at
+    once), negative per-feature R^2 is clipped to 0 before averaging, and a
+    feature contributes only if it has >= min_points held-out points.
+
+    A single pooled R^2 over all features combined (what this script did
+    before) is a DIFFERENT statistic: it's dominated by whichever features
+    have the largest magnitude/variance, so a model that fits a handful of
+    high-variance features very well can look far better pooled than
+    macro-averaged, even with mediocre or negative per-feature fit on most
+    other features.
+    """
+    r2_list, mae_list = [], []
+    for j in range(y_true_cols.shape[1]):
+        col_mask = mask_cols[:, j]
+        if col_mask.sum() < min_points:
+            continue
+        y_true = y_true_cols[col_mask, j]
+        y_pred = y_pred_cols[col_mask, j]
+        valid = np.isfinite(y_true) & np.isfinite(y_pred)
+        if valid.sum() < min_points:
+            continue
+        y_true, y_pred = y_true[valid], y_pred[valid]
+        r2_list.append(max(0.0, _r2_score(y_true, y_pred)))
+        mae_list.append(_mae(y_true, y_pred))
+    return {
+        "r2": float(np.mean(r2_list)) if r2_list else float("nan"),
+        "mae": float(np.mean(mae_list)) if mae_list else float("nan"),
+        "n_features": len(r2_list),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bundle", required=True)
@@ -192,15 +227,32 @@ def main():
     results = {}
     for group_name, cols_slice in (("chem", slice(0, n_chem)), ("psd", slice(n_chem, None))):
         mask_g = heldout_mask[:, cols_slice]
-        y_true = observed_output[:, cols_slice][mask_g]
-        y_pred = mean_out[:, cols_slice][mask_g]
+        y_true_g = observed_output[:, cols_slice]
+        y_pred_g = mean_out[:, cols_slice]
+
+        # Primary metric: per-feature R^2/MAE, negative clipped to 0, then
+        # averaged across features -- matches the research repo's
+        # ablation_heldout_eval.py exactly. This is what "chem_heldout_r2"
+        # in the reference's own reported numbers means.
+        macro = _macro_average_r2_mae(y_true_g, y_pred_g, mask_g)
+        results[f"{group_name}_heldout_r2"] = macro["r2"]
+        results[f"{group_name}_heldout_mae"] = macro["mae"]
+        results[f"{group_name}_heldout_n_features"] = macro["n_features"]
+
+        # Secondary/diagnostic: pool every feature's held-out points into one
+        # R^2/MAE. This is a DIFFERENT statistic (dominated by whichever
+        # features have the largest magnitude/variance) -- kept only so a
+        # large gap between _pooled and the macro-averaged number above is
+        # visible, not silently lost.
+        y_true = y_true_g[mask_g]
+        y_pred = y_pred_g[mask_g]
         q025_g = q025[:, cols_slice][mask_g]
         q975_g = q975[:, cols_slice][mask_g]
         valid = np.isfinite(y_true) & np.isfinite(y_pred)
         y_true, y_pred, q025_g, q975_g = y_true[valid], y_pred[valid], q025_g[valid], q975_g[valid]
         picp = float(np.mean((y_true >= q025_g) & (y_true <= q975_g)))
-        results[f"{group_name}_heldout_r2"] = _r2_score(y_true, y_pred)
-        results[f"{group_name}_heldout_mae"] = _mae(y_true, y_pred)
+        results[f"{group_name}_heldout_r2_pooled"] = _r2_score(y_true, y_pred)
+        results[f"{group_name}_heldout_mae_pooled"] = _mae(y_true, y_pred)
         results[f"{group_name}_heldout_picp95"] = picp
         results[f"{group_name}_heldout_n"] = int(len(y_true))
 
