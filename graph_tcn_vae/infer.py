@@ -54,11 +54,24 @@ def _validate_bundle(bundle):
 
 def load_bundle(path, device=None):
     device = device or setup_device()
-    bundle = torch.load(path, map_location=device, weights_only=False)
+    # Bundle files are data, not executable Python objects.  weights_only=True
+    # blocks arbitrary pickle object construction when loading an untrusted file.
+    bundle = torch.load(path, map_location=device, weights_only=True)
     bundle.setdefault("bundle_version", 1)
     bundle.setdefault("aux_missing_mode", "legacy_zero_fill")
     bundle.setdefault("aux_mask_channel", bundle["aux_missing_mode"] == "mask_channel")
     bundle.setdefault("target_transform", bundle.get("config", {}).get("target_transform", "none"))
+    bundle.setdefault(
+        "time_grid",
+        {
+            "frequency": bundle.get("config", {}).get("expected_frequency"),
+            "timezone": None,
+            "policy": bundle.get("config", {}).get("time_grid_policy", "row_order"),
+            "duplicate_timestamp_policy": bundle.get("config", {}).get(
+                "duplicate_timestamp_policy", "first"
+            ),
+        },
+    )
     bundle.setdefault(
         "target_output_transform",
         bundle.get("config", {}).get("target_output_transform", bundle["target_transform"]),
@@ -92,6 +105,7 @@ def load_bundle(path, device=None):
         "bundle_version": bundle["bundle_version"],
         "schema": bundle.get("schema"),
         "timestamp_col": bundle["config"].get("timestamp_col"),
+        "time_grid": bundle.get("time_grid", {}),
         "device": device,
     }
 
@@ -238,6 +252,49 @@ def aggregate_window_samples(
     return {"mean": mean, "variance": variance, "quantiles": quantile_values}
 
 
+def _compute_support_diagnostics(obs_mask, context_window=72):
+    """Describe each missing run without claiming model calibration.
+
+    Risk tiers are operational heuristics based on gap length and bilateral
+    observed context. They are not learned probabilities and should not replace
+    held-out evaluation on the user's dataset.
+    """
+    observed = np.asarray(obs_mask, dtype=bool)
+    n_rows, n_features = observed.shape
+    gap_length = np.zeros((n_rows, n_features), dtype=np.int32)
+    left_context = np.full((n_rows, n_features), np.nan, dtype=np.float64)
+    right_context = np.full((n_rows, n_features), np.nan, dtype=np.float64)
+    risk = np.full((n_rows, n_features), "observed", dtype=object)
+
+    for feature in range(n_features):
+        missing = ~observed[:, feature]
+        starts = np.flatnonzero(missing & ~np.r_[False, missing[:-1]])
+        ends = np.flatnonzero(missing & ~np.r_[missing[1:], False]) + 1
+        for start, end in zip(starts, ends):
+            length = int(end - start)
+            left = observed[max(0, start - context_window):start, feature]
+            right = observed[end:min(n_rows, end + context_window), feature]
+            left_fraction = float(left.mean()) if left.size else 0.0
+            right_fraction = float(right.mean()) if right.size else 0.0
+            gap_length[start:end, feature] = length
+            left_context[start:end, feature] = left_fraction
+            right_context[start:end, feature] = right_fraction
+            if length <= 12 and left_fraction >= 0.75 and right_fraction >= 0.75:
+                tier = "low"
+            elif length >= 96 or min(left_fraction, right_fraction) < 0.25:
+                tier = "high"
+            else:
+                tier = "moderate"
+            risk[start:end, feature] = tier
+
+    return {
+        "gap_length": gap_length,
+        "left_context_fraction": left_context,
+        "right_context_fraction": right_context,
+        "heuristic_risk_tier": risk,
+    }
+
+
 def impute(
     csv_paths,
     bundle,
@@ -247,6 +304,7 @@ def impute(
     timestamp_col=None,
     inference_batch_size=4,
     mc_batch_size=1,
+    support_context_window=72,
 ):
     """Impute/predict on new CSVs using a trained checkpoint bundle.
 
@@ -276,12 +334,31 @@ def impute(
     # Reuse the training window stride unless the caller explicitly overrides
     # it.  The 26e reference uses stride=24; falling back to window//2 would
     # silently change the overlap geometry during inference.
-    stride = stride or bundle.get("stride") or max(1, window_size // 2)
-    stride = min(stride, window_size)
+    if stride is None:
+        stride = bundle.get("stride") or max(1, window_size // 2)
+    if not isinstance(stride, int) or stride < 1:
+        raise ValueError("stride must be a positive integer")
+    if stride > window_size:
+        raise ValueError("stride cannot exceed window_size")
+    if not isinstance(n_mc_samples, int) or n_mc_samples < 2:
+        raise ValueError("n_mc_samples must be an integer >= 2")
     if inference_batch_size < 1 or mc_batch_size < 1:
         raise ValueError("inference_batch_size and mc_batch_size must be positive")
+    if support_context_window < 1:
+        raise ValueError("support_context_window must be positive")
 
-    frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
+    time_grid = bundle.get("time_grid", {})
+    frame = load_frame(
+        csv_paths,
+        ts_col,
+        target_cols,
+        aux_cols,
+        expected_frequency=time_grid.get("frequency"),
+        time_grid_policy=time_grid.get("policy", "row_order"),
+        duplicate_timestamp_policy=time_grid.get(
+            "duplicate_timestamp_policy", "error"
+        ),
+    )
     n = len(frame)
     starts = compute_window_starts(n, window_size, stride)
     if not starts:
@@ -345,7 +422,7 @@ def impute(
                     x_t,
                     cond_t,
                     mask_t,
-                    n_samples=max(2, n_mc_samples),
+                    n_samples=n_mc_samples,
                     return_samples=True,
                     mc_batch_size=mc_batch_size,
                 )
@@ -388,17 +465,27 @@ def impute(
     q05_out = np.where(obs_mask_full == 1, observed_output, q05_out)
     q95_out = np.where(obs_mask_full == 1, observed_output, q95_out)
 
+    support = _compute_support_diagnostics(
+        obs_mask_full, context_window=support_context_window
+    )
     frames = []
     for j, col in enumerate(target_cols):
         frames.append(pd.DataFrame({
             "timestamp": frame.index,
             "feature": col,
             "observed": observed_output[:, j],
+            "is_imputed": obs_mask_full[:, j] == 0,
             "imputed_mean": mean_out[:, j],
             "imputed_std": std_out[:, j],
             "q05": q05_out[:, j],
             "q95": q95_out[:, j],
+            "gap_length": support["gap_length"][:, j],
+            "left_context_fraction": support["left_context_fraction"][:, j],
+            "right_context_fraction": support["right_context_fraction"][:, j],
+            "heuristic_risk_tier": support["heuristic_risk_tier"][:, j],
         }))
     result_df = pd.concat(frames, ignore_index=True)
-    result_df.to_csv(output_csv, index=False)
+    output_path = Path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result_df.to_csv(output_path, index=False)
     return result_df

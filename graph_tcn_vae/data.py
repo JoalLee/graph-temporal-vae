@@ -60,12 +60,23 @@ class NaNAwareStandardScaler:
         self.std_ = None
 
     def fit(self, array):
-        mean = np.nanmean(array, axis=0)
-        std = np.nanstd(array, axis=0)
-        # A column that is entirely NaN, or constant, gets a neutral mean/std
-        # so transform() doesn't produce NaN/inf for it.
-        self.mean_ = np.nan_to_num(mean, nan=0.0)
-        self.std_ = np.where(np.isnan(std) | (std < 1e-8), 1.0, std)
+        values = np.asarray(array, dtype=np.float64)
+        if values.ndim != 2:
+            raise ValueError(f"Scaler input must be 2-D, got shape {values.shape}")
+        if values.shape[1] == 0:
+            self.mean_ = np.zeros(0, dtype=np.float64)
+            self.std_ = np.ones(0, dtype=np.float64)
+            return self
+        all_nan = np.isnan(values).all(axis=0)
+        if all_nan.any():
+            indices = np.flatnonzero(all_nan).tolist()
+            raise ValueError(
+                f"Cannot fit scaler: all values are missing in column indices {indices}"
+            )
+        mean = np.nanmean(values, axis=0)
+        std = np.nanstd(values, axis=0)
+        self.mean_ = mean
+        self.std_ = np.where(std < 1e-8, 1.0, std)
         return self
 
     def transform(self, array):
@@ -92,44 +103,168 @@ class NaNAwareStandardScaler:
         return scaler
 
 
-def load_frame(csv_paths, timestamp_col, target_cols, aux_cols):
-    """Load one or more CSVs, join on timestamp, sort chronologically.
+def _resolve_time_grid(index, expected_frequency=None):
+    """Return a concrete pandas offset for an observed timestamp index."""
+    if expected_frequency:
+        try:
+            return pd.tseries.frequencies.to_offset(expected_frequency)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid expected_frequency={expected_frequency!r}"
+            ) from exc
+    if len(index) < 2:
+        return None
+    diffs = index.to_series().diff().dropna()
+    if diffs.empty:
+        return None
+    mode = diffs.mode()
+    if mode.empty or mode.iloc[0] <= pd.Timedelta(0):
+        return None
+    return pd.tseries.frequencies.to_offset(mode.iloc[0])
 
-    Multiple paths are outer-joined on the timestamp index, which lets
-    co-located instruments (e.g. chemistry, PSD, meteorology) live in
-    separate files sharing a common time axis.
+
+def load_frame(
+    csv_paths,
+    timestamp_col,
+    target_cols,
+    aux_cols,
+    *,
+    expected_frequency=None,
+    time_grid_policy="strict",
+    duplicate_timestamp_policy="error",
+):
+    """Load named time-series columns and enforce an explicit time-grid contract.
+
+    ``time_grid_policy`` is ``strict`` (reject missing/irregular timestamps),
+    ``reindex`` (insert missing grid rows as NaN), or ``row_order`` (legacy
+    behavior; timestamps are sorted but row spacing is not validated).
     """
     if isinstance(csv_paths, (str, Path)):
         csv_paths = [csv_paths]
+    csv_paths = list(csv_paths)
+    if not csv_paths:
+        raise ValueError("At least one CSV path is required")
+    target_cols = list(target_cols)
+    aux_cols = list(aux_cols)
+    overlap = sorted(set(target_cols) & set(aux_cols))
+    if overlap:
+        raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")
+    if not target_cols:
+        raise ValueError("At least one target column is required")
+    if time_grid_policy not in {"strict", "reindex", "row_order"}:
+        raise ValueError(
+            "time_grid_policy must be 'strict', 'reindex', or 'row_order'"
+        )
+    if duplicate_timestamp_policy not in {"error", "first"}:
+        raise ValueError(
+            "duplicate_timestamp_policy must be 'error' or 'first'"
+        )
 
-    frames = []
+    required = target_cols + aux_cols
+    selected_frames = []
+    sources = {}
     for path in csv_paths:
         df = pd.read_csv(path)
         if timestamp_col not in df.columns:
             raise ValueError(f"'{timestamp_col}' not found in columns of {path}")
-        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-        df = df.set_index(timestamp_col)
-        df = df[~df.index.duplicated(keep="first")]
-        frames.append(df)
+        try:
+            timestamps = pd.to_datetime(df[timestamp_col], errors="raise")
+        except Exception as exc:
+            raise ValueError(f"Invalid timestamps in {path}: {exc}") from exc
+        if timestamps.isna().any():
+            raise ValueError(f"Missing timestamps found in {path}")
+        df = df.assign(**{timestamp_col: timestamps}).set_index(timestamp_col)
+        duplicate_count = int(df.index.duplicated(keep=False).sum())
+        if duplicate_count:
+            if duplicate_timestamp_policy == "error":
+                raise ValueError(
+                    f"{path} contains {duplicate_count} rows with duplicate timestamps"
+                )
+            df = df[~df.index.duplicated(keep="first")]
 
-    merged = frames[0]
-    for extra in frames[1:]:
-        merged = merged.join(extra, how="outer")
-    merged = merged.sort_index()
+        present = [column for column in required if column in df.columns]
+        for column in present:
+            if column in sources:
+                raise ValueError(
+                    f"Column {column!r} appears in multiple CSVs: "
+                    f"{sources[column]} and {path}"
+                )
+            sources[column] = str(path)
+        if present:
+            selected_frames.append(df[present])
 
-    required = list(target_cols) + list(aux_cols)
-    missing = [col for col in required if col not in merged.columns]
+    missing = [column for column in required if column not in sources]
     if missing:
         raise ValueError(f"Columns not found in the loaded data: {missing}")
+    if not selected_frames:
+        raise ValueError("No requested columns were loaded")
 
+    merged = pd.concat(selected_frames, axis=1, join="outer").sort_index()
+    if not merged.index.is_monotonic_increasing:
+        raise ValueError("Timestamp index could not be sorted monotonically")
+    if merged.index.has_duplicates:
+        raise ValueError("Duplicate timestamps remain after CSV merge")
+
+    for column in required:
+        try:
+            merged[column] = pd.to_numeric(merged[column], errors="raise")
+        except Exception as exc:
+            raise ValueError(f"Column {column!r} must be numeric") from exc
+    all_missing_targets = [
+        column for column in target_cols if merged[column].isna().all()
+    ]
+    if all_missing_targets:
+        raise ValueError(
+            f"Target columns contain no observed values: {all_missing_targets}"
+        )
+
+    frequency = None
+    if time_grid_policy != "row_order" and len(merged.index) > 1:
+        frequency = _resolve_time_grid(merged.index, expected_frequency)
+        if frequency is None:
+            raise ValueError(
+                "Could not determine a positive time frequency; pass "
+                "expected_frequency explicitly or use time_grid_policy='row_order'"
+            )
+        full_index = pd.date_range(
+            start=merged.index.min(),
+            end=merged.index.max(),
+            freq=frequency,
+            tz=merged.index.tz,
+        )
+        if not merged.index.equals(full_index):
+            missing_rows = int(len(full_index.difference(merged.index)))
+            off_grid_rows = int(len(merged.index.difference(full_index)))
+            if time_grid_policy == "strict":
+                raise ValueError(
+                    "Timestamp grid is irregular: "
+                    f"frequency={frequency.freqstr}, missing_grid_rows={missing_rows}, "
+                    f"off_grid_rows={off_grid_rows}. Use time_grid_policy='reindex' "
+                    "to insert missing rows as NaN."
+                )
+            if off_grid_rows:
+                raise ValueError(
+                    f"Cannot reindex: {off_grid_rows} timestamps are off the "
+                    f"{frequency.freqstr} grid"
+                )
+            merged = merged.reindex(full_index)
+            merged.index.name = timestamp_col
+
+    merged.attrs["frequency"] = frequency.freqstr if frequency is not None else None
+    merged.attrs["timezone"] = str(merged.index.tz) if merged.index.tz is not None else None
+    merged.attrs["time_grid_policy"] = time_grid_policy
     return merged
 
 
 def compute_window_starts(n, window_size, stride):
     """Sliding-window start indices; always includes a final tail window."""
+    if window_size < 1 or stride < 1:
+        raise ValueError("window_size and stride must be positive")
+    if stride > window_size:
+        raise ValueError("stride cannot exceed window_size because it leaves uncovered rows")
     if n < window_size:
         return []
-    starts = list(range(0, n - window_size + 1, max(1, stride)))
+    starts = list(range(0, n - window_size + 1, stride))
     last_start = n - window_size
     if not starts or starts[-1] != last_start:
         starts.append(last_start)

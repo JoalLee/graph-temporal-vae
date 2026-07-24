@@ -3,6 +3,7 @@ import argparse
 import json
 
 from .config import TrainConfig
+from .data import load_frame
 from .infer import impute as run_impute
 from .train import train_from_config
 
@@ -28,6 +29,20 @@ def build_parser():
              "Use log1p when the input CSV is already log1p-transformed.",
     )
     train_p.add_argument("--scaler-fit-scope", choices=["train", "full"], default="train")
+    train_p.add_argument(
+        "--expected-frequency",
+        default=None,
+        help="Expected pandas frequency such as 1h or 30min. If omitted, the modal positive interval is used.",
+    )
+    train_p.add_argument(
+        "--time-grid-policy",
+        choices=["strict", "reindex", "row_order"],
+        default="strict",
+        help="Reject irregular timestamps, insert missing grid rows, or preserve legacy row-order semantics.",
+    )
+    train_p.add_argument(
+        "--duplicate-timestamp-policy", choices=["error", "first"], default="error"
+    )
     train_p.add_argument("--window-size", type=int, default=48)
     train_p.add_argument("--stride", type=int, default=24)
     train_p.add_argument("--val-fraction", type=float, default=0.15)
@@ -110,13 +125,34 @@ def build_parser():
     infer_p.add_argument("--bundle", required=True)
     infer_p.add_argument("--csv", required=True, help="Comma-separated CSV path(s).")
     infer_p.add_argument("--timestamp-col", default=None, help="Defaults to the column used at training time.")
-    infer_p.add_argument("--stride", type=int, default=None, help="Defaults to window_size // 2.")
+    infer_p.add_argument("--stride", type=int, default=None, help="Defaults to the stride saved in the bundle.")
     infer_p.add_argument("--n-mc-samples", type=int, default=50)
     infer_p.add_argument("--inference-batch-size", type=int, default=4,
                          help="Number of sliding windows per model call.")
     infer_p.add_argument("--mc-batch-size", type=int, default=1,
                          help="Number of MC draws replicated per model call.")
+    infer_p.add_argument(
+        "--support-context-window",
+        type=int,
+        default=72,
+        help="Rows on each side used for operational gap-support diagnostics.",
+    )
     infer_p.add_argument("-o", "--output", required=True)
+
+    validate_p = sub.add_parser(
+        "validate-data", help="Validate CSV schema and timestamp-grid assumptions without training."
+    )
+    validate_p.add_argument("--csv", required=True, help="Comma-separated CSV path(s).")
+    validate_p.add_argument("--timestamp-col", required=True)
+    validate_p.add_argument("--target-cols", required=True)
+    validate_p.add_argument("--aux-cols", default="")
+    validate_p.add_argument("--expected-frequency", default=None)
+    validate_p.add_argument(
+        "--time-grid-policy", choices=["strict", "reindex", "row_order"], default="strict"
+    )
+    validate_p.add_argument(
+        "--duplicate-timestamp-policy", choices=["error", "first"], default="error"
+    )
 
     return parser
 
@@ -151,6 +187,9 @@ def main(argv=None):
             target_transform=args.target_transform,
             target_output_transform=args.target_output_transform,
             scaler_fit_scope=args.scaler_fit_scope,
+            expected_frequency=args.expected_frequency,
+            time_grid_policy=args.time_grid_policy,
+            duplicate_timestamp_policy=args.duplicate_timestamp_policy,
             window_size=args.window_size,
             stride=args.stride,
             val_fraction=args.val_fraction,
@@ -215,8 +254,36 @@ def main(argv=None):
             timestamp_col=args.timestamp_col,
             inference_batch_size=args.inference_batch_size,
             mc_batch_size=args.mc_batch_size,
+            support_context_window=args.support_context_window,
         )
         print(f"wrote imputed output to {args.output}")
+
+    elif args.command == "validate-data":
+        frame = load_frame(
+            _csv_list(args.csv),
+            args.timestamp_col,
+            _csv_list(args.target_cols),
+            _csv_list(args.aux_cols),
+            expected_frequency=args.expected_frequency,
+            time_grid_policy=args.time_grid_policy,
+            duplicate_timestamp_policy=args.duplicate_timestamp_policy,
+        )
+        target_cols = _csv_list(args.target_cols)
+        missing_fraction = frame[target_cols].isna().mean().to_dict()
+        print(
+            json.dumps(
+                {
+                    "rows": len(frame),
+                    "start": str(frame.index.min()),
+                    "end": str(frame.index.max()),
+                    "frequency": frame.attrs.get("frequency"),
+                    "timezone": frame.attrs.get("timezone"),
+                    "target_missing_fraction": missing_fraction,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
 
 if __name__ == "__main__":

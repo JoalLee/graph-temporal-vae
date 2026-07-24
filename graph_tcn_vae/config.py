@@ -20,6 +20,11 @@ class TrainConfig:
     # time axis before applying the fixed held-out mask.  General users may
     # prefer the leakage-safe train-only default.
     scaler_fit_scope: str = "train"
+    # Time-grid contract. strict rejects missing/off-grid rows; reindex inserts
+    # missing grid rows as NaN; row_order preserves legacy row-based behavior.
+    expected_frequency: Optional[str] = None
+    time_grid_policy: str = "strict"
+    duplicate_timestamp_policy: str = "error"
 
     window_size: int = 48
     stride: int = 24
@@ -100,6 +105,15 @@ class TrainConfig:
     def __post_init__(self):
         if isinstance(self.csv, str):
             self.csv = [self.csv]
+        self.target_cols = list(self.target_cols)
+        self.aux_cols = list(self.aux_cols)
+        if not self.csv:
+            raise ValueError("At least one CSV path is required")
+        if not self.target_cols:
+            raise ValueError("At least one target column is required")
+        overlap = sorted(set(self.target_cols) & set(self.aux_cols))
+        if overlap:
+            raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")
         for derived in ("target_dim", "aux_dim", "window_size"):
             self.model_kwargs.pop(derived, None)
         if self.validation_metric not in {"ho_nll", "ho_mse", "ho_crps"}:
@@ -114,6 +128,14 @@ class TrainConfig:
             raise ValueError("target_output_transform must be 'none' or 'log1p'")
         if self.scaler_fit_scope not in {"train", "full"}:
             raise ValueError("scaler_fit_scope must be 'train' or 'full'")
+        if self.time_grid_policy not in {"strict", "reindex", "row_order"}:
+            raise ValueError(
+                "time_grid_policy must be 'strict', 'reindex', or 'row_order'"
+            )
+        if self.duplicate_timestamp_policy not in {"error", "first"}:
+            raise ValueError(
+                "duplicate_timestamp_policy must be 'error' or 'first'"
+            )
         if self.prior_type not in {"gaussian", "laplace", "student_t"}:
             raise ValueError("prior_type must be 'gaussian', 'laplace', or 'student_t'")
         if self.loss_normalization not in {"observed_mean", "window_feature_sum"}:
@@ -132,6 +154,8 @@ class TrainConfig:
             raise ValueError("selection_mask_ratio must be in (0, 1]")
         if self.window_size < 1 or self.stride < 1:
             raise ValueError("window_size and stride must be positive")
+        if self.stride > self.window_size:
+            raise ValueError("stride cannot exceed window_size")
         if self.lr_min < 0 or self.weight_decay < 0:
             raise ValueError("lr_min and weight_decay must be non-negative")
         if self.chem_feature_weight < 0 or self.psd_feature_weight < 0:

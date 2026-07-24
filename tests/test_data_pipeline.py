@@ -28,11 +28,14 @@ def test_scaler_round_trip_ignores_nan():
     assert restored[2, 1] == pytest.approx(12.0)
 
 
-def test_scaler_handles_constant_and_allnan_columns():
-    array = np.array([[5.0, np.nan], [5.0, np.nan], [5.0, np.nan]])
-    scaler = NaNAwareStandardScaler().fit(array)
-    scaled = scaler.transform(array)
-    assert np.isfinite(scaled).all()
+def test_scaler_handles_constant_columns_but_rejects_allnan_columns():
+    constant = np.array([[5.0], [5.0], [5.0]])
+    scaler = NaNAwareStandardScaler().fit(constant)
+    assert np.isfinite(scaler.transform(constant)).all()
+
+    all_nan = np.array([[5.0, np.nan], [5.0, np.nan], [5.0, np.nan]])
+    with pytest.raises(ValueError, match="all values are missing"):
+        NaNAwareStandardScaler().fit(all_nan)
 
 
 def test_log1p_target_transform_round_trip_and_rejects_negative_values():
@@ -78,6 +81,78 @@ def test_load_frame_joins_multiple_csvs_on_timestamp(tmp_path):
     assert list(frame["a"]) == list(range(6))
     assert list(frame["b"]) == list(range(6, 12))
     assert frame.index.is_monotonic_increasing
+
+
+def test_load_frame_rejects_irregular_grid_by_default(tmp_path):
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 07:00"]
+            ),
+            "a": [1.0, 2.0, 3.0],
+        }
+    )
+    path = tmp_path / "irregular.csv"
+    df.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="Timestamp grid is irregular"):
+        load_frame([path], "time", target_cols=["a"], aux_cols=[])
+
+
+def test_load_frame_can_reindex_missing_grid_rows(tmp_path):
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 03:00"]
+            ),
+            "a": [1.0, 2.0, 4.0],
+        }
+    )
+    path = tmp_path / "missing_hour.csv"
+    df.to_csv(path, index=False)
+    frame = load_frame(
+        [path],
+        "time",
+        target_cols=["a"],
+        aux_cols=[],
+        expected_frequency="1h",
+        time_grid_policy="reindex",
+    )
+    assert len(frame) == 4
+    assert pd.isna(frame.loc[pd.Timestamp("2024-01-01 02:00"), "a"])
+    assert frame.attrs["frequency"].lower() == "h"
+
+
+def test_load_frame_rejects_duplicate_timestamps(tmp_path):
+    df = pd.DataFrame(
+        {
+            "time": ["2024-01-01 00:00", "2024-01-01 00:00"],
+            "a": [1.0, 2.0],
+        }
+    )
+    path = tmp_path / "duplicate.csv"
+    df.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="duplicate timestamps"):
+        load_frame([path], "time", target_cols=["a"], aux_cols=[])
+
+
+def test_load_frame_rejects_all_missing_target(tmp_path):
+    ts = pd.date_range("2024-01-01", periods=3, freq="h")
+    path = tmp_path / "all_missing.csv"
+    pd.DataFrame({"time": ts, "a": [np.nan, np.nan, np.nan]}).to_csv(
+        path, index=False
+    )
+    with pytest.raises(ValueError, match="no observed values"):
+        load_frame([path], "time", target_cols=["a"], aux_cols=[])
+
+
+def test_load_frame_rejects_same_column_from_multiple_csvs(tmp_path):
+    ts = pd.date_range("2024-01-01", periods=3, freq="h")
+    path_a = tmp_path / "a.csv"
+    path_b = tmp_path / "b.csv"
+    pd.DataFrame({"time": ts, "a": [1, 2, 3]}).to_csv(path_a, index=False)
+    pd.DataFrame({"time": ts, "a": [4, 5, 6]}).to_csv(path_b, index=False)
+    with pytest.raises(ValueError, match="appears in multiple CSVs"):
+        load_frame([path_a, path_b], "time", target_cols=["a"], aux_cols=[])
 
 
 def test_load_frame_missing_column_raises(tmp_path):

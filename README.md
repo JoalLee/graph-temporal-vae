@@ -81,7 +81,22 @@ with torch.no_grad():
 print(recon_mean.shape)
 ```
 
-See `examples/minimal_forward.py` for a runnable example.
+See `examples/minimal_forward.py` for a runnable architecture example.
+
+## Guided Nanzi Demo
+
+A compact 96-hour excerpt from the Nanzi aerosol supersite record is included at `examples/data/nanzi_demo_96h.csv`. The dataset contains four composition targets, four representative PSD bins, meteorological/time conditioning variables, and natural missing values.
+
+Open `examples/nanzi_demo_workflow.ipynb` for a complete walkthrough:
+
+1. inspect missingness;
+2. validate the hourly timestamp grid and column contract;
+3. train a deliberately small demonstration model;
+4. save and reload a self-contained checkpoint bundle;
+5. impute natural gaps with predictive intervals;
+6. inspect gap length, bilateral context support, and heuristic risk tiers.
+
+The excerpt is intended only to demonstrate the software interface. It is too short for scientifically valid aerosol reconstruction, calibrated uncertainty, or comparison with the reported 26e research results.
 
 ## Input Shapes
 

@@ -29,6 +29,9 @@ logs/
 *.docx
 *.pptx
 
+!examples/data/
+!examples/data/*.csv
+
 .agent/
 .agents/
 .claude/

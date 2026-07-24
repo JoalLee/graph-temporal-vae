@@ -169,31 +169,54 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
     return loss, recon.detach(), kl.detach()
 
 
-def empirical_crps(samples, target, mask):
-    """Compute empirical CRPS on selected entries of MC predictive samples."""
+def empirical_crps_components(samples, target, mask):
+    """Return empirical CRPS sum and selected-point count."""
     mask = mask.float()
-    if mask.sum() == 0:
-        return torch.tensor(float("nan"), device=target.device)
+    count = mask.sum()
+    if count == 0:
+        return torch.zeros((), device=target.device), count
     first = (samples - target.unsqueeze(0)).abs().mean(dim=0)
     pairwise = 0.5 * (samples[:, None] - samples[None, :]).abs().mean(dim=(0, 1))
     score = first - pairwise
-    return (score * mask).sum() / mask.sum()
+    return (score * mask).sum(), count
+
+
+def empirical_crps(samples, target, mask):
+    """Compute empirical CRPS on selected entries of MC predictive samples."""
+    total, count = empirical_crps_components(samples, target, mask)
+    if count == 0:
+        return torch.tensor(float("nan"), device=target.device)
+    return total / count
+
+
+def masked_mse_components(prediction, target, mask):
+    """Return squared-error sum and selected-point count."""
+    mask = mask.float()
+    return (((prediction - target) ** 2) * mask).sum(), mask.sum()
 
 
 def masked_mse(prediction, target, mask):
     """Mean squared error over a held-out mask."""
+    total, count = masked_mse_components(prediction, target, mask)
+    return total / count.clamp(min=1.0)
+
+
+def masked_nll_components(recon_mean, recon_logvar, target, mask):
+    """Return Gaussian NLL sum and selected-point count."""
+    if recon_logvar is None:
+        return masked_mse_components(recon_mean, target, mask)
+    variance = torch.exp(recon_logvar).clamp(min=1e-6)
+    nll = 0.5 * (recon_logvar + (target - recon_mean) ** 2 / variance)
     mask = mask.float()
-    return (((prediction - target) ** 2) * mask).sum() / mask.sum().clamp(min=1.0)
+    return (nll * mask).sum(), mask.sum()
 
 
 def masked_nll(recon_mean, recon_logvar, target, mask):
     """Gaussian reconstruction NLL over a held-out mask."""
-    if recon_logvar is None:
-        return masked_mse(recon_mean, target, mask)
-    variance = torch.exp(recon_logvar).clamp(min=1e-6)
-    nll = 0.5 * (recon_logvar + (target - recon_mean) ** 2 / variance)
-    mask = mask.float()
-    return (nll * mask).sum() / mask.sum().clamp(min=1.0)
+    total, count = masked_nll_components(
+        recon_mean, recon_logvar, target, mask
+    )
+    return total / count.clamp(min=1.0)
 
 
 class Trainer:
@@ -343,9 +366,9 @@ class Trainer:
         self._set_epoch_state(epoch)
         total_nll = 0.0
         total_mse = 0.0
+        total_heldout_count = 0.0
         total_crps = 0.0
-        n_batches = 0
-        n_crps_batches = 0
+        total_crps_count = 0.0
         compute_crps = (
             self.config.validation_metric == "ho_crps"
             and (epoch == 0 or (epoch + 1) % max(1, self.config.val_crps_every_n_epochs) == 0)
@@ -362,11 +385,17 @@ class Trainer:
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
-                ho_nll = masked_nll(recon_mean.float(), recon_logvar, target, heldout_mask)
-                ho_mse = masked_mse(recon_mean.float(), target, heldout_mask)
-                total_nll += ho_nll.item()
-                total_mse += ho_mse.item()
-                n_batches += 1
+                nll_sum, heldout_count = masked_nll_components(
+                    recon_mean.float(), recon_logvar, target, heldout_mask
+                )
+                mse_sum, mse_count = masked_mse_components(
+                    recon_mean.float(), target, heldout_mask
+                )
+                if not torch.equal(heldout_count, mse_count):
+                    raise RuntimeError("Held-out metric counts disagree")
+                total_nll += nll_sum.item()
+                total_mse += mse_sum.item()
+                total_heldout_count += heldout_count.item()
 
                 if compute_crps:
                     result = self.model.compute_uncertainty(
@@ -380,15 +409,23 @@ class Trainer:
                         amp_dtype=self.amp_dtype,
                     )
                     samples = result[-2]
-                    crps = empirical_crps(samples, target, heldout_mask)
-                    if torch.isfinite(crps):
-                        total_crps += crps.item()
-                        n_crps_batches += 1
+                    crps_sum, crps_count = empirical_crps_components(
+                        samples, target, heldout_mask
+                    )
+                    if crps_count > 0 and torch.isfinite(crps_sum):
+                        total_crps += crps_sum.item()
+                        total_crps_count += crps_count.item()
 
+        if total_heldout_count <= 0:
+            raise ValueError("Validation loader contained no held-out target points")
         return {
-            "ho_nll": total_nll / max(n_batches, 1),
-            "ho_mse": total_mse / max(n_batches, 1),
-            "ho_crps": (total_crps / n_crps_batches) if n_crps_batches else None,
+            "ho_nll": total_nll / total_heldout_count,
+            "ho_mse": total_mse / total_heldout_count,
+            "ho_crps": (
+                total_crps / total_crps_count
+                if total_crps_count > 0
+                else None
+            ),
         }
 
     def fit(self):
@@ -459,7 +496,15 @@ class Trainer:
 def train_from_config(config: TrainConfig, save_path: str) -> float:
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
-    frame = load_frame(config.csv, config.timestamp_col, config.target_cols, config.aux_cols)
+    frame = load_frame(
+        config.csv,
+        config.timestamp_col,
+        config.target_cols,
+        config.aux_cols,
+        expected_frequency=config.expected_frequency,
+        time_grid_policy=config.time_grid_policy,
+        duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+    )
 
     target_raw = frame[config.target_cols].to_numpy(dtype=np.float64)
     target_model_space = transform_target_values(target_raw, config.target_transform)
@@ -619,6 +664,12 @@ def train_from_config(config: TrainConfig, save_path: str) -> float:
         "aux_mask_channel": config.aux_mask_channel,
         "target_transform": config.target_transform,
         "target_output_transform": config.target_output_transform,
+        "time_grid": {
+            "frequency": frame.attrs.get("frequency"),
+            "timezone": frame.attrs.get("timezone"),
+            "policy": config.time_grid_policy,
+            "duplicate_timestamp_policy": config.duplicate_timestamp_policy,
+        },
         "selection_mask_protocol": f"fixed_{config.selection_mask_mode}_ho",
         "schema": {
             "target_cols": list(config.target_cols),

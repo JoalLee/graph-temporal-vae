@@ -410,6 +410,7 @@ def test_use_adaptive_lr_builds_plateau_scheduler_and_skips_cosine_after_warmup(
         timestamp_col="time",
         target_cols=["target_a", "target_b"],
         window_size=8,
+        stride=8,
         use_adaptive_lr=True,
         lr_reduce_factor=0.5,
         lr_reduce_patience=2,
