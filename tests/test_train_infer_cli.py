@@ -594,6 +594,13 @@ def test_fixed_mask_is_kept_out_of_training_inputs():
     assert item["heldout_mask"][3, 1].item() == 1.0
     assert item["input_mask"][3, 1].item() == 0.0
     assert item["target"][3, 1].item() == 1.0
+    # A fixed selection mask is a permanent blind held-out set: it must also
+    # be excluded from obs_mask, not just input_mask, since the training loss
+    # is computed over obs_mask. Otherwise the model gets direct gradient
+    # supervision on exactly the points later reported as held-out accuracy.
+    assert item["obs_mask"][3, 1].item() == 0.0
+    # every other position is untouched
+    assert item["obs_mask"].sum().item() == 15.0
 
 
 def test_student_t_window_feature_loss_uses_experiment_normalization():

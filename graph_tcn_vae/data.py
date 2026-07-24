@@ -412,17 +412,25 @@ class WindowedTimeSeriesDataset(Dataset):
         heldout_mask = np.zeros_like(obs_mask)
         if self.fixed_mask is not None:
             heldout_mask = (self.fixed_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
-            input_mask = obs_mask * (1.0 - heldout_mask)
+            # A fixed selection mask is a permanent blind held-out set, not a
+            # per-epoch denoising drop: exclude it from obs_mask (not just
+            # input_mask) so the reconstruction loss -- computed over
+            # obs_mask in the training loop -- never supervises on these
+            # positions either. Otherwise the model gets direct gradient
+            # signal to reconstruct exactly the points later reported as
+            # held-out accuracy, inflating held-out metrics.
+            obs_mask = obs_mask * (1.0 - heldout_mask)
+            input_mask = obs_mask.copy()
         if self.dynamic_mask_config:
             dynamic_mask = sample_dynamic_heldout_mask(
                 obs_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
             ).astype(np.float32)
             heldout_mask = np.maximum(heldout_mask, dynamic_mask)
-            input_mask = obs_mask * (1.0 - heldout_mask)
+            input_mask = obs_mask * (1.0 - dynamic_mask)
         elif self.selection_mask is not None:
             selection_mask = (self.selection_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
             heldout_mask = np.maximum(heldout_mask, selection_mask)
-            input_mask = obs_mask * (1.0 - heldout_mask)
+            input_mask = obs_mask * (1.0 - selection_mask)
         if self.denoise_prob > 0:
             drop = (obs_mask == 1.0) & (self.rng.random(obs_mask.shape) < self.denoise_prob)
             input_mask[drop] = 0.0
