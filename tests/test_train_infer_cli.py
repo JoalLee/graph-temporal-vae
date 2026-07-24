@@ -117,16 +117,16 @@ def _load_heldout_eval_module():
     return module
 
 
-def test_macro_average_r2_mae_matches_research_repo_methodology():
-    # Matches ablation_heldout_eval.py exactly: per-feature R^2 (not pooled
-    # across features), negative clipped to 0 before averaging, a feature
-    # needs >= min_points held-out points to count at all. Pooling instead
-    # (what this script did before) is dominated by whichever feature has
-    # the largest magnitude/variance -- feature 0 below has huge values and
-    # a near-perfect fit, feature 1 has small values and a bad (negative)
-    # fit; pooled R^2 would be dragged near 1.0 by feature 0's huge SS_tot,
-    # but the reference-matching macro-average must land near 0.5
-    # (mean of ~1.0 and clip(negative, 0) = 0.0).
+def test_macro_average_metrics_matches_research_repo_methodology():
+    # Matches ablation_heldout_eval.py's compute_heldout_metrics exactly:
+    # per-feature R^2 (not pooled across features), negative clipped to 0
+    # before averaging, a feature needs >= min_points held-out points to
+    # count at all. Pooling instead (what this script did before) is
+    # dominated by whichever feature has the largest magnitude/variance --
+    # feature 0 below has huge values and a near-perfect fit, feature 1 has
+    # small values and a bad (negative) fit; pooled R^2 would be dragged
+    # near 1.0 by feature 0's huge SS_tot, but the reference-matching
+    # macro-average must land near 0.5 (mean of ~1.0 and clip(negative, 0) = 0.0).
     heldout_eval = _load_heldout_eval_module()
 
     n = 20
@@ -141,15 +141,50 @@ def test_macro_average_r2_mae_matches_research_repo_methodology():
     y_true[:, 1] = rng.uniform(0, 1, n)
     y_pred[:, 1] = rng.uniform(0, 1, n)  # unrelated to y_true -- ~R^2 <= 0
 
-    result = heldout_eval._macro_average_r2_mae(y_true, y_pred, mask, min_points=10)
+    result = heldout_eval._macro_average_metrics(y_true, y_pred, mask, min_points=10)
     assert result["n_features"] == 2
     assert 0.3 < result["r2"] < 0.7  # NOT near 1.0, which pooling would give
+    assert result["rmse"] > 0
+    assert result["smape"] >= 0
 
     # A feature below the min_points threshold must not count at all.
     sparse_mask = mask.copy()
     sparse_mask[5:, 1] = False  # only 5 held-out points for feature 1
-    result_sparse = heldout_eval._macro_average_r2_mae(y_true, y_pred, sparse_mask, min_points=10)
+    result_sparse = heldout_eval._macro_average_metrics(y_true, y_pred, sparse_mask, min_points=10)
     assert result_sparse["n_features"] == 1
+
+    # clip_r2=False (the "observed" comparison) must NOT clip a negative
+    # per-feature R^2 to 0, unlike the held-out default.
+    result_unclipped = heldout_eval._macro_average_metrics(y_true, y_pred, mask, min_points=10, clip_r2=False)
+    assert result_unclipped["r2"] < result["r2"]
+
+    # sigma/quantile columns enable CRPS/PICP; omitting them omits those keys.
+    sigma = np.ones((n, 2))
+    q_lo = y_true - 1.0
+    q_hi = y_true + 1.0
+    result_with_interval = heldout_eval._macro_average_metrics(
+        y_true, y_pred, mask, sigma_cols=sigma, q_lo_cols=q_lo, q_hi_cols=q_hi, min_points=10,
+    )
+    assert "crps" in result_with_interval and "picp" in result_with_interval
+    assert "crps" not in result and "picp" not in result
+
+
+def test_category_indices_covers_overall_chem_psd_and_ignores_unparseable_psd_names():
+    heldout_eval = _load_heldout_eval_module()
+    target_cols = ["SO2", "K", "PM2.5", "target_b", "12.19", "9999.0"]
+    cats = dict(heldout_eval.category_indices(target_cols, n_chem=3))
+    assert cats["overall"] == [0, 1, 2, 3, 4, 5]
+    assert cats["chem"] == [0, 1, 2]
+    assert cats["psd"] == [3, 4, 5]
+    assert cats["gases"] == [0]  # SO2
+    assert cats["metal"] == [1]  # K
+    assert cats["pm"] == [2]  # PM2.5
+    # "target_b" isn't a parseable diameter -- excluded from PSD sub-groups
+    # but still present in "psd" above.
+    assert cats["nucleation"] == [4]  # 12.19nm
+    assert cats["coarse_super2.5"] == [5]  # 9999nm
+    assert all(3 not in idx for name, idx in heldout_eval.category_indices(target_cols, n_chem=3)
+               if name not in ("overall", "psd"))
 
 
 def test_two_stream_aggregation_keeps_mean_stable_despite_noisy_outlier_samples():
@@ -269,11 +304,14 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
     results = json.loads(output_path.read_text())
-    for group in ("chem", "psd"):
+    for group in ("overall", "chem", "psd"):
         assert f"{group}_heldout_n" in results
         assert results[f"{group}_heldout_n"] > 0
         assert np.isfinite(results[f"{group}_heldout_mae"])
-        assert 0.0 <= results[f"{group}_heldout_picp95"] <= 1.0
+        assert np.isfinite(results[f"{group}_heldout_rmse"])
+        assert 0.0 <= results[f"{group}_heldout_picp"] <= 100.0
+        assert 0.0 <= results[f"{group}_heldout_r2"]  # clipped to >= 0
+        assert f"{group}_observed_r2" in results  # sanity-check reconstruction fidelity
 
     predictions = pd.read_csv(predictions_path)
     expected_cols = {

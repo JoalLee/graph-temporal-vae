@@ -24,6 +24,7 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import norm
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -44,6 +45,25 @@ from graph_tcn_vae.infer import (
 )
 from graph_tcn_vae.utils import is_interactive
 
+# Same category definitions as the research repo's ablation_heldout_eval.py
+# (CHEM_GROUPS / PSD_GROUPS), so per-category macro-averages are directly
+# comparable to a reference run's reported numbers, not just the overall
+# chem/psd split.
+CHEM_GROUPS = {
+    "gases": ["SO2", "NO", "NO2", "CO", "O3"],
+    "ions": ["Na+", "NH4+", "Cl-", "NO2-", "NO3-", "SO42-"],
+    "carbon": ["OC", "EC"],
+    "metal": ["K", "Ca", "Ti", "V", "Cr", "Al", "Si", "Mn", "Fe", "Ni", "Cu", "Zn", "As", "Se", "Br", "Ba", "Pb"],
+    "pm": ["PM2.5", "PM10"],
+}
+PSD_GROUPS = {
+    "nucleation": lambda d: d < 30,
+    "aitken": lambda d: 30 <= d < 100,
+    "accumulation": lambda d: 100 <= d < 1000,
+    "coarse_sub2.5": lambda d: 1000 <= d <= 2500,
+    "coarse_super2.5": lambda d: d > 2500,
+}
+
 
 def _r2_score(y_true, y_pred):
     ss_res = np.sum((y_true - y_pred) ** 2)
@@ -55,22 +75,54 @@ def _mae(y_true, y_pred):
     return float(np.mean(np.abs(y_true - y_pred)))
 
 
-def _macro_average_r2_mae(y_true_cols, y_pred_cols, mask_cols, min_points=10):
-    """Per-feature R^2/MAE, then average -- matches the research repo's
-    ablation_heldout_eval.py exactly (see the 'Macro-average: compute
-    per-feature then average' comment there): R^2 is computed separately
-    for each feature (not pooled across all features' held-out points at
-    once), negative per-feature R^2 is clipped to 0 before averaging, and a
-    feature contributes only if it has >= min_points held-out points.
-
-    A single pooled R^2 over all features combined (what this script did
-    before) is a DIFFERENT statistic: it's dominated by whichever features
-    have the largest magnitude/variance, so a model that fits a handful of
-    high-variance features very well can look far better pooled than
-    macro-averaged, even with mediocre or negative per-feature fit on most
-    other features.
+def category_indices(target_cols, n_chem):
+    """(name, column-index-list) pairs matching the research repo's
+    CHEM_GROUPS/PSD_GROUPS categorization: overall, chem, psd, then Chem
+    sub-groups by species and PSD sub-groups by particle diameter bin.
     """
-    r2_list, mae_list = [], []
+    chem_indices = list(range(n_chem))
+    psd_indices = list(range(n_chem, len(target_cols)))
+    cats = [("overall", list(range(len(target_cols)))), ("chem", chem_indices), ("psd", psd_indices)]
+    for name, cols in CHEM_GROUPS.items():
+        idx = [i for i in chem_indices if target_cols[i] in cols]
+        if idx:
+            cats.append((name, idx))
+    # PSD sub-groups need the column name to parse as a particle diameter
+    # (the 26e convention). A general dataset's non-chem columns may not be
+    # named that way at all -- they still count in the "psd" category above,
+    # just not in any diameter-based sub-group.
+    psd_diameters = {}
+    for i in psd_indices:
+        try:
+            psd_diameters[i] = float(target_cols[i])
+        except ValueError:
+            continue
+    for name, in_range in PSD_GROUPS.items():
+        idx = [i for i, d in psd_diameters.items() if in_range(d)]
+        if idx:
+            cats.append((name, idx))
+    return cats
+
+
+def _macro_average_metrics(y_true_cols, y_pred_cols, mask_cols, sigma_cols=None,
+                            q_lo_cols=None, q_hi_cols=None, min_points=10, clip_r2=True):
+    """Per-feature R^2/MAE/RMSE/SMAPE(/CRPS/PICP), then average across
+    features -- matches the research repo's ablation_heldout_eval.py
+    compute_heldout_metrics exactly (see its 'Macro-average: compute
+    per-feature then average' comment). Held-out R^2 is clipped to >= 0 per
+    feature before averaging there (clip_r2=True); the reference does NOT
+    clip the observed-point counterpart (clip_r2=False), which this
+    function also supports so both comparisons match exactly.
+
+    A single statistic pooled across every feature's points at once (what
+    this script did originally) is DIFFERENT: it's dominated by whichever
+    features have the largest magnitude/variance, so a model that fits a
+    handful of high-variance features very well can look far better pooled
+    than macro-averaged, even with mediocre or negative per-feature fit on
+    most other features. sigma_cols/q_lo_cols/q_hi_cols are optional so this
+    also serves the plain R^2/MAE-only use (e.g. the "observed" comparison).
+    """
+    r2_list, mae_list, rmse_list, smape_list, crps_list, picp_list = [], [], [], [], [], []
     for j in range(y_true_cols.shape[1]):
         col_mask = mask_cols[:, j]
         if col_mask.sum() < min_points:
@@ -78,16 +130,46 @@ def _macro_average_r2_mae(y_true_cols, y_pred_cols, mask_cols, min_points=10):
         y_true = y_true_cols[col_mask, j]
         y_pred = y_pred_cols[col_mask, j]
         valid = np.isfinite(y_true) & np.isfinite(y_pred)
+        if sigma_cols is not None:
+            valid &= np.isfinite(sigma_cols[col_mask, j])
+        if q_lo_cols is not None:
+            valid &= np.isfinite(q_lo_cols[col_mask, j]) & np.isfinite(q_hi_cols[col_mask, j])
         if valid.sum() < min_points:
             continue
-        y_true, y_pred = y_true[valid], y_pred[valid]
-        r2_list.append(max(0.0, _r2_score(y_true, y_pred)))
-        mae_list.append(_mae(y_true, y_pred))
-    return {
-        "r2": float(np.mean(r2_list)) if r2_list else float("nan"),
-        "mae": float(np.mean(mae_list)) if mae_list else float("nan"),
-        "n_features": len(r2_list),
-    }
+        y_true_v, y_pred_v = y_true[valid], y_pred[valid]
+
+        r2 = _r2_score(y_true_v, y_pred_v)
+        r2_list.append(max(0.0, r2) if clip_r2 else r2)
+        mae_list.append(_mae(y_true_v, y_pred_v))
+        rmse_list.append(float(np.sqrt(np.mean((y_true_v - y_pred_v) ** 2))))
+
+        denom = np.abs(y_true_v) + np.abs(y_pred_v)
+        smape = np.zeros_like(y_true_v)
+        smape_valid = denom > 1e-8
+        smape[smape_valid] = 2 * np.abs(y_true_v[smape_valid] - y_pred_v[smape_valid]) / denom[smape_valid]
+        smape_list.append(float(np.mean(smape)) * 100.0)
+
+        if sigma_cols is not None:
+            sigma_v = np.maximum(sigma_cols[col_mask, j][valid], 1e-6)
+            z = (y_true_v - y_pred_v) / sigma_v
+            crps = sigma_v * (z * (2 * norm.cdf(z) - 1) + 2 * norm.pdf(z) - 1 / np.sqrt(np.pi))
+            crps_list.append(float(np.mean(crps)))
+        if q_lo_cols is not None:
+            q_lo_v = q_lo_cols[col_mask, j][valid]
+            q_hi_v = q_hi_cols[col_mask, j][valid]
+            picp_list.append(float(np.mean((y_true_v >= q_lo_v) & (y_true_v <= q_hi_v))))
+
+    out = {"n_features": len(r2_list)}
+    if r2_list:
+        out["r2"] = float(np.mean(r2_list))
+        out["mae"] = float(np.mean(mae_list))
+        out["rmse"] = float(np.mean(rmse_list))
+        out["smape"] = float(np.mean(smape_list))
+    if crps_list:
+        out["crps"] = float(np.mean(crps_list))
+    if picp_list:
+        out["picp"] = float(np.mean(picp_list)) * 100.0
+    return out
 
 
 def main():
@@ -212,49 +294,60 @@ def main():
     mean_agg = aggregate_window_samples(
         mean_chunks, total_length=n, position_weights=position_weights, quantiles=()
     )
+    # 0.05/0.95 (90% interval) matches the research repo's compute_heldout_metrics
+    # PICP definition exactly; 0.025/0.975 (95% interval) is kept for
+    # --predictions-csv, which is a separate, wider diagnostic interval.
     dist_agg = aggregate_window_samples(
-        sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.025, 0.975)
+        sample_chunks, total_length=n, position_weights=position_weights, quantiles=(0.025, 0.05, 0.95, 0.975)
     )
     mean_out, std_out, quantiles_out = summary_to_output_scale(
         mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], target_output_transform
     )
-    q025 = quantiles_out[0.025]
-    q975 = quantiles_out[0.975]
+    q025, q05, q95, q975 = quantiles_out[0.025], quantiles_out[0.05], quantiles_out[0.95], quantiles_out[0.975]
 
     observed_output = inverse_target_values(target_raw, target_output_transform)
 
     n_chem = args.n_chem
     results = {}
-    for group_name, cols_slice in (("chem", slice(0, n_chem)), ("psd", slice(n_chem, None))):
-        mask_g = heldout_mask[:, cols_slice]
-        y_true_g = observed_output[:, cols_slice]
-        y_pred_g = mean_out[:, cols_slice]
+    for cat_name, cols in category_indices(target_cols, n_chem):
+        y_true_g = observed_output[:, cols]
+        y_pred_g = mean_out[:, cols]
+        sigma_g = std_out[:, cols]
+        q05_g, q95_g = q05[:, cols], q95[:, cols]
 
-        # Primary metric: per-feature R^2/MAE, negative clipped to 0, then
-        # averaged across features -- matches the research repo's
-        # ablation_heldout_eval.py exactly. This is what "chem_heldout_r2"
-        # in the reference's own reported numbers means.
-        macro = _macro_average_r2_mae(y_true_g, y_pred_g, mask_g)
-        results[f"{group_name}_heldout_r2"] = macro["r2"]
-        results[f"{group_name}_heldout_mae"] = macro["mae"]
-        results[f"{group_name}_heldout_n_features"] = macro["n_features"]
+        # Primary metric: per-feature R^2/MAE/RMSE/SMAPE/CRPS/PICP, negative
+        # R^2 clipped to 0, then averaged across the features in this
+        # category -- matches the research repo's ablation_heldout_eval.py
+        # compute_heldout_metrics exactly. This is what a reference run's
+        # own reported "chem_r2"/"psd_r2" means.
+        held_mask_g = heldout_mask[:, cols]
+        held = _macro_average_metrics(
+            y_true_g, y_pred_g, held_mask_g, sigma_cols=sigma_g, q_lo_cols=q05_g, q_hi_cols=q95_g,
+        )
+        for key, value in held.items():
+            results[f"{cat_name}_heldout_{key}"] = value
+
+        # Observed-point counterpart (points the model saw as input): a
+        # reconstruction-fidelity sanity check, expected close to 1.0.
+        # The reference does NOT clip this R^2 to 0 (only the held-out one).
+        obs_mask_g = (obs_mask_full[:, cols] & ~heldout_mask[:, cols])
+        obs = _macro_average_metrics(
+            y_true_g, y_pred_g, obs_mask_g, sigma_cols=sigma_g, q_lo_cols=q05_g, q_hi_cols=q95_g, clip_r2=False,
+        )
+        for key, value in obs.items():
+            results[f"{cat_name}_observed_{key}"] = value
 
         # Secondary/diagnostic: pool every feature's held-out points into one
-        # R^2/MAE. This is a DIFFERENT statistic (dominated by whichever
-        # features have the largest magnitude/variance) -- kept only so a
-        # large gap between _pooled and the macro-averaged number above is
-        # visible, not silently lost.
-        y_true = y_true_g[mask_g]
-        y_pred = y_pred_g[mask_g]
-        q025_g = q025[:, cols_slice][mask_g]
-        q975_g = q975[:, cols_slice][mask_g]
-        valid = np.isfinite(y_true) & np.isfinite(y_pred)
-        y_true, y_pred, q025_g, q975_g = y_true[valid], y_pred[valid], q025_g[valid], q975_g[valid]
-        picp = float(np.mean((y_true >= q025_g) & (y_true <= q975_g)))
-        results[f"{group_name}_heldout_r2_pooled"] = _r2_score(y_true, y_pred)
-        results[f"{group_name}_heldout_mae_pooled"] = _mae(y_true, y_pred)
-        results[f"{group_name}_heldout_picp95"] = picp
-        results[f"{group_name}_heldout_n"] = int(len(y_true))
+        # R^2/MAE instead of averaging per-feature. This is a DIFFERENT
+        # statistic (dominated by whichever features have the largest
+        # magnitude/variance) -- kept only so a large gap against the
+        # macro-averaged number above is visible, not silently lost.
+        y_true_p = y_true_g[held_mask_g]
+        y_pred_p = y_pred_g[held_mask_g]
+        valid_p = np.isfinite(y_true_p) & np.isfinite(y_pred_p)
+        results[f"{cat_name}_heldout_r2_pooled"] = _r2_score(y_true_p[valid_p], y_pred_p[valid_p])
+        results[f"{cat_name}_heldout_mae_pooled"] = _mae(y_true_p[valid_p], y_pred_p[valid_p])
+        results[f"{cat_name}_heldout_n"] = int(valid_p.sum())
 
     print(json.dumps(results, indent=2))
     if args.output:
