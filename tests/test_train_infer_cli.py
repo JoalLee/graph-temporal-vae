@@ -9,24 +9,24 @@ import pandas as pd
 import pytest
 import torch
 
-from graph_tcn_vae.api import fit_multimodal, impute_multimodal
-from graph_tcn_vae.bundle import inspect_bundle
-from graph_tcn_vae.cli import main as cli_main
-from graph_tcn_vae.config import TrainConfig
-from graph_tcn_vae.contracts import InferenceConfig
-from graph_tcn_vae.data import (
+from graph_temporal_vae.api import fit_multimodal, impute_multimodal
+from graph_temporal_vae.bundle import inspect_bundle
+from graph_temporal_vae.cli import main as cli_main
+from graph_temporal_vae.config import TrainConfig
+from graph_temporal_vae.contracts import InferenceConfig
+from graph_temporal_vae.data import (
     WindowedTimeSeriesDataset,
     sample_anchor_constrained_heldout_mask,
     sample_dynamic_heldout_mask,
 )
-from graph_tcn_vae.infer import (
+from graph_temporal_vae.infer import (
     aggregate_window_samples,
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
 )
-from graph_tcn_vae.model_graph_uq import ImputationVAE_Graph
-from graph_tcn_vae.train import (
+from graph_temporal_vae.model_graph_uq import ImputationVAE_Graph
+from graph_temporal_vae.train import (
     Trainer,
     _student_t_nll,
     empirical_crps_components,
@@ -34,7 +34,7 @@ from graph_tcn_vae.train import (
     train_from_config,
     vae_loss,
 )
-from graph_tcn_vae.window_aggregation import (
+from graph_temporal_vae.window_aggregation import (
     StreamingWindowAggregator,
     weighted_empirical_crps,
 )

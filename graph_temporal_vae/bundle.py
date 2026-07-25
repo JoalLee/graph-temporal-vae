@@ -12,7 +12,7 @@ def inspect_bundle(bundle):
 
     Passing a path performs the complete load path, including schema checks,
     strict state-dict loading, and model construction. A previously loaded
-    bundle returned by :func:`graph_tcn_vae.load_bundle` is also accepted.
+    bundle returned by :func:`graph_temporal_vae.load_bundle` is also accepted.
     """
     if isinstance(bundle, (str, Path)):
         loaded = load_bundle(bundle, device=torch.device("cpu"))

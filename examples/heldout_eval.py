@@ -1,4 +1,4 @@
-"""Held-out evaluation for a graph-tcn-vae checkpoint bundle.
+"""Held-out evaluation for a graph-temporal-vae checkpoint bundle.
 
 Reconstructs the SAME fixed anchor-constrained held-out mask used during
 training (identical seed/ratio/n_chem -> identical mask, see
@@ -29,26 +29,26 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from graph_tcn_vae.contracts import ModalityFiles
-from graph_tcn_vae.data import (
+from graph_temporal_vae.contracts import ModalityFiles
+from graph_temporal_vae.data import (
     compute_window_starts,
     load_frame,
     load_modality_frame,
     make_condition,
     sample_anchor_constrained_heldout_mask,
 )
-from graph_tcn_vae.infer import (
+from graph_temporal_vae.infer import (
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
 )
-from graph_tcn_vae.preprocessing import (
+from graph_temporal_vae.preprocessing import (
     observed_targets_to_output,
     transform_auxiliary,
     transform_targets,
 )
-from graph_tcn_vae.utils import is_interactive
-from graph_tcn_vae.window_aggregation import StreamingWindowAggregator
+from graph_temporal_vae.utils import is_interactive
+from graph_temporal_vae.window_aggregation import StreamingWindowAggregator
 
 # Same category definitions as the research repo's ablation_heldout_eval.py
 # (CHEM_GROUPS / PSD_GROUPS), so per-category macro-averages are directly

@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class ModelConfig:
-    """Optional Graph-TCN-VAE architecture and ablation settings."""
+    """Optional Graph-enhanced Temporal-VAE architecture and ablation settings."""
 
     latent_dim: int = 256
     hidden_dims: List[int] = field(default_factory=lambda: [512, 512, 512])

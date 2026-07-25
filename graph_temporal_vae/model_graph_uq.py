@@ -1,4 +1,4 @@
-"""Backward-compatible imports for the Graph-TCN-VAE architecture.
+"""Backward-compatible imports for the Graph-enhanced Temporal-VAE architecture.
 
 The implementation is split across ``flows``, ``graph_blocks``,
 ``graph_layers``, ``graph_model``, and ``vanilla_vae``. Existing code may

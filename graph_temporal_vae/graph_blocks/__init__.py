@@ -1,4 +1,4 @@
-"""Reusable temporal and attention blocks for Graph-TCN-VAE models."""
+"""Reusable temporal and attention blocks for Graph-enhanced Temporal-VAE models."""
 
 from .attention import (
     AxialObservedAttentionBlock,

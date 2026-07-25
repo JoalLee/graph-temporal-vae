@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from graph_tcn_vae.graph_blocks.attention import RotarySelfAttention
+from graph_temporal_vae.graph_blocks.attention import RotarySelfAttention
 
 
 class TemporalObservationRefiner(nn.Module):

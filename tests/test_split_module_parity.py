@@ -1,12 +1,12 @@
-"""Compatibility contracts for the split Graph-TCN-VAE implementation."""
+"""Compatibility contracts for the split Graph-enhanced Temporal-VAE implementation."""
 
 import inspect
 
 import torch
 
-from graph_tcn_vae import model_graph_uq as facade
-from graph_tcn_vae.flows import AffineCouplingLayer, RealNVP, ReverseLayer
-from graph_tcn_vae.graph_blocks import (
+from graph_temporal_vae import model_graph_uq as facade
+from graph_temporal_vae.flows import AffineCouplingLayer, RealNVP, ReverseLayer
+from graph_temporal_vae.graph_blocks import (
     AxialObservedAttentionBlock,
     DepthwiseTCN,
     LocalContextMemoryAttention,
@@ -18,7 +18,7 @@ from graph_tcn_vae.graph_blocks import (
     TimeHybridEncoder,
     WindowTokenFFN,
 )
-from graph_tcn_vae.graph_layers import (
+from graph_temporal_vae.graph_layers import (
     CrossModalGraphLayer,
     ExternalHistoryContext,
     InputGraphLayer,
@@ -27,13 +27,13 @@ from graph_tcn_vae.graph_layers import (
     TokenGraphFFN,
     TokenGraphSelfBlock,
 )
-from graph_tcn_vae.graph_model import (
+from graph_temporal_vae.graph_model import (
     GraphDecoder,
     GraphEncoder,
     ImputationVAE_Graph,
 )
-from graph_tcn_vae.model_config import ModelConfig
-from graph_tcn_vae.vanilla_vae import VanillaVAE
+from graph_temporal_vae.model_config import ModelConfig
+from graph_temporal_vae.vanilla_vae import VanillaVAE
 
 
 def test_model_graph_uq_facade_reexports_split_symbols():
@@ -144,10 +144,10 @@ def test_split_model_strict_state_round_trip_and_deterministic_forward():
 
 def test_runtime_model_uses_split_module_paths():
     model = facade.ImputationVAE_Graph(**_small_26e_style_kwargs())
-    assert type(model).__module__ == "graph_tcn_vae.graph_model.vae"
-    assert type(model.encoder).__module__ == "graph_tcn_vae.graph_model.encoder"
-    assert type(model.decoder).__module__ == "graph_tcn_vae.graph_model.decoder"
-    assert type(model.flow).__module__ == "graph_tcn_vae.flows"
+    assert type(model).__module__ == "graph_temporal_vae.graph_model.vae"
+    assert type(model.encoder).__module__ == "graph_temporal_vae.graph_model.encoder"
+    assert type(model.decoder).__module__ == "graph_temporal_vae.graph_model.decoder"
+    assert type(model.flow).__module__ == "graph_temporal_vae.flows"
 
 
 def test_model_config_matches_legacy_constructor_defaults():

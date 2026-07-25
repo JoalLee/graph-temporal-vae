@@ -5,7 +5,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from graph_tcn_vae import ImputationVAE_Graph
+from graph_temporal_vae import ImputationVAE_Graph
 
 
 def main():

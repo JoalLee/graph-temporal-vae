@@ -838,7 +838,7 @@ def train_from_config(
     device = setup_device()
     n_params = sum(p.numel() for p in model.parameters())
     print(
-        f"[graph-tcn-vae] {len(frame)} rows -> {len(train_dataset)} train / "
+        f"[graph-temporal-vae] {len(frame)} rows -> {len(train_dataset)} train / "
         f"{len(val_dataset) if val_loader is not None else 0} val windows "
         f"({len(train_loader)} batches/epoch), {data_schema.target_dim} targets "
         f"({n_chem} chem + {len(data_schema.psd_cols)} psd), {data_schema.aux_dim} met cols, "

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from graph_tcn_vae.graph_layers.token_graph import TokenGraphSelfBlock
+from graph_temporal_vae.graph_layers.token_graph import TokenGraphSelfBlock
 
 
 class LocalChunkGraphBranch(nn.Module):

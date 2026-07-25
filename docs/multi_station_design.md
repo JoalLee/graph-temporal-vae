@@ -2,7 +2,7 @@
 
 > Branch: `feature/multi-station-graph`
 > Status: design draft（尚未實作）
-> 目標：在現有單站 Graph-TCN-VAE 上，引入多個一般測站（單模態）資料，以提升 super-station 的 Chem/PSD 缺值填補（後續可延伸至預測）。
+> 目標：在現有單站 Graph-enhanced Temporal-VAE 上，引入多個一般測站（單模態）資料，以提升 super-station 的 Chem/PSD 缺值填補（後續可延伸至預測）。
 
 ---
 
@@ -128,7 +128,7 @@ def forward(self, x, cond, mask, history=None, stations=None, sample_latent=True
 
 ## 8. 模組與檔案規劃
 
-- 新增 `graph_tcn_vae/station_graph.py`：`StationGraphEncoder`、`StationFactor`（Eigenmaps）、`SpeciesFactor`、axial attention block。
+- 新增 `graph_temporal_vae/station_graph.py`：`StationGraphEncoder`、`StationFactor`（Eigenmaps）、`SpeciesFactor`、axial attention block。
 - `model_graph_uq.py`：`ImputationVAE_Graph.__init__` 增 `use_station_graph` 等旗標；`forward` 增 `stations` 參數與注入縫（§4.3）。
 - `dataset.py` / `masking_utils.py`：多站張量打包與 station-level block masking。
 - `tests/`：`stations=None` 等價性測試（必須 bit-for-bit 等於現行 forward）、shape 測試、缺站 mask 行為測試。

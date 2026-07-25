@@ -1,4 +1,4 @@
-"""Top-level Graph-TCN-VAE model and compatibility helpers."""
+"""Top-level Graph-enhanced Temporal-VAE model and compatibility helpers."""
 
 from contextlib import nullcontext
 

@@ -1,4 +1,4 @@
-"""Core Graph-TCN-VAE encoder, decoder, and model modules."""
+"""Core Graph-enhanced Temporal-VAE encoder, decoder, and model modules."""
 
 from .decoder import GraphDecoder
 from .encoder import GraphEncoder

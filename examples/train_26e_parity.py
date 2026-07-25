@@ -18,8 +18,8 @@ import pandas as pd
 # ``python examples/train_26e_parity.py``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from graph_tcn_vae.config import TrainConfig
-from graph_tcn_vae.train import train_from_config
+from graph_temporal_vae.config import TrainConfig
+from graph_temporal_vae.train import train_from_config
 from prepare_26e_input import AUX_COLS, CHEM_COLS, TIME_COLS
 
 

@@ -14,7 +14,7 @@ This project is motivated by the need for imputation models that can recover cou
 
 ## Purpose
 
-The main purpose of this package is to make the Graph-TCN-VAE model architecture reusable outside the original research workspace. The architecture combines:
+The main purpose of this package is to make the Graph-enhanced Temporal-VAE model architecture reusable outside the original research workspace. The architecture combines:
 
 - feature-space graph learning, where chemical species and PSD size bins are represented as feature nodes rather than monitoring stations;
 - temporal encoding with dilated temporal convolutional blocks, which captures local, diurnal, and multi-day structure inside each moving window;
@@ -51,7 +51,7 @@ pip install -e ".[dev]"
 
 ```python
 import torch
-from graph_tcn_vae import ImputationVAE_Graph
+from graph_temporal_vae import ImputationVAE_Graph
 
 batch_size = 2
 window_size = 48
@@ -116,7 +116,7 @@ For imputation models:
 
 ## Training and Inference
 
-The `graph-tcn-vae` command trains `ImputationVAE_Graph` and saves a self-contained checkpoint **bundle** containing weights, the resolved data schema, preprocessing choices, fitted affine statistics, architecture versions, and model settings. Inference reuses this contract and never re-fits preprocessing.
+The `graph-temporal-vae` command trains `ImputationVAE_Graph` and saves a self-contained checkpoint **bundle** containing weights, the resolved data schema, preprocessing choices, fitted affine statistics, architecture versions, and model settings. Inference reuses this contract and never re-fits preprocessing.
 
 ### Multimodal data contract
 
@@ -131,14 +131,14 @@ The preferred interface supplies each measurement modality separately:
 At least one of Chem or PSD is required. Files are outer-joined on timestamp, Chem targets are placed before PSD targets, and `n_chem` is inferred automatically. The exact discovered columns and ordering are stored in `DataSchema` and enforced on future inference data.
 
 ```bash
-graph-tcn-vae validate-data \
+graph-temporal-vae validate-data \
   --chem-csv data/chemistry.csv \
   --psd-csv data/psd.csv \
   --met-csv data/meteorology.csv \
   --timestamp-col time \
   --expected-frequency 1h
 
-graph-tcn-vae train \
+graph-temporal-vae train \
   --chem-csv data/chemistry.csv \
   --psd-csv data/psd.csv \
   --met-csv data/meteorology.csv \
@@ -149,7 +149,7 @@ graph-tcn-vae train \
   --epochs 200 \
   -o checkpoints/run1.pt
 
-graph-tcn-vae impute \
+graph-temporal-vae impute \
   --bundle checkpoints/run1.pt \
   --chem-csv data/new_chemistry.csv \
   --psd-csv data/new_psd.csv \
@@ -157,9 +157,9 @@ graph-tcn-vae impute \
   --inference-config examples/inference_config.example.json \
   -o imputed.csv
 
-graph-tcn-vae inspect-bundle --bundle checkpoints/run1.pt
+graph-temporal-vae inspect-bundle --bundle checkpoints/run1.pt
 
-graph-tcn-vae validate-data \
+graph-temporal-vae validate-data \
   --bundle checkpoints/run1.pt \
   --chem-csv data/new_chemistry.csv \
   --psd-csv data/new_psd.csv \
@@ -175,7 +175,7 @@ Each modality independently selects an input transform (`none` or `log1p`) and a
 `--chem-output-transform` and `--psd-output-transform` define how de-standardized model values are mapped to the public output scale. They normally match their input transform. The separate setting is needed when a CSV already contains log1p values:
 
 ```bash
-graph-tcn-vae train \
+graph-temporal-vae train \
   --csv experiment_input_log1p.csv \
   --timestamp-col time \
   --target-cols species_a,species_b \
@@ -217,13 +217,13 @@ input is an already log1p-transformed artifact, pass
 `--target-transform none`; the preparation helper above writes raw targets and
 therefore uses the runner default `--target-transform log1p`.
 
-Any validated `ModelConfig` field (see `graph_tcn_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`.
+Any validated `ModelConfig` field (see `graph_temporal_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`.
 
 The preferred Python interface accepts paths, pandas DataFrames, or mixtures of both:
 
 ```python
 import pandas as pd
-from graph_tcn_vae import (
+from graph_temporal_vae import (
     InferenceConfig,
     ModalityPreprocessing,
     PreprocessingConfig,

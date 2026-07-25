@@ -527,7 +527,7 @@ def impute(
 
     n_batches = math.ceil(len(starts) / inference_batch_size)
     print(
-        f"[graph-tcn-vae] {n} rows -> {len(starts)} windows ({n_batches} batches), "
+        f"[graph-temporal-vae] {n} rows -> {len(starts)} windows ({n_batches} batches), "
         f"{len(target_cols)} targets, {n_mc_samples} MC samples, stride={stride}, device={device}"
     )
 

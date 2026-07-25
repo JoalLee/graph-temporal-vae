@@ -1,4 +1,4 @@
-"""`graph-tcn-vae train` / `graph-tcn-vae impute` command-line entry point."""
+"""`graph-temporal-vae train` / `graph-temporal-vae impute` command-line entry point."""
 import argparse
 import json
 
@@ -22,7 +22,7 @@ def _csv_list(value):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="graph-tcn-vae", description="Train / impute with Graph-TCN-VAE models.")
+    parser = argparse.ArgumentParser(prog="graph-temporal-vae", description="Train / impute with Graph-enhanced Temporal-VAE models.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     train_p = sub.add_parser("train", help="Train a model and save a checkpoint bundle.")

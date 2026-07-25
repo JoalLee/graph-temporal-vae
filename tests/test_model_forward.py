@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from graph_tcn_vae import ImputationVAE, ImputationVAE_Graph, ImputationVAE_UQ
-from graph_tcn_vae.model_graph_uq import CrossModalGraphLayer
+from graph_temporal_vae import ImputationVAE, ImputationVAE_Graph, ImputationVAE_UQ
+from graph_temporal_vae.model_graph_uq import CrossModalGraphLayer
 
 
 def _inputs(batch_size=2, window_size=24, target_dim=6, aux_dim=3):

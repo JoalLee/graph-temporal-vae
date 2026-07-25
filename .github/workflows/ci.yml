@@ -28,6 +28,6 @@ jobs:
       - name: Verify wheel import
         if: matrix.python-version == '3.12'
         run: |
-          python -m venv /tmp/graph-tcn-vae-wheel
-          /tmp/graph-tcn-vae-wheel/bin/pip install dist/*.whl
-          /tmp/graph-tcn-vae-wheel/bin/python -c "from graph_tcn_vae import DataSchema, ImputationVAE_Graph, PreprocessingConfig"
+          python -m venv /tmp/graph-temporal-vae-wheel
+          /tmp/graph-temporal-vae-wheel/bin/pip install dist/*.whl
+          /tmp/graph-temporal-vae-wheel/bin/python -c "from graph_temporal_vae import DataSchema, ImputationVAE_Graph, PreprocessingConfig"

@@ -1,4 +1,4 @@
-"""Graph-enhanced TCN-VAE model architectures."""
+"""Graph-enhanced Temporal-VAE model architectures."""
 
 from .api import fit_multimodal, impute_multimodal, validate_multimodal_data
 from .bundle import inspect_bundle

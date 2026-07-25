@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "graph-tcn-vae"
+name = "graph-temporal-vae"
 version = "0.1.0"
-description = "Graph-enhanced TCN-VAE architectures for time-series imputation."
+description = "Graph-enhanced Temporal-VAE architectures for time-series imputation."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -31,13 +31,14 @@ dependencies = [
 dev = [
     "pytest>=8",
     "scipy>=1.10",
+    "matplotlib>=3.7",
 ]
 
 [project.scripts]
-graph-tcn-vae = "graph_tcn_vae.cli:main"
+graph-temporal-vae = "graph_temporal_vae.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["graph_tcn_vae*"]
+include = ["graph_temporal_vae*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

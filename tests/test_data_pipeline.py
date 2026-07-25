@@ -2,14 +2,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from graph_tcn_vae.contracts import (
+from graph_temporal_vae.contracts import (
     DataSchema,
     ModalityFiles,
     ModalityInputs,
     ModalityPreprocessing,
     PreprocessingConfig,
 )
-from graph_tcn_vae.data import (
+from graph_temporal_vae.data import (
     NaNAwareStandardScaler,
     WindowedTimeSeriesDataset,
     chronological_split_index,
@@ -19,7 +19,7 @@ from graph_tcn_vae.data import (
     load_modality_frame,
     transform_target_values,
 )
-from graph_tcn_vae.preprocessing import (
+from graph_temporal_vae.preprocessing import (
     NaNAwareAffineScaler,
     fit_target_scaler,
     observed_targets_to_output,

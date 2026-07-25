@@ -1,4 +1,4 @@
-"""Normalizing-flow layers used by Graph-TCN-VAE variants."""
+"""Normalizing-flow layers used by Graph-enhanced Temporal-VAE variants."""
 
 import torch
 import torch.nn as nn

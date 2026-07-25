@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from graph_tcn_vae.graph_blocks.tcn import WindowTokenFFN
+from graph_temporal_vae.graph_blocks.tcn import WindowTokenFFN
 
 
 class CrossModalGraphLayer(nn.Module):
