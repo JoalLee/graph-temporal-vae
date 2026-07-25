@@ -49,6 +49,8 @@ from experiments.diagnose_latent_bottleneck import (  # noqa: E402
 @dataclass(frozen=True)
 class TeacherDatasetSummary:
     split: str
+    unique_windows: int
+    masks_per_window: int
     requested_windows: int
     accepted_windows: int
     skipped_without_psd_mask: int
@@ -280,6 +282,7 @@ def _prepare_teacher_split(
     teacher_steps: int,
     teacher_lr: float,
     teacher_regularization: float,
+    masks_per_window: int,
     seed: int,
 ) -> tuple[dict[str, Any], TeacherDatasetSummary]:
     model = source["model"]
@@ -290,6 +293,13 @@ def _prepare_teacher_split(
     starts = source["starts"]
     window_size = source["window_size"]
     n_chem = source["n_chem"]
+
+    if masks_per_window < 1:
+        raise ValueError("masks_per_window must be >= 1")
+    unique_window_count = int(len(window_indices))
+    window_indices = np.repeat(window_indices, masks_per_window)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(window_indices)
 
     condition_rows: list[torch.Tensor] = []
     delta_rows: list[torch.Tensor] = []
@@ -415,6 +425,8 @@ def _prepare_teacher_split(
     }
     summary = TeacherDatasetSummary(
         split=split,
+        unique_windows=unique_window_count,
+        masks_per_window=int(masks_per_window),
         requested_windows=int(len(window_indices)),
         accepted_windows=int(len(conditions)),
         skipped_without_psd_mask=int(skipped),
@@ -649,6 +661,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         teacher_steps=args.teacher_steps,
         teacher_lr=args.teacher_lr,
         teacher_regularization=args.teacher_regularization,
+        masks_per_window=args.train_masks_per_window,
         seed=args.seed,
     )
     validation_payload, validation_summary = _prepare_teacher_split(
@@ -662,6 +675,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         teacher_steps=args.teacher_steps,
         teacher_lr=args.teacher_lr,
         teacher_regularization=args.teacher_regularization,
+        masks_per_window=args.validation_masks_per_window,
         seed=args.seed + 1000,
     )
     torch.save(train_payload, output_dir / "teacher_train.pt")
@@ -733,6 +747,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-windows", type=int, default=None)
     parser.add_argument("--max-validation-windows", type=int, default=None)
     parser.add_argument("--teacher-batch-size", type=int, default=4)
+    parser.add_argument("--train-masks-per-window", type=int, default=4)
+    parser.add_argument("--validation-masks-per-window", type=int, default=2)
     parser.add_argument("--mask-attempts", type=int, default=8)
     parser.add_argument("--teacher-steps", type=int, default=20)
     parser.add_argument("--teacher-lr", type=float, default=0.03)

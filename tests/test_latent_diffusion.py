@@ -39,6 +39,40 @@ def test_diffusion_loss_is_finite_and_backpropagates():
     )
 
 
+def test_diffusion_can_fit_a_fixed_denoising_batch():
+    torch.manual_seed(13)
+    model = ConditionalLatentResidualDiffusion(
+        latent_dim=4,
+        condition_dim=6,
+        config=LatentResidualDiffusionConfig(
+            timesteps=6,
+            hidden_dim=32,
+            time_embedding_dim=12,
+            num_layers=2,
+            dropout=0.0,
+        ),
+    )
+    delta = torch.randn(12, 4)
+    condition = torch.randn(12, 6)
+    timesteps = torch.arange(12) % 6
+    noise = torch.randn_like(delta)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+
+    initial = float(
+        model.loss(delta, condition, timesteps=timesteps, noise=noise).detach()
+    )
+    for _ in range(80):
+        optimizer.zero_grad(set_to_none=True)
+        loss = model.loss(delta, condition, timesteps=timesteps, noise=noise)
+        loss.backward()
+        optimizer.step()
+    final = float(
+        model.loss(delta, condition, timesteps=timesteps, noise=noise).detach()
+    )
+
+    assert final < initial * 0.1
+
+
 def test_diffusion_sampling_is_reproducible_with_generator():
     config = LatentResidualDiffusionConfig(
         timesteps=8,
