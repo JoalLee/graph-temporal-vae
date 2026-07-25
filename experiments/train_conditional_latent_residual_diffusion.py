@@ -242,16 +242,30 @@ def _sample_mask_with_psd_target(
     generator: torch.Generator,
     attempts: int,
 ) -> torch.Tensor | None:
+    """Resample rows independently until each has a PSD teacher target."""
+
+    artificial = torch.zeros_like(natural_observed, dtype=torch.bool)
+    pending = torch.ones(
+        natural_observed.shape[0],
+        dtype=torch.bool,
+        device=natural_observed.device,
+    )
     for _ in range(attempts):
-        artificial = sample_heldout_like_mask(
-            natural_observed,
+        if not bool(pending.any()):
+            break
+        pending_indices = torch.nonzero(pending, as_tuple=False).flatten()
+        candidate = sample_heldout_like_mask(
+            natural_observed[pending_indices],
             n_chem=n_chem,
             config=config,
             generator=generator,
         )
-        if artificial[:, :, n_chem:].any():
-            return artificial
-    return None
+        accepted = candidate[:, :, n_chem:].any(dim=(1, 2))
+        if bool(accepted.any()):
+            accepted_indices = pending_indices[accepted]
+            artificial[accepted_indices] = candidate[accepted]
+            pending[accepted_indices] = False
+    return artificial if bool((~pending).any()) else None
 
 
 def _prepare_teacher_split(
