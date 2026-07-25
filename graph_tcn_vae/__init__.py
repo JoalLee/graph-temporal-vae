@@ -12,6 +12,15 @@ from .contracts import (
     PreprocessingConfig,
 )
 from .infer import impute, load_bundle
+from .latent_diffusion import (
+    ConditionalLatentResidualDiffusion,
+    HeldoutLikeMaskConfig,
+    LatentResidualDiffusionConfig,
+    LatentTeacherResult,
+    build_latent_condition,
+    optimize_latent_target,
+    sample_heldout_like_mask,
+)
 from .model import ImputationVAE
 from .model_config import ModelConfig
 from .model_graph_pred import PredictionVAE_Graph
@@ -26,16 +35,23 @@ __all__ = [
     "ModalityInputs",
     "ModalityPreprocessing",
     "PreprocessingConfig",
+    "ConditionalLatentResidualDiffusion",
+    "HeldoutLikeMaskConfig",
+    "LatentResidualDiffusionConfig",
+    "LatentTeacherResult",
     "ImputationVAE",
     "ImputationVAE_UQ",
     "ImputationVAE_Graph",
     "ModelConfig",
     "PredictionVAE_Graph",
     "TrainConfig",
+    "build_latent_condition",
     "fit_multimodal",
     "impute_multimodal",
     "validate_multimodal_data",
     "inspect_bundle",
+    "optimize_latent_target",
+    "sample_heldout_like_mask",
     "train_from_config",
     "load_bundle",
     "impute",
