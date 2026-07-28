@@ -9,6 +9,7 @@ package. The bundle it saves carries everything `infer.impute` needs
 stats), so there is no separate config file to keep in sync by hand.
 """
 import copy
+import csv
 import os
 from contextlib import nullcontext
 
@@ -19,6 +20,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, get_worker_info
 from tqdm import tqdm
 
+from .censoring import (
+    STATE_CENSORED,
+    STATE_MISSING,
+    CensoringConfig,
+    apply_input_fill,
+    build_state_matrix,
+    censoring_report,
+    high_censoring_columns,
+    model_space_thresholds,
+)
 from .config import TrainConfig
 from .contracts import DataSchema
 from .data import (
@@ -102,6 +113,209 @@ def _pointwise_reconstruction_nll(
     )
 
 
+_LOG_NDTR_TAIL_CUTOFF = -5.0
+
+
+def _clamp_signed_denominator(values, floor):
+    """Keep continued-fraction denominators away from zero without NaNs."""
+    return torch.where(
+        values.abs() < floor,
+        torch.where(values < 0, values.new_tensor(-floor), values.new_tensor(floor)),
+        values,
+    )
+
+
+def _beta_continued_fraction(a, b, x, max_iter=100):
+    """Evaluate the regularized incomplete-beta continued fraction."""
+    tiny = torch.finfo(x.dtype).tiny
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    d = _clamp_signed_denominator(1.0 - qab * x / qap, tiny)
+    d = 1.0 / d
+    c = torch.ones_like(d)
+    h = d
+    for m in range(1, max_iter + 1):
+        m_value = float(m)
+        m2 = 2.0 * m_value
+        aa = m_value * (b - m_value) * x / ((qam + m2) * (a + m2))
+        d = _clamp_signed_denominator(1.0 + aa * d, tiny)
+        c = _clamp_signed_denominator(1.0 + aa / c, tiny)
+        d = 1.0 / d
+        h = h * d * c
+        aa = -((a + m_value) * (qab + m_value) * x) / (
+            (a + m2) * (qap + m2)
+        )
+        d = _clamp_signed_denominator(1.0 + aa * d, tiny)
+        c = _clamp_signed_denominator(1.0 + aa / c, tiny)
+        d = 1.0 / d
+        h = h * d * c
+    return h
+
+
+def student_t_log_cdf(values, df):
+    """Differentiable log-CDF of a standardized Student-t distribution.
+
+    PyTorch exposes Student-t sampling but not ``StudentT.cdf``. The CDF is
+    expressed through the regularized incomplete beta function and evaluated
+    with its continued fraction, avoiding SciPy in the training graph.
+    """
+    values = torch.as_tensor(values)
+    # The continued fraction is not stable in fp16/bfloat16. Keep the result
+    # differentiable while evaluating the special-function path in fp32 under
+    # CUDA autocast.
+    if values.dtype in {torch.float16, torch.bfloat16}:
+        values = values.float()
+    df = torch.as_tensor(df, device=values.device, dtype=values.dtype)
+    while df.ndim < values.ndim:
+        df = df.unsqueeze(0)
+    df = df.expand_as(values)
+    if torch.any(df <= 0):
+        raise ValueError("Student-t degrees of freedom must be positive")
+
+    a = 0.5 * df
+    b = torch.full_like(a, 0.5)
+    x = (df / (df + values.square())).clamp(min=1e-12, max=1.0)
+    reflect = x > (a + 1.0) / (a + b + 2.0)
+    x_cf = torch.where(reflect, 1.0 - x, x).clamp(min=1e-12, max=1.0 - 1e-7)
+    a_cf = torch.where(reflect, b, a)
+    b_cf = torch.where(reflect, a, b)
+    log_front = (
+        torch.lgamma(a_cf + b_cf)
+        - torch.lgamma(a_cf)
+        - torch.lgamma(b_cf)
+        + a_cf * torch.log(x_cf)
+        + b_cf * torch.log1p(-x_cf)
+    )
+    fraction = _beta_continued_fraction(a_cf, b_cf, x_cf)
+    log_small_i = log_front + torch.log(fraction.clamp(min=1e-30)) - torch.log(a_cf)
+    small_i = torch.exp(log_small_i).clamp(max=1.0)
+    log_i = torch.where(
+        reflect,
+        torch.log1p(-small_i.clamp(max=1.0 - 1e-7)),
+        log_small_i,
+    )
+    log_half = values.new_tensor(-np.log(2.0))
+    return torch.where(
+        values < 0,
+        log_half + log_i,
+        torch.log1p(-0.5 * torch.exp(log_i).clamp(max=1.0)),
+    )
+
+
+def log_ndtr(values):
+    """Numerically stable ``log Phi(x)``, identical on every backend.
+
+    ``torch.special.log_ndtr`` is unimplemented on MPS, and dispatching by
+    device would make the same config produce different likelihoods on
+    different machines. Both branches are always evaluated and clamped, so no
+    NaN reaches the backward pass through the unselected side.
+    """
+    sqrt_half = 0.7071067811865476
+    # Right branch: the erfc argument stays below ~3.6, far from underflow.
+    upper = torch.log(0.5 * torch.erfc(-values.clamp(min=_LOG_NDTR_TAIL_CUTOFF) * sqrt_half))
+    # Left tail: Mills-ratio asymptotic expansion, accurate past |x| >= 5
+    # where a direct erfc would underflow to log(0).
+    tail = values.clamp(max=_LOG_NDTR_TAIL_CUTOFF)
+    tail_sq = tail * tail
+    series = 1.0 - 1.0 / tail_sq + 3.0 / tail_sq.square() - 15.0 / (tail_sq * tail_sq.square())
+    lower = (
+        -0.5 * tail_sq
+        - torch.log(-tail)
+        - 0.5 * float(np.log(2.0 * np.pi))
+        + torch.log(series.clamp(min=1e-12))
+    )
+    return torch.where(values >= _LOG_NDTR_TAIL_CUTOFF, upper, lower)
+
+
+def _censored_nll(
+    recon_mean,
+    recon_logvar,
+    threshold,
+    var_min=1e-3,
+    var_max=10.0,
+    *,
+    use_student_t_nll=False,
+    df=None,
+):
+    """Tobit term for a left-censored cell: ``-log P(y <= threshold)``.
+
+    ``threshold`` is the detection limit expressed in the scaled space the
+    decoder predicts in, broadcast over the feature axis.  Unlike the
+    observed-cell likelihood this places probability mass below the limit
+    rather than pulling the mean toward a point value.
+
+    Student-t uses the differentiable incomplete-beta CDF above; Gaussian is
+    retained for explicit Gaussian likelihoods and old callers.
+    """
+    if recon_logvar is None:
+        # Deterministic decoder: fall back to a hinge that is zero once the
+        # prediction is already below the limit.
+        return (recon_mean - threshold).clamp(min=0.0).square()
+    log_variance = recon_logvar.clamp(min=np.log(var_min), max=np.log(var_max))
+    variance = torch.exp(log_variance)
+    if use_student_t_nll:
+        if df is None:
+            df = torch.tensor(3.0, device=recon_mean.device, dtype=recon_mean.dtype)
+        df_for_scale = torch.as_tensor(df, device=recon_mean.device, dtype=recon_mean.dtype)
+        while df_for_scale.ndim < recon_mean.ndim:
+            df_for_scale = df_for_scale.unsqueeze(0)
+        variance = (variance * (df_for_scale - 2.0) / df_for_scale).clamp(min=1e-10)
+    sigma = torch.sqrt(variance).clamp(min=1e-6)
+    standardized_limit = (threshold - recon_mean) / sigma
+    if use_student_t_nll:
+        return -student_t_log_cdf(standardized_limit, df)
+    return -log_ndtr(standardized_limit)
+
+
+def _likelihood_df(model, num_features, device, dtype):
+    getter = getattr(model, "get_likelihood_df", None) if model is not None else None
+    if callable(getter):
+        return getter(num_features, device=device, dtype=dtype)
+    return torch.tensor(3.0, device=device, dtype=dtype)
+
+
+def _combine_censored_point_loss(
+    point_loss,
+    metric_mask,
+    censor_mask,
+    censor_threshold,
+    recon_mean,
+    recon_logvar,
+    var_min,
+    var_max,
+    use_student_t_nll=False,
+    df=None,
+):
+    """Fold the Tobit term into the pointwise loss and its normalizing mask.
+
+    Observed and censored positions are disjoint, so the two masks can simply
+    be added: every supervised cell still contributes exactly once to the
+    reduction denominator.
+    """
+    if censor_mask is None or censor_threshold is None:
+        return point_loss, metric_mask
+    censor_mask = censor_mask.float()
+    if float(censor_mask.sum()) == 0.0:
+        return point_loss, metric_mask
+    # Uncensored features carry a NaN threshold; their censor mask is zero but
+    # a NaN would still propagate through torch.where's backward pass.
+    threshold = torch.nan_to_num(censor_threshold, nan=0.0).to(recon_mean.dtype)
+    while threshold.ndim < recon_mean.ndim:
+        threshold = threshold.unsqueeze(0)
+    censored_loss = _censored_nll(
+        recon_mean,
+        recon_logvar,
+        threshold,
+        var_min=var_min,
+        var_max=var_max,
+        use_student_t_nll=use_student_t_nll,
+        df=df,
+    )
+    combined = torch.where(censor_mask.bool(), censored_loss, point_loss)
+    return combined, metric_mask + censor_mask
+
+
 def _reduce_window_feature_loss(point_loss, mask, normalization, n_chem=0,
                                 use_family_balanced_loss=False,
                                 family_loss_chem_weight=0.5,
@@ -167,10 +381,14 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
              loss_normalization="observed_mean", n_chem=0,
              use_family_balanced_loss=False, family_loss_chem_weight=0.5,
              family_loss_scale="target_dim", chem_feature_weight=1.0,
-             psd_feature_weight=1.0, var_min=1e-3, var_max=10.0):
+             psd_feature_weight=1.0, var_min=1e-3, var_max=10.0,
+             censor_mask=None, censor_threshold=None):
     obs_mask = obs_mask.float()
     metric_mask = obs_mask if metric_mask is None else metric_mask.float()
-    n_obs = metric_mask.sum().clamp(min=1.0)
+    likelihood_df = (
+        _likelihood_df(model, target.shape[-1], target.device, target.dtype)
+        if use_student_t_nll else None
+    )
 
     if recon_logvar is not None:
         point_nll = _pointwise_reconstruction_nll(
@@ -181,6 +399,18 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             use_student_t_nll=use_student_t_nll,
             var_min=var_min,
             var_max=var_max,
+        )
+        point_nll, metric_mask = _combine_censored_point_loss(
+            point_nll,
+            metric_mask,
+            censor_mask,
+            censor_threshold,
+            recon_mean,
+            recon_logvar,
+            var_min,
+            var_max,
+            use_student_t_nll=use_student_t_nll,
+            df=likelihood_df,
         )
         recon = _reduce_window_feature_loss(
             point_nll,
@@ -194,8 +424,20 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             psd_feature_weight=psd_feature_weight,
         )
     else:
-        recon = _reduce_window_feature_loss(
+        point_loss, metric_mask = _combine_censored_point_loss(
             (recon_mean - target).square(),
+            metric_mask,
+            censor_mask,
+            censor_threshold,
+            recon_mean,
+            recon_logvar,
+            var_min,
+            var_max,
+            use_student_t_nll=use_student_t_nll,
+            df=likelihood_df,
+        )
+        recon = _reduce_window_feature_loss(
+            point_loss,
             metric_mask,
             loss_normalization,
             n_chem=n_chem,
@@ -287,6 +529,73 @@ def masked_nll_components(
     return (point_nll * mask).sum(), mask.sum()
 
 
+def calibration_components(recon_mean, recon_logvar, target, mask,
+                           *, var_min=1e-3, var_max=10.0):
+    """Split a heteroscedastic NLL into its accuracy and sharpness parts.
+
+    Every heteroscedastic likelihood here has the shape
+    ``const + 0.5*log(sigma^2) + f(z^2)`` with ``z = (y - mu) / sigma``. The
+    two pieces answer different questions, and a rising NLL cannot say which
+    one moved:
+
+    ``z^2``
+        Squared standardized residual. Its mean is 1.0 for a well-calibrated
+        model; above 1 the predictions are wrong more often than the reported
+        variance admits (overconfident), below 1 the variance is inflated.
+    ``log sigma^2``
+        How sharp the predictive distribution is, independent of whether it is
+        centered correctly.
+
+    Returns summed ``z^2``, summed ``log sigma^2``, and the point count.
+    """
+    zeros = torch.zeros((), device=recon_mean.device)
+    if recon_logvar is None:
+        return zeros, zeros, zeros
+    with torch.no_grad():
+        log_variance = recon_logvar.clamp(min=np.log(var_min), max=np.log(var_max))
+        variance = torch.exp(log_variance)
+        z_squared = (target - recon_mean).square() / variance
+        mask = mask.float()
+        return (z_squared * mask).sum(), (log_variance * mask).sum(), mask.sum()
+
+
+def masked_censored_nll_components(
+    recon_mean,
+    recon_logvar,
+    censor_threshold,
+    mask,
+    *,
+    model=None,
+    use_student_t_nll=False,
+    var_min=1e-3,
+    var_max=10.0,
+):
+    """Tobit NLL sum and count over censored positions.
+
+    Reported alongside the observed-cell held-out NLL so a run that improves
+    one at the expense of the other is visible rather than silent.
+    """
+    mask = mask.float()
+    if censor_threshold is None or float(mask.sum()) == 0.0:
+        return torch.zeros((), device=recon_mean.device), torch.zeros((), device=recon_mean.device)
+    threshold = torch.nan_to_num(censor_threshold, nan=0.0).to(recon_mean.dtype)
+    while threshold.ndim < recon_mean.ndim:
+        threshold = threshold.unsqueeze(0)
+    point_nll = _censored_nll(
+        recon_mean,
+        recon_logvar,
+        threshold,
+        var_min=var_min,
+        var_max=var_max,
+        use_student_t_nll=use_student_t_nll,
+        df=(
+            _likelihood_df(model, recon_mean.shape[-1], recon_mean.device, recon_mean.dtype)
+            if use_student_t_nll else None
+        ),
+    )
+    return (point_nll * mask).sum(), mask.sum()
+
+
 def masked_nll(
     recon_mean,
     recon_logvar,
@@ -313,12 +622,26 @@ def masked_nll(
 
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, config: TrainConfig, device):
+    def __init__(self, model, train_loader, val_loader, config: TrainConfig, device,
+                 censor_threshold=None, history_path=None, train_ho_loader=None):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.train_ho_loader = train_ho_loader
         self.config = config
         self.device = device
+        # Durable per-epoch record independent of any live terminal or
+        # external logging service: just a CSV, so a run can be replotted or
+        # compared long after the process exits.
+        self.history_path = history_path
+        self._history_rows = []
+        # Per-feature detection limits in scaled space; None disables the
+        # Tobit term entirely and restores the plain observed-only likelihood.
+        self.censor_threshold = (
+            None
+            if censor_threshold is None or not np.isfinite(censor_threshold).any()
+            else torch.as_tensor(censor_threshold, dtype=torch.float32, device=device)
+        )
 
         # The 26e reference trainer uses AdamW, not Adam.  Keeping the
         # optimizer choice explicit here matters when weight_decay is part of
@@ -408,6 +731,9 @@ class Trainer:
         beta = self.kl_scheduler.get_beta(epoch)
         total_loss = 0.0
         n_batches = 0
+        total_z2 = 0.0
+        total_logvar = 0.0
+        total_points = 0.0
 
         with torch.set_grad_enabled(train):
             # _run_epoch is only ever called with train=True (validation goes
@@ -419,6 +745,11 @@ class Trainer:
                 input_mask = batch["input_mask"].to(self.device)
                 target = batch["target"].to(self.device)
                 obs_mask = batch["obs_mask"].to(self.device)
+                censor_mask = (
+                    batch["censor_mask"].to(self.device)
+                    if self.censor_threshold is not None and "censor_mask" in batch
+                    else None
+                )
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
@@ -443,6 +774,8 @@ class Trainer:
                         psd_feature_weight=self.config.psd_feature_weight,
                         var_min=var_min,
                         var_max=var_max,
+                        censor_mask=censor_mask,
+                        censor_threshold=self.censor_threshold,
                     )
 
                 if train:
@@ -458,12 +791,26 @@ class Trainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
 
+                # Same cells the reconstruction term is scored on, so the
+                # breakdown is directly comparable to the held-out one.
+                z2_sum, logvar_sum, count = calibration_components(
+                    recon_mean.float(), recon_logvar, target, obs_mask,
+                    var_min=var_min, var_max=var_max,
+                )
+                total_z2 += z2_sum.item()
+                total_logvar += logvar_sum.item()
+                total_points += count.item()
+
                 total_loss += loss.item()
                 n_batches += 1
 
-        return total_loss / max(n_batches, 1)
+        points = max(total_points, 1.0)
+        return total_loss / max(n_batches, 1), {
+            "z2": total_z2 / points,
+            "log_sigma2": total_logvar / points,
+        }
 
-    def _run_validation(self, loader, epoch):
+    def _run_validation(self, loader, epoch, loader_name="Validation"):
         """Evaluate only on the fixed selection-HO positions."""
         self.model.eval()
         self._set_epoch_state(epoch)
@@ -472,6 +819,10 @@ class Trainer:
         total_heldout_count = 0.0
         total_crps = 0.0
         total_crps_count = 0.0
+        total_censored_nll = 0.0
+        total_censored_count = 0.0
+        total_z2 = 0.0
+        total_logvar = 0.0
         compute_crps = (
             self.config.validation_metric == "ho_crps"
             and (epoch == 0 or (epoch + 1) % max(1, self.config.val_crps_every_n_epochs) == 0)
@@ -504,9 +855,30 @@ class Trainer:
                 )
                 if not torch.equal(heldout_count, mse_count):
                     raise RuntimeError("Held-out metric counts disagree")
+                z2_sum, logvar_sum, _ = calibration_components(
+                    recon_mean.float(), recon_logvar, target, heldout_mask,
+                    var_min=var_min, var_max=var_max,
+                )
+                total_z2 += z2_sum.item()
+                total_logvar += logvar_sum.item()
+
                 total_nll += nll_sum.item()
                 total_mse += mse_sum.item()
                 total_heldout_count += heldout_count.item()
+
+                if self.censor_threshold is not None and "censor_mask" in batch:
+                    cens_sum, cens_count = masked_censored_nll_components(
+                        recon_mean.float(),
+                        recon_logvar,
+                        self.censor_threshold,
+                        batch["censor_mask"].to(self.device),
+                        model=self.model,
+                        use_student_t_nll=self.config.use_student_t_nll,
+                        var_min=var_min,
+                        var_max=var_max,
+                    )
+                    total_censored_nll += cens_sum.item()
+                    total_censored_count += cens_count.item()
 
                 if compute_crps:
                     result = self.model.compute_uncertainty(
@@ -528,7 +900,7 @@ class Trainer:
                         total_crps_count += crps_count.item()
 
         if total_heldout_count <= 0:
-            raise ValueError("Validation loader contained no held-out target points")
+            raise ValueError(f"{loader_name} loader contained no held-out target points")
         return {
             "ho_nll": total_nll / total_heldout_count,
             "ho_mse": total_mse / total_heldout_count,
@@ -537,7 +909,64 @@ class Trainer:
                 if total_crps_count > 0
                 else None
             ),
+            # Reported, not selected on: model selection stays on the
+            # observed held-out set so the metric keeps a ground-truth scalar.
+            "censored_nll": (
+                total_censored_nll / total_censored_count
+                if total_censored_count > 0
+                else None
+            ),
+            # Mean squared standardized residual over the held-out cells:
+            # 1.0 is calibrated, >1 overconfident, <1 over-dispersed.
+            "z2": total_z2 / total_heldout_count,
+            "log_sigma2": total_logvar / total_heldout_count,
         }
+
+    _HISTORY_FIELDS = [
+        "epoch", "train_loss", "val_ho_nll", "val_ho_mse", "val_ho_crps",
+        "val_censored_nll", "train_ho_nll", "train_ho_mse", "train_ho_crps",
+        "train_ho_z2", "train_ho_log_sigma2",
+        "train_z2", "train_log_sigma2", "val_ho_z2", "val_ho_log_sigma2",
+        "lr", "kl_beta", "is_best",
+    ]
+
+    def _record_epoch(self, epoch, train_loss, val_metrics, current_lr, beta, is_best,
+                      train_calibration=None, train_ho_metrics=None):
+        if self.history_path is None:
+            return
+        train_calibration = train_calibration or {}
+        train_ho_metrics = train_ho_metrics or {}
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_ho_nll": val_metrics.get("ho_nll"),
+            "val_ho_mse": val_metrics.get("ho_mse"),
+            "val_ho_crps": val_metrics.get("ho_crps"),
+            "val_censored_nll": val_metrics.get("censored_nll"),
+            "train_ho_nll": train_ho_metrics.get("ho_nll"),
+            "train_ho_mse": train_ho_metrics.get("ho_mse"),
+            "train_ho_crps": train_ho_metrics.get("ho_crps"),
+            "train_ho_z2": train_ho_metrics.get("z2"),
+            "train_ho_log_sigma2": train_ho_metrics.get("log_sigma2"),
+            # Accuracy/sharpness split of the same NLL, so a train-vs-held-out
+            # gap can be attributed rather than just observed.
+            "train_z2": train_calibration.get("z2"),
+            "train_log_sigma2": train_calibration.get("log_sigma2"),
+            "val_ho_z2": val_metrics.get("z2"),
+            "val_ho_log_sigma2": val_metrics.get("log_sigma2"),
+            "lr": current_lr,
+            "kl_beta": beta,
+            "is_best": int(is_best),
+        }
+        self._history_rows.append(row)
+        # Rewritten whole each epoch rather than appended: cheap at these row
+        # counts, and it means a killed run's file is always valid CSV with a
+        # header, never a half-written line missing one.
+        os.makedirs(os.path.dirname(self.history_path) or ".", exist_ok=True)
+        with open(self.history_path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self._HISTORY_FIELDS)
+            writer.writeheader()
+            writer.writerows(self._history_rows)
 
     def fit(self):
         best_val = float("inf")
@@ -557,11 +986,17 @@ class Trainer:
             # mode: warmup/cosine first, then plateau scheduler post-warmup.
             if not self.use_adaptive_lr or in_warmup:
                 self.lr_scheduler.step(epoch)
-            train_loss = self._run_epoch(self.train_loader, epoch, train=True)
+            train_loss, train_calibration = self._run_epoch(self.train_loader, epoch, train=True)
             current_lr = self.optimizer.param_groups[0]["lr"]
 
+            train_ho_metrics = None
+            if self.train_ho_loader is not None:
+                train_ho_metrics = self._run_validation(
+                    self.train_ho_loader, epoch, loader_name="Train-HO"
+                )
+
             if self.val_loader is not None:
-                val_metrics = self._run_validation(self.val_loader, epoch)
+                val_metrics = self._run_validation(self.val_loader, epoch, loader_name="Validation")
                 metric = val_metrics.get(self.config.validation_metric)
                 # CRPS may be intentionally evaluated every N epochs. Do not
                 # count skipped epochs against patience.
@@ -572,7 +1007,17 @@ class Trainer:
                     f"val_ho_nll={val_metrics['ho_nll']:.4f} "
                     f"val_ho_mse={val_metrics['ho_mse']:.4f} "
                     f"val_ho_crps={val_metrics['ho_crps'] if val_metrics['ho_crps'] is not None else 'skipped'} "
-                    f"lr={current_lr:.2e}"
+                    + (
+                        f"val_cens_nll={val_metrics['censored_nll']:.4f} "
+                        if val_metrics.get("censored_nll") is not None else ""
+                    )
+                    + (
+                        f"train_ho_nll={train_ho_metrics['ho_nll']:.4f} "
+                        f"train_ho_mse={train_ho_metrics['ho_mse']:.4f} "
+                        if train_ho_metrics is not None else ""
+                    )
+                    + f"z2={train_calibration['z2']:.2f}/{val_metrics['z2']:.2f} "
+                    + f"lr={current_lr:.2e}"
                 )
                 epoch_bar.set_postfix(
                     loss=f"{train_loss:.3f}", ho_mse=f"{val_metrics['ho_mse']:.3f}", lr=f"{current_lr:.1e}"
@@ -588,20 +1033,46 @@ class Trainer:
                 if self.use_adaptive_lr and not in_warmup:
                     self.plateau_scheduler.step(train_loss)
 
-            if metric is not None and metric < best_val - 1e-6:
+            is_best = metric is not None and metric < best_val - 1e-6
+            if is_best:
                 best_val = metric
                 best_state = copy.deepcopy(self.model.state_dict())
                 epochs_without_improvement = 0
             elif metric is not None:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= self.config.patience:
-                    tqdm.write(f"early stopping at epoch {epoch + 1}")
-                    break
+            self._record_epoch(
+                epoch, train_loss, val_metrics, current_lr,
+                self.kl_scheduler.get_beta(epoch), is_best,
+                train_calibration=train_calibration,
+                train_ho_metrics=train_ho_metrics,
+            )
+            if metric is not None and not is_best and epochs_without_improvement >= self.config.patience:
+                tqdm.write(f"early stopping at epoch {epoch + 1}")
+                break
 
         epoch_bar.close()
         if best_state is not None:
             self.model.load_state_dict(best_state)
         return best_val
+
+
+def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_chem):
+    """Build a deterministic HO mask for a split without exposing its targets.
+
+    Train and validation use the same protocol family, but different seeds and
+    different time segments.  The train mask is later passed as ``fixed_mask``
+    so its cells are excluded from the training reconstruction loss.
+    """
+    observed_mask = np.asarray(observed_mask, dtype=bool)
+    if mode == "anchor_constrained":
+        return sample_anchor_constrained_heldout_mask(
+            observed_mask, ratio=ratio, seed=seed, n_chem=n_chem
+        )
+    return sample_dynamic_heldout_mask(
+        observed_mask,
+        {**dynamic_config, "target_ratio": ratio, "ensure_nonempty": True},
+        seed=seed,
+    )
 
 
 def train_from_config(
@@ -695,7 +1166,15 @@ def train_from_config(
     aux_cols = data_schema.auxiliary_cols
     n_chem = data_schema.n_chem
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
-    target_model_space = transform_targets(target_raw, data_schema, preprocessing)
+    censoring = config.censoring or CensoringConfig()
+    # Classify before transforming: detection is defined on physical values.
+    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    censor_full = state_full == STATE_CENSORED
+    # loss='ignore' demotes non-detects to missing, so drop their values too.
+    if censoring.active and censoring.loss == "ignore":
+        target_raw = np.where(state_full == STATE_MISSING, np.nan, target_raw)
+    target_input_raw = apply_input_fill(target_raw, state_full, data_schema, censoring)
+    target_model_space = transform_targets(target_input_raw, data_schema, preprocessing)
     aux_raw = (
         frame[aux_cols].to_numpy(dtype=np.float64)
         if aux_cols
@@ -708,14 +1187,35 @@ def train_from_config(
     if full_data_validation:
         train_target = val_target = target_model_space
         train_aux = val_aux = aux_model_space
+        train_censor = val_censor = censor_full
     else:
         train_target, val_target = target_model_space[:split_idx], target_model_space[split_idx:]
         train_aux, val_aux = aux_model_space[:split_idx], aux_model_space[split_idx:]
+        train_censor, val_censor = censor_full[:split_idx], censor_full[split_idx:]
     train_aux_mask = ~np.isnan(train_aux)
     val_aux_mask = ~np.isnan(val_aux)
 
     scaler_target_fit = target_model_space if preprocessing.fit_scope == "full" else train_target
     scaler_aux_fit = aux_model_space if preprocessing.fit_scope == "full" else train_aux
+    # Fitting on substituted non-detects would describe the detection-limit
+    # spike rather than the concentration distribution, dragging the center
+    # down and the spread with it. Hide them from the fit only.
+    scaler_censor_fit = censor_full if preprocessing.fit_scope == "full" else train_censor
+    if scaler_censor_fit.any():
+        hidden = np.where(scaler_censor_fit, np.nan, scaler_target_fit)
+        # A column that is censored almost everywhere has too few detects left
+        # to fit an affine scaler. Keep its non-detects in the fit rather than
+        # failing the run, and name it: such a column carries little signal and
+        # is usually better dropped from the target set entirely.
+        too_sparse = np.flatnonzero((~np.isnan(hidden)).sum(axis=0) < 2)
+        if len(too_sparse):
+            hidden[:, too_sparse] = scaler_target_fit[:, too_sparse]
+            print(
+                "[graph-temporal-vae] scaler fit kept non-detects for "
+                f"{len(too_sparse)} near-fully-censored column(s): "
+                f"{[target_cols[i] for i in too_sparse]}"
+            )
+        scaler_target_fit = hidden
     scaler_target = fit_target_scaler(scaler_target_fit, data_schema, preprocessing)
     scaler_aux = fit_auxiliary_scaler(scaler_aux_fit, preprocessing)
 
@@ -723,6 +1223,11 @@ def train_from_config(
     train_target_scaled[np.isnan(train_target)] = np.nan
     val_target_scaled = scaler_target.transform(val_target)
     val_target_scaled[np.isnan(val_target)] = np.nan
+    # Detection limits must live in the same space the decoder predicts in.
+    censor_threshold_scaled = model_space_thresholds(
+        data_schema, preprocessing, scaler_target, censoring
+    )
+    censor_report = censoring_report(state_full, data_schema, censoring)
     train_aux_scaled = scaler_aux.transform(train_aux) if aux_cols else train_aux
     val_aux_scaled = scaler_aux.transform(val_aux) if aux_cols else val_aux
 
@@ -741,11 +1246,33 @@ def train_from_config(
         "n_chem": n_chem,
     }
     train_fixed_mask = None
+    train_selection_mask = None
+    # Held-out selection scores predictions against a ground-truth scalar, so
+    # only real detections are eligible: a non-detect has no such value.
+    observed_full = (~np.isnan(target_model_space)) & ~censor_full
+    observed_train = (~np.isnan(train_target)) & ~train_censor
+    observed_val = (~np.isnan(val_target)) & ~val_censor
+
+    if config.train_ho_enabled:
+        train_selection_mask = _make_fixed_ho_mask(
+            observed_train,
+            mode=config.selection_mask_mode,
+            ratio=config.train_ho_ratio,
+            seed=config.train_ho_seed,
+            dynamic_config=dynamic_mask_config,
+            n_chem=n_chem,
+        )
+        if train_selection_mask.sum() == 0:
+            raise ValueError("Training split has no observed target positions for train-HO evaluation")
+        # WindowedTimeSeriesDataset removes fixed_mask cells from obs_mask, so
+        # these values are hidden from both the input and the training loss.
+        train_fixed_mask = train_selection_mask
+
     if len(val_target):
         if config.selection_mask_mode == "anchor_constrained":
             if config.shared_full_heldout_mask:
                 selection_full = sample_anchor_constrained_heldout_mask(
-                    ~np.isnan(target_model_space),
+                    observed_full,
                     ratio=config.selection_mask_ratio,
                     seed=config.selection_val_seed,
                     n_chem=n_chem,
@@ -756,16 +1283,18 @@ def train_from_config(
                 else:
                     train_fixed_mask = selection_full[:split_idx]
                     val_selection_mask = selection_full[split_idx:]
+                if config.train_ho_enabled:
+                    train_selection_mask = train_fixed_mask
             else:
                 val_selection_mask = sample_anchor_constrained_heldout_mask(
-                    ~np.isnan(val_target),
+                    observed_val,
                     ratio=config.selection_mask_ratio,
                     seed=config.selection_val_seed,
                     n_chem=n_chem,
                 )
         else:
             val_selection_mask = sample_dynamic_heldout_mask(
-                ~np.isnan(val_target),
+                observed_val,
                 {**dynamic_mask_config, "ensure_nonempty": True},
                 seed=config.selection_val_seed,
             )
@@ -786,11 +1315,29 @@ def train_from_config(
         aux_mask_channel=preprocessing.aux_mask_channel,
         dynamic_mask_config=dynamic_mask_config,
         fixed_mask=train_fixed_mask,
+        censor_mask=train_censor,
     )
     if len(train_dataset) == 0:
         raise ValueError(
             f"Training split ({len(train_target)} rows) is shorter than window_size={config.window_size}"
         )
+
+    train_ho_dataset = None
+    if config.train_ho_enabled:
+        train_ho_dataset = WindowedTimeSeriesDataset(
+            train_target_scaled,
+            train_aux_scaled,
+            config.window_size,
+            config.stride,
+            mode="val",
+            seed=config.seed,
+            aux_mask=train_aux_mask,
+            aux_mask_channel=preprocessing.aux_mask_channel,
+            selection_mask=train_selection_mask,
+            censor_mask=train_censor,
+        )
+        if len(train_ho_dataset) == 0:
+            raise ValueError("Training split produced no windows for train-HO evaluation")
 
     val_dataset = WindowedTimeSeriesDataset(
         val_target_scaled,
@@ -802,6 +1349,7 @@ def train_from_config(
         aux_mask=val_aux_mask,
         aux_mask_channel=preprocessing.aux_mask_channel,
         selection_mask=val_selection_mask,
+        censor_mask=val_censor,
     )
     if len(val_target) and config.val_fraction > 0 and len(val_dataset) == 0:
         raise ValueError(
@@ -815,6 +1363,17 @@ def train_from_config(
         num_workers=config.train_loader_num_workers,
         worker_init_fn=_seed_window_worker,
         generator=torch.Generator().manual_seed(config.seed),
+    )
+    train_ho_loader = (
+        DataLoader(
+            train_ho_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.val_loader_num_workers,
+            worker_init_fn=_seed_window_worker,
+        )
+        if train_ho_dataset is not None
+        else None
     )
     val_loader = (
         DataLoader(
@@ -844,7 +1403,34 @@ def train_from_config(
         f"({n_chem} chem + {len(data_schema.psd_cols)} psd), {data_schema.aux_dim} met cols, "
         f"{n_params:,} params, device={device}, epochs={config.epochs}, batch_size={config.batch_size}"
     )
-    trainer = Trainer(model, train_loader, val_loader, config, device)
+    if train_selection_mask is not None:
+        print(
+            f"[graph-temporal-vae] train-HO: {int(train_selection_mask.sum())} "
+            f"observed cells held out with seed={config.train_ho_seed}, "
+            f"ratio={config.train_ho_ratio}"
+        )
+    if censoring.active:
+        fractions = censor_report["fractions"]
+        print(
+            f"[graph-temporal-vae] censoring: {fractions['censored'] * 100:.1f}% of target "
+            f"cells below detection limit across {censor_report['n_censored_columns']} column(s), "
+            f"{fractions['observed'] * 100:.1f}% observed, {fractions['missing'] * 100:.1f}% missing "
+            f"(loss={censoring.loss}, input_fill={censoring.input_fill})"
+        )
+        saturated = high_censoring_columns(censor_report, 0.9)
+        if saturated:
+            print(
+                f"[graph-temporal-vae] {len(saturated)} column(s) are >=90% non-detect and carry "
+                f"little concentration signal; consider dropping them: {saturated}"
+            )
+
+    history_path = os.path.splitext(save_path)[0] + "_history.csv"
+    trainer = Trainer(
+        model, train_loader, val_loader, config, device,
+        censor_threshold=censor_threshold_scaled,
+        history_path=history_path,
+        train_ho_loader=train_ho_loader,
+    )
     best_val = trainer.fit()
 
     input_transforms = {
@@ -886,6 +1472,15 @@ def train_from_config(
         "target_output_transform": uniform_output_transform,
         "target_output_transforms": output_transforms,
         "preprocessing": preprocessing.to_dict(),
+        "censoring": censoring.to_dict(),
+        # Scaled-space limits so inference can flag non-detects and report
+        # P(y <= MDL) without re-deriving the transform chain.
+        "censor_threshold_scaled": [
+            None if not np.isfinite(value) else float(value)
+            for value in censor_threshold_scaled
+        ],
+        "censoring_report": censor_report,
+        "history_csv": os.path.basename(history_path),
         "data_schema": data_schema.to_dict(),
         "data_interface": data_interface,
         "time_grid": {

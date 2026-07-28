@@ -4,6 +4,7 @@ import json
 
 from .api import validate_multimodal_data
 from .bundle import inspect_bundle
+from .censoring import CensoringConfig
 from .config import TrainConfig
 from .contracts import (
     InferenceConfig,
@@ -95,6 +96,15 @@ def build_parser():
     train_p.add_argument("--selection-val-seed", type=int, default=100003)
     train_p.add_argument("--selection-mask-mode", choices=["block", "anchor_constrained"], default="block")
     train_p.add_argument("--selection-mask-ratio", type=float, default=0.10)
+    train_p.add_argument(
+        "--train-ho-enabled", action="store_true",
+        help="Reserve a fixed training-period HO mask, exclude it from training loss, and log train_ho_* metrics.",
+    )
+    train_p.add_argument("--train-ho-seed", type=int, default=None)
+    train_p.add_argument(
+        "--train-ho-ratio", type=float, default=None,
+        help="Training-period fixed-HO ratio; defaults to --selection-mask-ratio.",
+    )
     train_p.add_argument("--shared-full-heldout-mask", action="store_true")
     train_p.add_argument(
         "--validation-metric", choices=["ho_nll", "ho_mse", "ho_crps"], default="ho_nll",
@@ -102,7 +112,10 @@ def build_parser():
     )
     train_p.add_argument("--val-crps-mc-samples", type=int, default=20)
     train_p.add_argument("--val-crps-every-n-epochs", type=int, default=1)
-    train_p.add_argument("--val-crps-dist-type", choices=["gaussian", "student_t"], default="gaussian")
+    train_p.add_argument(
+        "--val-crps-dist-type", choices=["gaussian", "student_t"], default=None,
+        help="Uncertainty distribution; defaults to Student-t when --use-student-t-nll is enabled.",
+    )
     train_p.add_argument("--val-mc-batch-size", type=int, default=1)
     train_p.add_argument("--use-adaptive-lr", action="store_true",
                          help="Switch to ReduceLROnPlateau (monitoring held-out MSE) after warmup, as in the 26e reference.")
@@ -132,6 +145,25 @@ def build_parser():
     train_p.add_argument("--aux-mask-channel", dest="aux_mask_channel", action="store_true", default=True)
     train_p.add_argument("--no-aux-mask-channel", dest="aux_mask_channel", action="store_false")
     train_p.add_argument("--seed", type=int, default=0)
+
+    train_p.add_argument(
+        "--censoring-thresholds", default=None,
+        help="JSON file mapping target column -> detection limit in CSV units. "
+             "Enables below-detection-limit handling; see scripts/build_mdl_table.py.",
+    )
+    train_p.add_argument(
+        "--censoring-detect", choices=["zero", "at_or_below_threshold"], default="zero",
+        help="How a non-detect is recognized: an exact zero, or any value at or below the limit.",
+    )
+    train_p.add_argument(
+        "--censoring-input-fill", choices=["half_threshold", "threshold", "zero"],
+        default="half_threshold",
+        help="Point value shown to the encoder for a non-detect; the likelihood still treats it as an interval.",
+    )
+    train_p.add_argument(
+        "--censoring-loss", choices=["tobit", "ignore"], default="tobit",
+        help="'tobit' constrains predictive mass below the limit; 'ignore' demotes non-detects to missing.",
+    )
 
     train_p.add_argument("--n-chem", type=int, default=0, help="First N target columns treated as the Chem modality.")
     train_p.add_argument("--latent-dim", type=int, default=256)
@@ -240,6 +272,21 @@ def _preprocessing_from_args(args):
     )
 
 
+def _censoring_from_args(args):
+    """Build a CensoringConfig, or None when no threshold table was supplied."""
+    if not getattr(args, "censoring_thresholds", None):
+        return None
+    with open(args.censoring_thresholds) as handle:
+        thresholds = json.load(handle)
+    return CensoringConfig(
+        enabled=True,
+        thresholds=thresholds,
+        detect=args.censoring_detect,
+        input_fill=args.censoring_input_fill,
+        loss=args.censoring_loss,
+    )
+
+
 def _model_kwargs_from_args(args, *, include_n_chem=True):
     model_kwargs = {}
     if args.model_config:
@@ -314,6 +361,9 @@ def main(argv=None):
             selection_val_seed=args.selection_val_seed,
             selection_mask_mode=args.selection_mask_mode,
             selection_mask_ratio=args.selection_mask_ratio,
+            train_ho_enabled=args.train_ho_enabled,
+            train_ho_seed=args.train_ho_seed,
+            train_ho_ratio=args.train_ho_ratio,
             shared_full_heldout_mask=args.shared_full_heldout_mask,
             validation_metric=args.validation_metric,
             val_crps_mc_samples=args.val_crps_mc_samples,
@@ -338,6 +388,7 @@ def main(argv=None):
             chem_feature_weight=args.chem_feature_weight,
             psd_feature_weight=args.psd_feature_weight,
             aux_mask_channel=args.aux_mask_channel,
+            censoring=_censoring_from_args(args),
             seed=args.seed,
             model_kwargs=_model_kwargs_from_args(
                 args, include_n_chem=modality_files is None

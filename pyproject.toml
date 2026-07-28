@@ -32,6 +32,10 @@ dev = [
     "pytest>=8",
     "scipy>=1.10",
     "matplotlib>=3.7",
+    # Used by the evaluation/plotting scripts under examples/ and scripts/,
+    # never by the library itself: importing graph_temporal_vae stays on the
+    # core numpy/torch/pandas/tqdm set.
+    "scikit-learn>=1.3",
 ]
 
 [project.scripts]

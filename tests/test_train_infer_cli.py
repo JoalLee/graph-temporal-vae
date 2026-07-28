@@ -1029,6 +1029,55 @@ def test_heldout_validation_metric_accepts_mse():
     assert config.validation_metric == "ho_mse"
 
 
+def test_train_ho_config_resolves_a_distinct_fixed_mask_seed_and_ratio():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        selection_val_seed=100003,
+        selection_mask_ratio=0.2,
+        train_ho_enabled=True,
+    )
+
+    assert config.train_ho_enabled is True
+    assert config.train_ho_seed == 100004
+    assert config.train_ho_ratio == pytest.approx(0.2)
+
+
+def test_train_ho_metrics_are_recorded_from_cells_excluded_from_training_loss(tmp_path):
+    csv_path = tmp_path / "train_ho.csv"
+    _write_synthetic_csv(csv_path, n=80)
+    config = TrainConfig(
+        csv=[str(csv_path)],
+        timestamp_col="time",
+        target_cols=["target_a", "target_b"],
+        aux_cols=["ws", "at"],
+        window_size=8,
+        stride=8,
+        val_fraction=0.25,
+        batch_size=4,
+        epochs=1,
+        patience=1,
+        train_ho_enabled=True,
+        selection_mask_mode="block",
+        selection_mask_ratio=0.2,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    bundle_path = tmp_path / "train_ho.pt"
+    train_from_config(config, str(bundle_path))
+
+    history = pd.read_csv(tmp_path / "train_ho_history.csv")
+    for column in ("train_ho_nll", "train_ho_mse", "val_ho_nll", "val_ho_mse"):
+        assert column in history.columns
+        assert np.isfinite(history.loc[0, column])
+
+
 def test_26e_training_controls_are_serializable():
     config = TrainConfig(
         csv=["unused.csv"],

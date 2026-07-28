@@ -3,6 +3,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .censoring import CensoringConfig
 from .contracts import ModalityFiles, PreprocessingConfig
 from .model_config import ModelConfig
 from .preprocessing import preprocessing_from_legacy
@@ -18,6 +19,9 @@ class TrainConfig:
     aux_cols: List[str] = field(default_factory=list)
     modality_files: Optional[ModalityFiles] = None
     preprocessing: Optional[PreprocessingConfig] = None
+    # Below-detection-limit handling. Disabled by default so existing configs
+    # keep their exact behavior: a zero stays an ordinary observation.
+    censoring: Optional[CensoringConfig] = None
     # Transform applied to values read from the CSV before scaling/training.
     # For an already-log1p-preprocessed experiment CSV, use "none" here.
     target_transform: str = "none"
@@ -62,11 +66,21 @@ class TrainConfig:
     selection_val_seed: int = 100003
     selection_mask_mode: str = "block"
     selection_mask_ratio: float = 0.10
+    # Optional fixed HO inside the training period. When enabled, these cells
+    # are removed from both the training input and reconstruction loss, then
+    # evaluated with the same HO-only metrics as validation. Dynamic HO remains
+    # active as the training augmentation on the remaining observed cells.
+    train_ho_enabled: bool = False
+    train_ho_seed: Optional[int] = None
+    train_ho_ratio: Optional[float] = None
     shared_full_heldout_mask: bool = False
     validation_metric: str = "ho_nll"
     val_crps_mc_samples: int = 20
     val_crps_every_n_epochs: int = 1
-    val_crps_dist_type: str = "gaussian"
+    # If omitted, uncertainty evaluation follows the reconstruction
+    # likelihood: Student-t for Student-t NLL, Gaussian otherwise. An
+    # explicit value remains an intentional override for parity studies.
+    val_crps_dist_type: Optional[str] = None
     val_crps_use_inference_epoch: bool = True
     val_mc_batch_size: int = 1
     # Linear warmup + cosine anneal runs for the whole schedule by default.
@@ -120,6 +134,8 @@ class TrainConfig:
             self.modality_files = ModalityFiles.from_dict(self.modality_files)
         if isinstance(self.preprocessing, dict):
             self.preprocessing = PreprocessingConfig.from_dict(self.preprocessing)
+        if isinstance(self.censoring, dict):
+            self.censoring = CensoringConfig.from_dict(self.censoring)
         has_legacy_source = bool(self.csv or self.target_cols or self.aux_cols)
         if self.modality_files is not None:
             if has_legacy_source:
@@ -143,8 +159,16 @@ class TrainConfig:
             )
         if self.validation_metric not in {"ho_nll", "ho_mse", "ho_crps"}:
             raise ValueError("validation_metric must be 'ho_nll', 'ho_mse', or 'ho_crps'")
+        if self.val_crps_dist_type is None:
+            self.val_crps_dist_type = "student_t" if self.use_student_t_nll else "gaussian"
         if self.val_crps_dist_type not in {"gaussian", "student_t"}:
             raise ValueError("val_crps_dist_type must be 'gaussian' or 'student_t'")
+        if self.train_ho_seed is None:
+            self.train_ho_seed = self.selection_val_seed + 1
+        if self.train_ho_ratio is None:
+            self.train_ho_ratio = self.selection_mask_ratio
+        if not 0 < self.train_ho_ratio <= 1:
+            raise ValueError("train_ho_ratio must be in (0, 1]")
         if self.target_transform not in {"none", "log1p"}:
             raise ValueError("target_transform must be 'none' or 'log1p'")
         if self.target_output_transform is None:
@@ -161,6 +185,8 @@ class TrainConfig:
         else:
             self.scaler_fit_scope = self.preprocessing.fit_scope
             self.aux_mask_channel = self.preprocessing.aux_mask_channel
+        if self.censoring is None:
+            self.censoring = CensoringConfig()
         if self.scaler_fit_scope not in {"train", "full"}:
             raise ValueError("scaler_fit_scope must be 'train' or 'full'")
         if self.time_grid_policy not in {"strict", "reindex", "row_order"}:

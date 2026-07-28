@@ -1,19 +1,31 @@
 """Held-out evaluation for a graph-temporal-vae checkpoint bundle.
 
-Reconstructs the SAME fixed anchor-constrained held-out mask used during
-training (identical seed/ratio/n_chem -> identical mask, see
-train.py:sample_anchor_constrained_heldout_mask under shared_full_heldout_mask),
-forces those points to look unobserved to the model at inference time (as
-training did), and scores predictions against true values only at those
-points. `impute()` alone cannot produce this number because it always
-treats real observations as observed -- this is the missing piece for
-answering "how close does this checkpoint get to a reference run's
-reported held-out R²/MAE?".
+Holds out a fixed fraction of the genuinely observed points, forces them to
+look unobserved to the model, and scores the predictions against the values
+that were hidden. `impute()` alone cannot produce this number: it always
+writes real observations straight through to the output, so the model's own
+prediction for an observed cell is discarded and never compared to anything.
+This script is what answers "how accurate is this checkpoint, per feature?".
+
+Two things the reported numbers depend on, both worth stating in any writeup:
+
+* The held-out set is generated *for this evaluation*, not replayed from the
+  training loop. The default anchor-constrained protocol holds out a share of
+  every feature's observed points so each feature has enough scored points for
+  a per-feature R^2; the training loop's own `block` protocol draws one block
+  per modality per window, which is right for augmentation but too sparse to
+  score features individually. Pass `--selection-mask-mode block` to use it.
+* Below-detection-limit cells are excluded from scoring. A non-detect has no
+  ground-truth scalar, so including it would score "did the model predict
+  exactly zero?" -- the very error the censored likelihood exists to prevent.
 
 Usage:
     python examples/heldout_eval.py \\
-        --bundle checkpoints/run1.pt --csv data.csv \\
-        --n-chem 32 -o heldout_metrics.json
+        --bundle outputs/iop_.../model.pt \\
+        --chem-csv data/iop_clean/chem.csv \\
+        --psd-csv data/iop_clean/psd.csv \\
+        --met-csv data/iop_clean/met.csv \\
+        -o heldout_metrics.json --predictions-csv heldout_predictions.csv
 """
 import argparse
 import json
@@ -25,10 +37,18 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy.stats import norm
+from sklearn.metrics import mean_absolute_error, r2_score
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from graph_temporal_vae.censoring import (
+    STATE_CENSORED,
+    STATE_OBSERVED,
+    CensoringConfig,
+    apply_input_fill,
+    build_state_matrix,
+)
 from graph_temporal_vae.contracts import ModalityFiles
 from graph_temporal_vae.data import (
     compute_window_starts,
@@ -36,6 +56,7 @@ from graph_temporal_vae.data import (
     load_modality_frame,
     make_condition,
     sample_anchor_constrained_heldout_mask,
+    sample_dynamic_heldout_mask,
 )
 from graph_temporal_vae.infer import (
     load_bundle,
@@ -71,13 +92,18 @@ PSD_GROUPS = {
 
 
 def _r2_score(y_true, y_pred):
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
-    return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    # Undefined, not zero, in two cases sklearn treats differently: an empty
+    # selection (it raises) and a constant truth vector (it returns 0.0, which
+    # would read as "explains nothing" for a genuinely flat feature).
+    if len(y_true) == 0 or np.var(y_true) <= 0:
+        return float("nan")
+    return float(r2_score(y_true, y_pred))
 
 
 def _mae(y_true, y_pred):
-    return float(np.mean(np.abs(y_true - y_pred)))
+    if len(y_true) == 0:
+        return float("nan")
+    return float(mean_absolute_error(y_true, y_pred))
 
 
 def category_indices(target_cols, n_chem):
@@ -205,8 +231,19 @@ def main():
     ap.add_argument("--psd-csv", default=None)
     ap.add_argument("--met-csv", default=None)
     ap.add_argument("--n-chem", type=int, default=None, help="Defaults to the bundle data schema.")
-    ap.add_argument("--selection-mask-ratio", type=float, default=0.1)
-    ap.add_argument("--selection-val-seed", type=int, default=42)
+    ap.add_argument(
+        "--selection-mask-mode", choices=["anchor_constrained", "block"],
+        default="anchor_constrained",
+        help="Held-out protocol for THIS evaluation. 'anchor_constrained' (default) holds "
+             "out a fixed fraction of every feature's observed points, bounded by observed "
+             "anchors, which is what gives each feature enough scored points for a per-feature "
+             "R2. 'block' replays the training-time augmentation protocol instead: it draws "
+             "one block per modality and yields far fewer scored points.",
+    )
+    ap.add_argument("--selection-mask-ratio", type=float, default=None,
+                    help="Defaults to the ratio stored in the checkpoint.")
+    ap.add_argument("--selection-val-seed", type=int, default=None,
+                    help="Defaults to the seed stored in the checkpoint.")
     ap.add_argument("--n-mc-samples", type=int, default=50)
     ap.add_argument("--stride", type=int, default=None, help="Defaults to window_size // 2.")
     ap.add_argument("--inference-batch-size", type=int, default=4)
@@ -253,21 +290,64 @@ def main():
         frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
     n = len(frame)
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
-    target_model_space = transform_targets(target_raw, data_schema, preprocessing)
+    # Non-detects are not point observations: they have no ground-truth scalar
+    # to score against, so they must be excluded from the held-out set exactly
+    # as training excludes them. Scoring them would ask "did the model predict
+    # exactly zero?", which is the error the censored likelihood exists to avoid.
+    censoring = bundle.get("censoring") or CensoringConfig()
+    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    censor_mask_full = state_full == STATE_CENSORED
+    target_input_raw = apply_input_fill(target_raw, state_full, data_schema, censoring)
+    target_model_space = transform_targets(target_input_raw, data_schema, preprocessing)
     aux_raw = frame[aux_cols].to_numpy(dtype=np.float64) if aux_cols else np.zeros((n, 0))
     aux_model_space = transform_auxiliary(aux_raw, preprocessing)
-    obs_mask_full = ~np.isnan(target_raw)
+    obs_mask_full = state_full == STATE_OBSERVED
+    known_mask_full = obs_mask_full | censor_mask_full
 
-    heldout_mask = sample_anchor_constrained_heldout_mask(
-        obs_mask_full,
-        ratio=args.selection_mask_ratio,
-        seed=args.selection_val_seed,
-        n_chem=data_schema.n_chem if args.n_chem is None else args.n_chem,
-    ).astype(bool)
+    training_config = bundle.get("training_config", {})
+    mask_mode = args.selection_mask_mode
+    ratio = args.selection_mask_ratio
+    if ratio is None:
+        ratio = training_config.get("selection_mask_ratio", 0.1)
+    seed = args.selection_val_seed
+    if seed is None:
+        seed = training_config.get("selection_val_seed", 42)
+    n_chem = data_schema.n_chem if args.n_chem is None else args.n_chem
+
+    # Reproduce the protocol the checkpoint was trained under; a mismatch here
+    # silently scores a different set of cells than the run's own val metric.
+    if mask_mode == "block":
+        heldout_mask = sample_dynamic_heldout_mask(
+            obs_mask_full,
+            {
+                "mode": "block",
+                "target_ratio": ratio,
+                "mean_duration": training_config.get("dynamic_mask_mean_duration", 48.0),
+                "std_duration": training_config.get("dynamic_mask_std_duration", 24.0),
+                "min_duration": training_config.get("dynamic_mask_min_duration", 3),
+                "max_duration": training_config.get("dynamic_mask_max_duration", 168),
+                "chem_blocks": training_config.get("dynamic_mask_chem_blocks", 1),
+                "psd_blocks": training_config.get("dynamic_mask_psd_blocks", 1),
+                "n_chem": n_chem,
+                "ensure_nonempty": True,
+            },
+            seed=seed,
+        ).astype(bool)
+    else:
+        heldout_mask = sample_anchor_constrained_heldout_mask(
+            obs_mask_full, ratio=ratio, seed=seed, n_chem=n_chem,
+        ).astype(bool)
+    print(
+        f"[heldout_eval] selection protocol: mode={mask_mode} ratio={ratio} seed={seed}"
+        + (f", {int(censor_mask_full.sum())} censored cells excluded from scoring"
+           if censoring.active else "")
+        + f", dist={bundle.get('uncertainty_dist_type', 'gaussian')}"
+    )
 
     # Force held-out points to look unobserved to the model, exactly as
     # training did (fixed_mask carved out of the training input mask).
-    input_obs_mask = (obs_mask_full & ~heldout_mask).astype(np.float32)
+    # Non-detects stay visible: training keeps them in the encoder input.
+    input_obs_mask = (known_mask_full & ~heldout_mask).astype(np.float32)
 
     target_scaled = np.nan_to_num(scaler_target.transform(target_model_space), nan=0.0)
     aux_scaled = scaler_aux.transform(aux_model_space) if aux_cols else aux_model_space
@@ -287,7 +367,8 @@ def main():
         f"[heldout_eval] {n} rows -> {len(starts)} windows ({n_batches} batches), "
         f"{heldout_mask.sum()}/{obs_mask_full.sum()} observed points held out "
         f"({100 * heldout_mask.sum() / obs_mask_full.sum():.2f}%), "
-        f"{args.n_mc_samples} MC samples, stride={stride}, device={device}"
+        f"{args.n_mc_samples} MC samples, stride={stride}, "
+        f"dist={bundle.get('uncertainty_dist_type', 'gaussian')}, device={device}"
     )
 
     # Two bounded-memory aggregators preserve the established two-stream
@@ -349,6 +430,7 @@ def main():
                 cond_t,
                 mask_t,
                 n_samples=max(2, args.n_mc_samples),
+                dist_type=bundle.get("uncertainty_dist_type", "gaussian"),
                 return_samples=True,
             )
             pred_mean_scaled = result[0].cpu().numpy()

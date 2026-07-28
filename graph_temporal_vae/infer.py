@@ -7,6 +7,14 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
+from .censoring import (
+    STATE_CENSORED,
+    STATE_MISSING,
+    STATE_OBSERVED,
+    CensoringConfig,
+    apply_input_fill,
+    build_state_matrix,
+)
 from .contracts import (
     DataSchema,
     InferenceConfig,
@@ -227,6 +235,13 @@ def load_bundle(path, device=None):
     model.to(device)
     model.eval()
 
+    training_config = dict(bundle.get("config", {}))
+    uncertainty_dist_type = training_config.get("val_crps_dist_type")
+    if uncertainty_dist_type is None:
+        uncertainty_dist_type = (
+            "student_t" if training_config.get("use_student_t_nll", False) else "gaussian"
+        )
+
     return {
         "model": model,
         "scaler_target": NaNAwareAffineScaler.from_dict(bundle["scaler_target"]),
@@ -241,6 +256,12 @@ def load_bundle(path, device=None):
         "target_output_transform": bundle.get("target_output_transform", "none"),
         "target_output_transforms": list(bundle["target_output_transforms"]),
         "preprocessing": preprocessing,
+        # Non-detect handling must match training exactly: the same cells have
+        # to be recognized, filled, and bounded at inference time.
+        "censoring": CensoringConfig.from_dict(bundle["censoring"])
+        if bundle.get("censoring")
+        else CensoringConfig(),
+        "censor_threshold_scaled": bundle.get("censor_threshold_scaled"),
         "data_schema": data_schema,
         "data_interface": bundle.get("data_interface", "legacy_columns"),
         "bundle_version": bundle["bundle_version"],
@@ -248,7 +269,8 @@ def load_bundle(path, device=None):
         "state_dict_format_version": bundle["state_dict_format_version"],
         "schema": bundle.get("schema"),
         "model_kwargs": dict(bundle["model_kwargs"]),
-        "training_config": dict(bundle.get("config", {})),
+        "training_config": training_config,
+        "uncertainty_dist_type": uncertainty_dist_type,
         "timestamp_col": data_schema.timestamp_col,
         "time_grid": bundle.get("time_grid", {}),
         "device": device,
@@ -275,6 +297,94 @@ def trapezoid_position_weights(window_size, edge_frac=0.2):
     weights[:edge_len] = ramp
     weights[-edge_len:] = ramp[::-1]
     return weights
+
+
+def _bundle_censor_thresholds(bundle, data_schema):
+    """Scaled-space detection limits saved at training time, or all-NaN."""
+    stored = bundle.get("censor_threshold_scaled")
+    thresholds = np.full(data_schema.target_dim, np.nan, dtype=np.float64)
+    if not stored:
+        return thresholds
+    if len(stored) != data_schema.target_dim:
+        raise ValueError(
+            f"Bundle censor_threshold_scaled has {len(stored)} entries but the schema "
+            f"has {data_schema.target_dim} targets"
+        )
+    for index, value in enumerate(stored):
+        if value is not None:
+            thresholds[index] = float(value)
+    return thresholds
+
+
+_HAZARD_TAIL_CUTOFF = -5.0
+
+
+def _standard_normal_pdf(values):
+    return np.exp(-0.5 * values ** 2) / math.sqrt(2.0 * math.pi)
+
+
+def _inverse_mills_ratio(alpha):
+    """``phi(a) / Phi(a)``, stable into the far-left tail.
+
+    A direct ratio collapses to 0/0 once ``Phi`` underflows (around a = -10 in
+    float64), which would silently skip the truncation and let a censored cell
+    report a value above its own detection limit. The asymptotic Mills-ratio
+    expansion takes over well before that, where it agrees to ~1e-4 and tends
+    to ``-a``, which drives the truncated mean to the limit as it should.
+    """
+    alpha = np.asarray(alpha, dtype=np.float64)
+    near = np.clip(alpha, _HAZARD_TAIL_CUTOFF, None)
+    near_hazard = _standard_normal_pdf(near) / np.clip(_standard_normal_cdf(near), 1e-300, None)
+
+    tail = np.clip(alpha, None, _HAZARD_TAIL_CUTOFF)
+    tail_sq = tail * tail
+    series = 1.0 - 1.0 / tail_sq + 3.0 / tail_sq ** 2 - 15.0 / tail_sq ** 3
+    tail_hazard = -tail / np.clip(series, 1e-12, None)
+    return np.where(alpha >= _HAZARD_TAIL_CUTOFF, near_hazard, tail_hazard)
+
+
+def _standard_normal_cdf(values):
+    # numpy has no erf; torch is already a hard dependency and ndtr is exact.
+    return torch.special.ndtr(torch.as_tensor(values, dtype=torch.float64)).numpy()
+
+
+def truncate_below_limit(mean_model, variance_model, limit_model, censored):
+    """Condition the predictive distribution on ``y <= limit`` where censored.
+
+    A non-detect is only known to lie below the detection limit, so reporting
+    an unconstrained mean would contradict the measurement. Returns the
+    truncated mean and variance plus ``P(y <= limit)`` for every cell that has
+    a limit, which is also informative for genuinely missing cells.
+    """
+    mean_model = np.asarray(mean_model, dtype=np.float64)
+    variance_model = np.asarray(variance_model, dtype=np.float64)
+    limit = np.asarray(limit_model, dtype=np.float64)
+    has_limit = np.isfinite(limit)
+    p_below = np.full(mean_model.shape, np.nan, dtype=np.float64)
+    if not has_limit.any():
+        return mean_model, variance_model, p_below
+
+    sigma = np.sqrt(np.maximum(variance_model, 1e-12))
+    safe_limit = np.where(has_limit[None, :], limit[None, :], 0.0)
+    alpha = (safe_limit - mean_model) / sigma
+    cdf = _standard_normal_cdf(alpha)
+    p_below = np.where(has_limit[None, :], cdf, np.nan)
+
+    hazard = _inverse_mills_ratio(alpha)
+    truncated_mean = mean_model - sigma * hazard
+    # The leading terms of the variance factor cancel as the constraint becomes
+    # binding; the floor keeps it positive, which is the right limit anyway
+    # (all the mass is pinned just below the detection limit).
+    truncated_var = variance_model * np.maximum(
+        1.0 - alpha * hazard - hazard ** 2, 1e-12
+    )
+
+    apply = np.asarray(censored, dtype=bool) & has_limit[None, :]
+    return (
+        np.where(apply, truncated_mean, mean_model),
+        np.where(apply, truncated_var, variance_model),
+        p_below,
+    )
 
 
 def summary_to_output_scale(mean_model, variance_model, quantile_values_model, transform):
@@ -516,10 +626,27 @@ def impute(
         raise ValueError(f"Series length {n} is shorter than window_size={window_size}")
 
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
-    target_model_space = transform_targets(target_raw, data_schema, preprocessing)
+    # Reproduce the training-time observation states so non-detects are fed to
+    # the encoder the same way they were during fitting, and are reported as
+    # interval-constrained rather than as ordinary observations.
+    censoring = bundle.get("censoring") or CensoringConfig()
+    if isinstance(censoring, dict):
+        censoring = CensoringConfig.from_dict(censoring)
+    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    censor_mask_full = (state_full == STATE_CENSORED).astype(np.float32)
+    target_input_raw = apply_input_fill(target_raw, state_full, data_schema, censoring)
+    target_model_space = transform_targets(target_input_raw, data_schema, preprocessing)
     aux_raw = frame[aux_cols].to_numpy(dtype=np.float64) if aux_cols else np.zeros((n, 0))
     aux_model_space = transform_auxiliary(aux_raw, preprocessing)
-    obs_mask_full = (~np.isnan(target_raw)).astype(np.float32)
+    obs_mask_full = (state_full == STATE_OBSERVED).astype(np.float32)
+    # A non-detect is known to the encoder even though it is not a point value.
+    known_mask_full = obs_mask_full + censor_mask_full
+    # The bundle stores limits in scaled space because that is where the
+    # decoder is supervised, but the window aggregators emit model space.
+    censor_threshold_scaled = _bundle_censor_thresholds(bundle, data_schema)
+    censor_threshold_model = (
+        censor_threshold_scaled * scaler_target.std_ + scaler_target.mean_
+    )
 
     target_scaled = np.nan_to_num(scaler_target.transform(target_model_space), nan=0.0)
     aux_scaled = scaler_aux.transform(aux_model_space) if aux_cols else aux_model_space
@@ -563,7 +690,7 @@ def impute(
         ):
             batch_starts = starts[batch_start:batch_start + inference_batch_size]
             masks = np.stack([
-                obs_mask_full[start:start + window_size]
+                known_mask_full[start:start + window_size]
                 for start in batch_starts
             ])
             xs = np.stack([
@@ -587,6 +714,7 @@ def impute(
                 cond_t,
                 mask_t,
                 n_samples=n_mc_samples,
+                dist_type=bundle.get("uncertainty_dist_type", "gaussian"),
                 return_samples=True,
                 mc_batch_size=mc_batch_size,
             )
@@ -608,8 +736,13 @@ def impute(
 
     mean_agg = mean_aggregator.finish()
     dist_agg = distribution_aggregator.finish()
+    # Non-detects are reported under the constraint that produced them, so the
+    # mean and interval respect the detection limit instead of contradicting it.
+    mean_model, variance_model, p_below_limit = truncate_below_limit(
+        mean_agg["mean"], dist_agg["variance"], censor_threshold_model, censor_mask_full == 1
+    )
     mean_out, std_out, quantiles_out = summary_to_output_scale(
-        mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], output_transforms
+        mean_model, variance_model, dist_agg["quantiles"], output_transforms
     )
     q_lower_out = quantiles_out[lower_q]
     q_upper_out = quantiles_out[upper_q]
@@ -624,8 +757,28 @@ def impute(
     q_lower_out = np.where(obs_mask_full == 1, observed_output, q_lower_out)
     q_upper_out = np.where(obs_mask_full == 1, observed_output, q_upper_out)
 
+    # A censored cell is not usable context for gap-support diagnostics: it
+    # constrains the value without pinning it down.
     support = _compute_support_diagnostics(
         obs_mask_full, context_window=support_context_window
+    )
+    # Quantiles for a non-detect cannot exceed the limit it was censored at.
+    limit_output = inverse_targets(
+        censor_threshold_model[None, :], data_schema, preprocessing
+    )[0]
+    limit_output = np.where(np.isfinite(censor_threshold_model), limit_output, np.nan)
+    censored_cells = censor_mask_full == 1
+    for array in (q_upper_out, q_lower_out):
+        np.copyto(
+            array,
+            np.minimum(array, np.broadcast_to(limit_output[None, :], array.shape)),
+            where=censored_cells & np.isfinite(limit_output)[None, :],
+        )
+
+    state_labels = np.select(
+        [state_full == STATE_OBSERVED, state_full == STATE_CENSORED],
+        ["observed", "censored"],
+        default="missing",
     )
     frames = []
     for j, col in enumerate(target_cols):
@@ -633,6 +786,11 @@ def impute(
             "timestamp": frame.index,
             "feature": col,
             "observed": observed_output[:, j],
+            "observation_state": state_labels[:, j],
+            "detection_limit": (
+                limit_output[j] if np.isfinite(limit_output[j]) else np.nan
+            ),
+            "p_below_limit": p_below_limit[:, j],
             "is_imputed": obs_mask_full[:, j] == 0,
             "imputed_mean": mean_out[:, j],
             "imputed_std": std_out[:, j],

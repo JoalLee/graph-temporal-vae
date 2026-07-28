@@ -696,6 +696,7 @@ class WindowedTimeSeriesDataset(Dataset):
         dynamic_mask_config=None,
         selection_mask=None,
         fixed_mask=None,
+        censor_mask=None,
     ):
         self.target = np.asarray(target, dtype=np.float32)
         self.aux = np.asarray(aux, dtype=np.float32)
@@ -717,6 +718,12 @@ class WindowedTimeSeriesDataset(Dataset):
         self.fixed_mask = None if fixed_mask is None else np.asarray(fixed_mask, dtype=bool)
         if self.fixed_mask is not None and self.fixed_mask.shape != self.target.shape:
             raise ValueError("fixed_mask must have the same shape as target")
+        # Below-detection-limit cells. They are excluded from obs_mask (they
+        # are not point observations) but stay in the encoder input, where
+        # they carry their substituted value.
+        self.censor_mask = None if censor_mask is None else np.asarray(censor_mask, dtype=bool)
+        if self.censor_mask is not None and self.censor_mask.shape != self.target.shape:
+            raise ValueError("censor_mask must have the same shape as target")
         self.starts = compute_window_starts(len(self.target), window_size, stride)
         self.rng = np.random.default_rng(seed)
 
@@ -731,11 +738,21 @@ class WindowedTimeSeriesDataset(Dataset):
         aux_win = self.aux[start:end]
         aux_mask_win = self.aux_mask[start:end]
 
-        obs_mask = (~np.isnan(target_win)).astype(np.float32)
+        present = ~np.isnan(target_win)
+        if self.censor_mask is None:
+            censor_mask = np.zeros_like(present, dtype=np.float32)
+            obs_mask = present.astype(np.float32)
+        else:
+            censored = present & self.censor_mask[start:end]
+            censor_mask = censored.astype(np.float32)
+            obs_mask = (present & ~censored).astype(np.float32)
         target_clean = np.nan_to_num(target_win, nan=0.0)
         cond = make_condition(aux_win, aux_mask_win, self.aux_mask_channel)
 
-        input_mask = obs_mask.copy()
+        # Everything the encoder is allowed to read: real observations plus
+        # non-detects, which are informative even though they are not points.
+        known_mask = obs_mask + censor_mask
+        input_mask = known_mask.copy()
         heldout_mask = np.zeros_like(obs_mask)
         if self.fixed_mask is not None:
             heldout_mask = (self.fixed_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
@@ -747,19 +764,25 @@ class WindowedTimeSeriesDataset(Dataset):
             # signal to reconstruct exactly the points later reported as
             # held-out accuracy, inflating held-out metrics.
             obs_mask = obs_mask * (1.0 - heldout_mask)
-            input_mask = obs_mask.copy()
+            known_mask = obs_mask + censor_mask
+            input_mask = known_mask.copy()
         if self.dynamic_mask_config:
+            # Non-detects are droppable from the input too, so the model has
+            # to predict "below the limit" from context rather than by
+            # reading the substituted value back out.
             dynamic_mask = sample_dynamic_heldout_mask(
-                obs_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
+                known_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
             ).astype(np.float32)
-            heldout_mask = np.maximum(heldout_mask, dynamic_mask)
-            input_mask = obs_mask * (1.0 - dynamic_mask)
+            # Held-out metrics need a ground-truth scalar, which a censored
+            # cell does not have: score only the observed positions.
+            heldout_mask = np.maximum(heldout_mask, dynamic_mask * obs_mask)
+            input_mask = known_mask * (1.0 - dynamic_mask)
         elif self.selection_mask is not None:
             selection_mask = (self.selection_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
             heldout_mask = np.maximum(heldout_mask, selection_mask)
-            input_mask = obs_mask * (1.0 - selection_mask)
+            input_mask = known_mask * (1.0 - selection_mask)
         if self.denoise_prob > 0:
-            drop = (obs_mask == 1.0) & (self.rng.random(obs_mask.shape) < self.denoise_prob)
+            drop = (known_mask == 1.0) & (self.rng.random(known_mask.shape) < self.denoise_prob)
             input_mask[drop] = 0.0
         input_x = target_clean * input_mask
 
@@ -767,6 +790,7 @@ class WindowedTimeSeriesDataset(Dataset):
             "target": torch.from_numpy(target_clean),
             "cond": torch.from_numpy(cond),
             "obs_mask": torch.from_numpy(obs_mask),
+            "censor_mask": torch.from_numpy(censor_mask),
             "heldout_mask": torch.from_numpy(heldout_mask),
             "input_x": torch.from_numpy(input_x),
             "input_mask": torch.from_numpy(input_mask),
