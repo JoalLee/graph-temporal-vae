@@ -38,7 +38,7 @@ from .data import (
     load_frame,
     load_modality_frame,
     sample_anchor_constrained_heldout_mask,
-    sample_dynamic_heldout_mask,
+    sample_block_heldout_mask_to_ratio,
 )
 from .model_graph_uq import ImputationVAE_Graph
 from .preprocessing import (
@@ -56,6 +56,30 @@ def _seed_window_worker(_worker_id):
     info = get_worker_info()
     if info is not None and hasattr(info.dataset, "rng"):
         info.dataset.rng = np.random.default_rng(torch.initial_seed() % (2**32))
+
+
+def _loader_options(config, num_workers):
+    """Build DataLoader options without enabling worker-only knobs at zero."""
+    pin_memory = (
+        torch.cuda.is_available()
+        if config.pin_memory is None
+        else bool(config.pin_memory)
+    )
+    options = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "worker_init_fn": _seed_window_worker,
+    }
+    if num_workers > 0:
+        # Timeline-epoch masks are replaced in the parent dataset before each
+        # iterator. Persistent workers would keep stale dataset copies from
+        # epoch 0, so they must be respawned for this protocol.
+        options["persistent_workers"] = bool(
+            config.persistent_workers
+            and config.dynamic_mask_scope != "timeline_epoch"
+        )
+        options["prefetch_factor"] = int(config.loader_prefetch_factor)
+    return options
 
 
 def _student_t_nll(recon_mean, recon_logvar, target, var_min=1e-3, var_max=10.0, df=None):
@@ -348,7 +372,15 @@ def _reduce_window_feature_loss(point_loss, mask, normalization, n_chem=0,
     return normalized.sum(dim=1).mean()
 
 
-def _latent_kl_loss(mu, logvar, model=None, prior_type="gaussian"):
+def _latent_kl_per_dim(mu, logvar, model=None, prior_type="gaussian"):
+    """Per-latent-dimension KL contribution, before summing over latent_dim.
+
+    Returns ``(kl_per_dim, log_det)``. ``log_det`` is the RealNVP flow's
+    batch-level Jacobian correction (``None`` outside the flow path) -- it
+    mixes dimensions through the coupling layers and isn't decomposable
+    per-dimension, so callers doing free-bits clamping must clamp
+    ``kl_per_dim`` only and add ``log_det`` back afterward, unclamped.
+    """
     mu = torch.clamp(mu, min=-100.0, max=100.0)
     logvar = torch.clamp(logvar, min=-10.0, max=10.0)
     if model is not None and getattr(model, "last_log_det_J", None) is not None:
@@ -357,7 +389,7 @@ def _latent_kl_loss(mu, logvar, model=None, prior_type="gaussian"):
         log_det = model.last_log_det_J
         log_q_z0 = -0.5 * (
             np.log(2.0 * np.pi) + logvar + (z0 - mu).square() / logvar.exp()
-        ).sum(dim=1)
+        )
         if prior_type == "student_t":
             df_getter = getattr(model, "get_prior_df", None)
             df = df_getter(device=z_k.device, dtype=z_k.dtype) if callable(df_getter) else 3.0
@@ -372,8 +404,21 @@ def _latent_kl_loss(mu, logvar, model=None, prior_type="gaussian"):
             log_p = -(np.log(2.0) + z_k.abs())
         else:
             log_p = -0.5 * (np.log(2.0 * np.pi) + z_k.square())
-        return (log_q_z0 - log_det - log_p.sum(dim=1)).mean()
-    return -0.5 * torch.mean(torch.sum(1 + logvar - mu.square() - logvar.exp(), dim=1))
+        return log_q_z0 - log_p, log_det
+    kl_per_dim = -0.5 * (1 + logvar - mu.square() - logvar.exp())
+    return kl_per_dim, None
+
+
+def _latent_kl_loss(mu, logvar, model=None, prior_type="gaussian"):
+    """Raw, unclamped KL divergence -- the posterior-collapse diagnostic
+    signal. Always reflects the true divergence, regardless of any
+    free-bits floor applied to the loss term in ``vae_loss`` -- otherwise
+    collapse would become invisible the moment free-bits is turned on."""
+    kl_per_dim, log_det = _latent_kl_per_dim(mu, logvar, model=model, prior_type=prior_type)
+    total = kl_per_dim.sum(dim=1)
+    if log_det is not None:
+        total = total - log_det
+    return total.mean()
 
 
 def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metric_mask=None,
@@ -382,7 +427,7 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
              use_family_balanced_loss=False, family_loss_chem_weight=0.5,
              family_loss_scale="target_dim", chem_feature_weight=1.0,
              psd_feature_weight=1.0, var_min=1e-3, var_max=10.0,
-             censor_mask=None, censor_threshold=None):
+             censor_mask=None, censor_threshold=None, kl_free_bits_nats=0.0):
     obs_mask = obs_mask.float()
     metric_mask = obs_mask if metric_mask is None else metric_mask.float()
     likelihood_df = (
@@ -448,9 +493,19 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             psd_feature_weight=psd_feature_weight,
         )
 
-    kl = _latent_kl_loss(mu, logvar, model=model, prior_type=prior_type)
-    loss = recon + beta * kl
-    return loss, recon.detach(), kl.detach()
+    kl_per_dim, log_det = _latent_kl_per_dim(mu, logvar, model=model, prior_type=prior_type)
+    raw_kl_total = kl_per_dim.sum(dim=1)
+    if kl_free_bits_nats > 0:
+        loss_kl_total = torch.clamp(kl_per_dim, min=kl_free_bits_nats).sum(dim=1)
+    else:
+        loss_kl_total = raw_kl_total
+    if log_det is not None:
+        raw_kl_total = raw_kl_total - log_det
+        loss_kl_total = loss_kl_total - log_det
+    kl = raw_kl_total.mean()
+    weighted_kl = beta * loss_kl_total.mean()
+    loss = recon + weighted_kl
+    return loss, recon.detach(), kl.detach(), weighted_kl.detach()
 
 
 def empirical_crps_components(samples, target, mask):
@@ -691,6 +746,10 @@ class Trainer:
             )
         self.amp_dtype = self._resolve_amp_dtype(config.amp_dtype)
         self.amp_enabled = bool(config.use_amp and self.amp_dtype is not None)
+        self.non_blocking_transfer = bool(
+            self.device.type == "cuda"
+            and (config.pin_memory if config.pin_memory is not None else True)
+        )
         self.grad_scaler = torch.amp.GradScaler(
             "cuda",
             enabled=self.amp_enabled and self.amp_dtype == torch.float16
@@ -725,28 +784,41 @@ class Trainer:
             float(getattr(decoder, "var_max", 10.0)),
         )
 
-    def _run_epoch(self, loader, epoch, train):
+    def _run_epoch(self, loader, epoch, train, *, beta_override=None):
         self.model.train(train)
         self._set_epoch_state(epoch)
-        beta = self.kl_scheduler.get_beta(epoch)
-        total_loss = 0.0
+        if hasattr(loader.dataset, "set_epoch"):
+            loader.dataset.set_epoch(epoch)
+        beta = (
+            self.kl_scheduler.get_beta(epoch)
+            if beta_override is None
+            else float(beta_override)
+        )
+        zero = torch.zeros((), device=self.device)
+        total_loss = zero.clone()
         n_batches = 0
-        total_z2 = 0.0
-        total_logvar = 0.0
-        total_points = 0.0
+        total_z2 = zero.clone()
+        total_logvar = zero.clone()
+        total_points = zero.clone()
+        # Raw KL divergence, not beta-weighted: the beta schedule scales how
+        # much this term counts toward the loss, but the divergence itself is
+        # what tells you whether the posterior is actually collapsing.
+        total_kl = zero.clone()
+        total_recon = zero.clone()
+        total_weighted_kl = zero.clone()
 
         with torch.set_grad_enabled(train):
             # _run_epoch is only ever called with train=True (validation goes
             # through _run_validation instead); per-batch bars are only worth
             # drawing on a live terminal -- see utils.is_interactive.
             for batch in tqdm(loader, desc=f"train epoch {epoch + 1}", leave=False, disable=not is_interactive()):
-                input_x = batch["input_x"].to(self.device)
-                cond = batch["cond"].to(self.device)
-                input_mask = batch["input_mask"].to(self.device)
-                target = batch["target"].to(self.device)
-                obs_mask = batch["obs_mask"].to(self.device)
+                input_x = batch["input_x"].to(self.device, non_blocking=self.non_blocking_transfer)
+                cond = batch["cond"].to(self.device, non_blocking=self.non_blocking_transfer)
+                input_mask = batch["input_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
+                target = batch["target"].to(self.device, non_blocking=self.non_blocking_transfer)
+                obs_mask = batch["obs_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
                 censor_mask = (
-                    batch["censor_mask"].to(self.device)
+                    batch["censor_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
                     if self.censor_threshold is not None and "censor_mask" in batch
                     else None
                 )
@@ -754,7 +826,7 @@ class Trainer:
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
                     var_min, var_max = self._variance_bounds()
-                    loss, _recon, _kl = vae_loss(
+                    loss, _recon, _kl, _weighted_kl = vae_loss(
                         recon_mean,
                         recon_logvar,
                         target,
@@ -776,6 +848,7 @@ class Trainer:
                         var_max=var_max,
                         censor_mask=censor_mask,
                         censor_threshold=self.censor_threshold,
+                        kl_free_bits_nats=self.config.kl_free_bits_nats,
                     )
 
                 if train:
@@ -797,32 +870,41 @@ class Trainer:
                     recon_mean.float(), recon_logvar, target, obs_mask,
                     var_min=var_min, var_max=var_max,
                 )
-                total_z2 += z2_sum.item()
-                total_logvar += logvar_sum.item()
-                total_points += count.item()
+                total_z2 += z2_sum.detach()
+                total_logvar += logvar_sum.detach()
+                total_points += count.detach()
 
-                total_loss += loss.item()
+                total_loss += loss.detach()
+                total_kl += _kl.detach()
+                total_recon += _recon.detach()
+                total_weighted_kl += _weighted_kl.detach()
                 n_batches += 1
 
         points = max(total_points, 1.0)
-        return total_loss / max(n_batches, 1), {
-            "z2": total_z2 / points,
-            "log_sigma2": total_logvar / points,
+        return float((total_loss / max(n_batches, 1)).item()), {
+            "z2": float((total_z2 / points).item()),
+            "log_sigma2": float((total_logvar / points).item()),
+            "kl": float((total_kl / max(n_batches, 1)).item()),
+            "recon": float((total_recon / max(n_batches, 1)).item()),
+            "weighted_kl": float((total_weighted_kl / max(n_batches, 1)).item()),
         }
 
     def _run_validation(self, loader, epoch, loader_name="Validation"):
         """Evaluate only on the fixed selection-HO positions."""
         self.model.eval()
         self._set_epoch_state(epoch)
-        total_nll = 0.0
-        total_mse = 0.0
-        total_heldout_count = 0.0
-        total_crps = 0.0
-        total_crps_count = 0.0
-        total_censored_nll = 0.0
-        total_censored_count = 0.0
-        total_z2 = 0.0
-        total_logvar = 0.0
+        zero = torch.zeros((), device=self.device)
+        total_nll = zero.clone()
+        total_mse = zero.clone()
+        total_heldout_count = zero.clone()
+        total_crps = zero.clone()
+        total_crps_count = zero.clone()
+        total_censored_nll = zero.clone()
+        total_censored_count = zero.clone()
+        total_z2 = zero.clone()
+        total_logvar = zero.clone()
+        total_kl = zero.clone()
+        n_batches = 0
         compute_crps = (
             self.config.validation_metric == "ho_crps"
             and (epoch == 0 or (epoch + 1) % max(1, self.config.val_crps_every_n_epochs) == 0)
@@ -830,15 +912,19 @@ class Trainer:
 
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"val epoch {epoch + 1}", leave=False, disable=not is_interactive()):
-                input_x = batch["input_x"].to(self.device)
-                cond = batch["cond"].to(self.device)
-                input_mask = batch["input_mask"].to(self.device)
-                target = batch["target"].to(self.device)
-                obs_mask = batch["obs_mask"].to(self.device)
-                heldout_mask = batch["heldout_mask"].to(self.device)
+                input_x = batch["input_x"].to(self.device, non_blocking=self.non_blocking_transfer)
+                cond = batch["cond"].to(self.device, non_blocking=self.non_blocking_transfer)
+                input_mask = batch["input_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
+                target = batch["target"].to(self.device, non_blocking=self.non_blocking_transfer)
+                obs_mask = batch["obs_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
+                heldout_mask = batch["heldout_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
+                total_kl += _latent_kl_loss(
+                    mu, logvar, model=self.model, prior_type=self.config.prior_type
+                ).detach()
+                n_batches += 1
                 var_min, var_max = self._variance_bounds()
                 nll_sum, heldout_count = masked_nll_components(
                     recon_mean.float(),
@@ -853,32 +939,30 @@ class Trainer:
                 mse_sum, mse_count = masked_mse_components(
                     recon_mean.float(), target, heldout_mask
                 )
-                if not torch.equal(heldout_count, mse_count):
-                    raise RuntimeError("Held-out metric counts disagree")
                 z2_sum, logvar_sum, _ = calibration_components(
                     recon_mean.float(), recon_logvar, target, heldout_mask,
                     var_min=var_min, var_max=var_max,
                 )
-                total_z2 += z2_sum.item()
-                total_logvar += logvar_sum.item()
+                total_z2 += z2_sum.detach()
+                total_logvar += logvar_sum.detach()
 
-                total_nll += nll_sum.item()
-                total_mse += mse_sum.item()
-                total_heldout_count += heldout_count.item()
+                total_nll += nll_sum.detach()
+                total_mse += mse_sum.detach()
+                total_heldout_count += heldout_count.detach()
 
                 if self.censor_threshold is not None and "censor_mask" in batch:
                     cens_sum, cens_count = masked_censored_nll_components(
                         recon_mean.float(),
                         recon_logvar,
                         self.censor_threshold,
-                        batch["censor_mask"].to(self.device),
+                        batch["censor_mask"].to(self.device, non_blocking=self.non_blocking_transfer),
                         model=self.model,
                         use_student_t_nll=self.config.use_student_t_nll,
                         var_min=var_min,
                         var_max=var_max,
                     )
-                    total_censored_nll += cens_sum.item()
-                    total_censored_count += cens_count.item()
+                    total_censored_nll += cens_sum.detach()
+                    total_censored_count += cens_count.detach()
 
                 if compute_crps:
                     result = self.model.compute_uncertainty(
@@ -895,31 +979,41 @@ class Trainer:
                     crps_sum, crps_count = empirical_crps_components(
                         samples, target, heldout_mask
                     )
-                    if crps_count > 0 and torch.isfinite(crps_sum):
-                        total_crps += crps_sum.item()
-                        total_crps_count += crps_count.item()
+                    valid_crps = (crps_count > 0) & torch.isfinite(crps_sum)
+                    total_crps += torch.where(
+                        valid_crps, crps_sum, torch.zeros_like(crps_sum)
+                    ).detach()
+                    total_crps_count += torch.where(
+                        valid_crps, crps_count, torch.zeros_like(crps_count)
+                    ).detach()
 
-        if total_heldout_count <= 0:
+        heldout_count_value = float(total_heldout_count.item())
+        censored_count_value = float(total_censored_count.item())
+        crps_count_value = float(total_crps_count.item())
+        if heldout_count_value <= 0:
             raise ValueError(f"{loader_name} loader contained no held-out target points")
         return {
-            "ho_nll": total_nll / total_heldout_count,
-            "ho_mse": total_mse / total_heldout_count,
+            "ho_nll": float((total_nll / heldout_count_value).item()),
+            "ho_mse": float((total_mse / heldout_count_value).item()),
             "ho_crps": (
-                total_crps / total_crps_count
-                if total_crps_count > 0
+                float((total_crps / crps_count_value).item())
+                if crps_count_value > 0
                 else None
             ),
             # Reported, not selected on: model selection stays on the
             # observed held-out set so the metric keeps a ground-truth scalar.
             "censored_nll": (
-                total_censored_nll / total_censored_count
-                if total_censored_count > 0
+                float((total_censored_nll / censored_count_value).item())
+                if censored_count_value > 0
                 else None
             ),
             # Mean squared standardized residual over the held-out cells:
             # 1.0 is calibrated, >1 overconfident, <1 over-dispersed.
-            "z2": total_z2 / total_heldout_count,
-            "log_sigma2": total_logvar / total_heldout_count,
+            "z2": float((total_z2 / heldout_count_value).item()),
+            "log_sigma2": float((total_logvar / heldout_count_value).item()),
+            # Raw KL divergence, batch-averaged like train_loss (not
+            # cell-weighted: it's one scalar per window, not per feature-cell).
+            "kl": float((total_kl / max(n_batches, 1)).item()),
         }
 
     _HISTORY_FIELDS = [
@@ -927,6 +1021,15 @@ class Trainer:
         "val_censored_nll", "train_ho_nll", "train_ho_mse", "train_ho_crps",
         "train_ho_z2", "train_ho_log_sigma2",
         "train_z2", "train_log_sigma2", "val_ho_z2", "val_ho_log_sigma2",
+        # Raw KL divergence (not beta-weighted): the direct posterior-collapse
+        # diagnostic. train_kl is over directly-supervised cells each batch;
+        # val_kl/train_ho_kl are over the respective held-out windows.
+        "train_kl", "val_kl", "train_ho_kl",
+        # Loss decomposition: train_loss == train_recon + train_weighted_kl
+        # (train_weighted_kl = kl_beta * the free-bits-floored KL used for
+        # the gradient -- can exceed kl_beta * train_kl once free-bits is
+        # clamping some dimensions up, since train_kl above stays raw).
+        "train_recon", "train_weighted_kl",
         "lr", "kl_beta", "is_best",
     ]
 
@@ -954,6 +1057,11 @@ class Trainer:
             "train_log_sigma2": train_calibration.get("log_sigma2"),
             "val_ho_z2": val_metrics.get("z2"),
             "val_ho_log_sigma2": val_metrics.get("log_sigma2"),
+            "train_kl": train_calibration.get("kl"),
+            "val_kl": val_metrics.get("kl"),
+            "train_ho_kl": train_ho_metrics.get("kl"),
+            "train_recon": train_calibration.get("recon"),
+            "train_weighted_kl": train_calibration.get("weighted_kl"),
             "lr": current_lr,
             "kl_beta": beta,
             "is_best": int(is_best),
@@ -972,6 +1080,8 @@ class Trainer:
         best_val = float("inf")
         best_state = None
         epochs_without_improvement = 0
+        self.best_epoch = None
+        self.epochs_completed = 0
 
         # Outer, whole-run progress bar (epoch X/N, ETA). Only drawn on a
         # live terminal; in a redirected log (nohup, CI) it's a no-op and the
@@ -1017,6 +1127,7 @@ class Trainer:
                         if train_ho_metrics is not None else ""
                     )
                     + f"z2={train_calibration['z2']:.2f}/{val_metrics['z2']:.2f} "
+                    + f"kl={train_calibration['kl']:.3f}/{val_metrics['kl']:.3f} "
                     + f"lr={current_lr:.2e}"
                 )
                 epoch_bar.set_postfix(
@@ -1037,6 +1148,7 @@ class Trainer:
             if is_best:
                 best_val = metric
                 best_state = copy.deepcopy(self.model.state_dict())
+                self.best_epoch = epoch
                 epochs_without_improvement = 0
             elif metric is not None:
                 epochs_without_improvement += 1
@@ -1046,6 +1158,7 @@ class Trainer:
                 train_calibration=train_calibration,
                 train_ho_metrics=train_ho_metrics,
             )
+            self.epochs_completed = epoch + 1
             if metric is not None and not is_best and epochs_without_improvement >= self.config.patience:
                 tqdm.write(f"early stopping at epoch {epoch + 1}")
                 break
@@ -1055,20 +1168,153 @@ class Trainer:
             self.model.load_state_dict(best_state)
         return best_val
 
+    def refit_full_data(self, train_loader, monitor_loader, history_path=None):
+        """Continue from the selected checkpoint after restoring global-HO cells.
+
+        This is a final-fit phase, not an independent validation phase. The
+        monitor loader applies one deterministic mask shaped like the dynamic
+        training masks so its MSE is stable enough for an optional practical
+        stopping rule. Those target values remain part of full-data training,
+        so the metric must not be reported as generalization performance.
+        """
+        max_epochs = int(self.config.full_data_refit_epochs)
+        if max_epochs <= 0:
+            return None
+
+        refit_lr = (
+            float(self.config.full_data_refit_lr)
+            if self.config.full_data_refit_lr is not None
+            else max(float(self.config.lr_min), float(self.config.lr) * 0.1)
+        )
+        patience = self.config.full_data_refit_patience
+        early_stopping_enabled = patience is not None
+
+        # The selected model weights carry over, but optimizer and schedule
+        # state do not. A small constant LR and the fully annealed KL weight
+        # make this a continuation phase rather than a second warmup.
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=refit_lr,
+            weight_decay=self.config.weight_decay,
+        )
+        self.train_loader = train_loader
+        best_monitor_mse = float("inf")
+        best_state = None
+        best_epoch = None
+        epochs_without_improvement = 0
+        rows = []
+        base_model_epoch = (
+            self.best_epoch + 1
+            if self.best_epoch is not None
+            else self.epochs_completed
+        )
+
+        epoch_bar = tqdm(
+            range(max_epochs),
+            desc="full-data refit",
+            disable=not is_interactive(),
+            dynamic_ncols=True,
+        )
+        for phase_epoch in epoch_bar:
+            model_epoch = base_model_epoch + phase_epoch
+            train_loss, train_calibration = self._run_epoch(
+                train_loader,
+                model_epoch,
+                train=True,
+                beta_override=self.config.kl_max_beta,
+            )
+            monitor_metrics = self._run_validation(
+                monitor_loader,
+                model_epoch,
+                loader_name="Refit dynamic-HO monitor",
+            )
+            monitor_mse = float(monitor_metrics["ho_mse"])
+            is_best = monitor_mse < best_monitor_mse - 1e-6
+            if is_best:
+                best_monitor_mse = monitor_mse
+                best_epoch = phase_epoch
+                epochs_without_improvement = 0
+                if early_stopping_enabled:
+                    best_state = copy.deepcopy(self.model.state_dict())
+            else:
+                epochs_without_improvement += 1
+
+            rows.append({
+                "epoch": phase_epoch + 1,
+                "model_epoch": model_epoch + 1,
+                "train_loss": train_loss,
+                "dynamic_ho_nll": monitor_metrics["ho_nll"],
+                "dynamic_ho_mse": monitor_mse,
+                "dynamic_ho_z2": monitor_metrics["z2"],
+                "dynamic_ho_log_sigma2": monitor_metrics["log_sigma2"],
+                "train_z2": train_calibration["z2"],
+                "train_log_sigma2": train_calibration["log_sigma2"],
+                # Beta is pinned to kl_max_beta for the whole refit phase, but
+                # the divergence itself isn't -- this is what actually shows
+                # whether the posterior keeps collapsing under the low, fixed
+                # refit LR, which a constant kl_beta column can't tell you.
+                "train_kl": train_calibration["kl"],
+                "dynamic_ho_kl": monitor_metrics["kl"],
+                "train_recon": train_calibration["recon"],
+                "train_weighted_kl": train_calibration["weighted_kl"],
+                "lr": refit_lr,
+                "kl_beta": self.config.kl_max_beta,
+                "is_best": int(is_best),
+            })
+            if history_path is not None:
+                os.makedirs(os.path.dirname(history_path) or ".", exist_ok=True)
+                with open(history_path, "w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+            tqdm.write(
+                f"refit {phase_epoch + 1}/{max_epochs}  "
+                f"train_loss={train_loss:.4f}  "
+                f"dynamic_ho_mse={monitor_mse:.4f}  "
+                f"lr={refit_lr:.2e}"
+            )
+            epoch_bar.set_postfix(
+                loss=f"{train_loss:.3f}",
+                dynamic_ho_mse=f"{monitor_mse:.3f}",
+            )
+            if (
+                early_stopping_enabled
+                and not is_best
+                and epochs_without_improvement >= patience
+            ):
+                tqdm.write(
+                    "full-data refit early stopping at "
+                    f"epoch {phase_epoch + 1} on dynamic_ho_mse"
+                )
+                break
+
+        epoch_bar.close()
+        if early_stopping_enabled and best_state is not None:
+            self.model.load_state_dict(best_state)
+        return {
+            "epochs_completed": len(rows),
+            "max_epochs": max_epochs,
+            "early_stopping_enabled": early_stopping_enabled,
+            "patience": patience,
+            "learning_rate": refit_lr,
+            "monitor_metric": "dynamic_ho_mse",
+            "best_monitor_mse": best_monitor_mse,
+            "best_epoch": None if best_epoch is None else best_epoch + 1,
+            "history_csv": (
+                None if history_path is None else os.path.basename(history_path)
+            ),
+        }
+
 
 def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_chem):
-    """Build a deterministic HO mask for a split without exposing its targets.
-
-    Train and validation use the same protocol family, but different seeds and
-    different time segments.  The train mask is later passed as ``fixed_mask``
-    so its cells are excluded from the training reconstruction loss.
-    """
+    """Build a deterministic HO mask without exposing its targets."""
     observed_mask = np.asarray(observed_mask, dtype=bool)
     if mode == "anchor_constrained":
         return sample_anchor_constrained_heldout_mask(
             observed_mask, ratio=ratio, seed=seed, n_chem=n_chem
         )
-    return sample_dynamic_heldout_mask(
+    return sample_block_heldout_mask_to_ratio(
         observed_mask,
         {**dynamic_config, "target_ratio": ratio, "ensure_nonempty": True},
         seed=seed,
@@ -1233,6 +1479,7 @@ def train_from_config(
 
     dynamic_mask_config = {
         "mode": config.dynamic_masking_mode,
+        "scope": config.dynamic_mask_scope,
         "target_ratio": config.dynamic_mask_target_ratio,
         "mean_duration": config.dynamic_mask_mean_duration,
         "std_duration": config.dynamic_mask_std_duration,
@@ -1247,13 +1494,29 @@ def train_from_config(
     }
     train_fixed_mask = None
     train_selection_mask = None
+    selection_full = None
+    val_selection_mask = None
     # Held-out selection scores predictions against a ground-truth scalar, so
     # only real detections are eligible: a non-detect has no such value.
     observed_full = (~np.isnan(target_model_space)) & ~censor_full
     observed_train = (~np.isnan(train_target)) & ~train_censor
     observed_val = (~np.isnan(val_target)) & ~val_censor
 
-    if config.train_ho_enabled:
+    if full_data_validation and config.shared_full_heldout_mask:
+        # One global fixed mask serves both roles: it is excluded from the
+        # stage-one input/loss and scored by the validation loader. This is the
+        # research-repo protocol and works for both block and anchor masks.
+        selection_full = _make_fixed_ho_mask(
+            observed_full,
+            mode=config.selection_mask_mode,
+            ratio=config.selection_mask_ratio,
+            seed=config.selection_val_seed,
+            dynamic_config=dynamic_mask_config,
+            n_chem=n_chem,
+        )
+        train_fixed_mask = selection_full
+        val_selection_mask = selection_full
+    elif config.train_ho_enabled:
         train_selection_mask = _make_fixed_ho_mask(
             observed_train,
             mode=config.selection_mask_mode,
@@ -1268,40 +1531,24 @@ def train_from_config(
         # these values are hidden from both the input and the training loss.
         train_fixed_mask = train_selection_mask
 
-    if len(val_target):
-        if config.selection_mask_mode == "anchor_constrained":
-            if config.shared_full_heldout_mask:
-                selection_full = sample_anchor_constrained_heldout_mask(
-                    observed_full,
-                    ratio=config.selection_mask_ratio,
-                    seed=config.selection_val_seed,
-                    n_chem=n_chem,
-                )
-                if full_data_validation:
-                    train_fixed_mask = selection_full
-                    val_selection_mask = selection_full
-                else:
-                    train_fixed_mask = selection_full[:split_idx]
-                    val_selection_mask = selection_full[split_idx:]
-                if config.train_ho_enabled:
-                    train_selection_mask = train_fixed_mask
-            else:
-                val_selection_mask = sample_anchor_constrained_heldout_mask(
-                    observed_val,
-                    ratio=config.selection_mask_ratio,
-                    seed=config.selection_val_seed,
-                    n_chem=n_chem,
-                )
-        else:
-            val_selection_mask = sample_dynamic_heldout_mask(
-                observed_val,
-                {**dynamic_mask_config, "ensure_nonempty": True},
-                seed=config.selection_val_seed,
+    if val_selection_mask is None and len(val_target):
+        val_selection_mask = _make_fixed_ho_mask(
+            observed_val,
+            mode=config.selection_mask_mode,
+            ratio=config.selection_mask_ratio,
+            seed=config.selection_val_seed,
+            dynamic_config=dynamic_mask_config,
+            n_chem=n_chem,
+        )
+    if val_selection_mask is None:
+        if len(val_target):
+            raise ValueError(
+                "Validation target exists but no held-out selection mask was created"
             )
-    else:
-        val_selection_mask = None
-    if len(val_target) and val_selection_mask.sum() == 0:
-        raise ValueError("Validation split has no observed target positions for selection-HO validation")
+    elif val_selection_mask.sum() == 0:
+        raise ValueError(
+            "Validation split has no observed target positions for selection-HO validation"
+        )
 
     train_dataset = WindowedTimeSeriesDataset(
         train_target_scaled,
@@ -1360,8 +1607,7 @@ def train_from_config(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.train_loader_num_workers,
-        worker_init_fn=_seed_window_worker,
+        **_loader_options(config, config.train_loader_num_workers),
         generator=torch.Generator().manual_seed(config.seed),
     )
     train_ho_loader = (
@@ -1369,8 +1615,7 @@ def train_from_config(
             train_ho_dataset,
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=config.val_loader_num_workers,
-            worker_init_fn=_seed_window_worker,
+            **_loader_options(config, config.val_loader_num_workers),
         )
         if train_ho_dataset is not None
         else None
@@ -1380,8 +1625,7 @@ def train_from_config(
             val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=config.val_loader_num_workers,
-            worker_init_fn=_seed_window_worker,
+            **_loader_options(config, config.val_loader_num_workers),
         )
         if len(val_dataset) > 0
         else None
@@ -1409,6 +1653,12 @@ def train_from_config(
             f"observed cells held out with seed={config.train_ho_seed}, "
             f"ratio={config.train_ho_ratio}"
         )
+    if selection_full is not None:
+        print(
+            f"[graph-temporal-vae] global-HO: {int(selection_full.sum())} "
+            f"observed cells excluded from stage-one input/loss with "
+            f"seed={config.selection_val_seed}, ratio={config.selection_mask_ratio}"
+        )
     if censoring.active:
         fractions = censor_report["fractions"]
         print(
@@ -1432,6 +1682,86 @@ def train_from_config(
         train_ho_loader=train_ho_loader,
     )
     best_val = trainer.fit()
+    refit_summary = None
+    refit_history_path = None
+    refit_monitor_mask = None
+    if config.full_data_refit_epochs > 0:
+        # Stage two restores the global-HO cells to the loss and trains on the
+        # full timeline. A separate deterministic mask with the same shape
+        # family as dynamic training masks provides a stable, task-aligned
+        # monitor. It is not independent validation because its target values
+        # are included in full-data training.
+        full_target_scaled = scaler_target.transform(target_model_space)
+        full_target_scaled[np.isnan(target_model_space)] = np.nan
+        full_aux_scaled = (
+            scaler_aux.transform(aux_model_space) if aux_cols else aux_model_space
+        )
+        full_aux_mask = ~np.isnan(aux_model_space)
+        refit_monitor_seed = config.selection_val_seed + 2
+        refit_monitor_mask = sample_block_heldout_mask_to_ratio(
+            observed_full,
+            {**dynamic_mask_config, "ensure_nonempty": True},
+            seed=refit_monitor_seed,
+        )
+        if refit_monitor_mask.sum() == 0:
+            raise ValueError(
+                "Full-data refit monitor produced no observed held-out cells"
+            )
+
+        refit_dataset = WindowedTimeSeriesDataset(
+            full_target_scaled,
+            full_aux_scaled,
+            config.window_size,
+            config.stride,
+            mode="train",
+            denoise_prob=config.denoise_prob,
+            seed=config.seed + 1,
+            aux_mask=full_aux_mask,
+            aux_mask_channel=preprocessing.aux_mask_channel,
+            dynamic_mask_config=dynamic_mask_config,
+            fixed_mask=None,
+            censor_mask=censor_full,
+        )
+        refit_monitor_dataset = WindowedTimeSeriesDataset(
+            full_target_scaled,
+            full_aux_scaled,
+            config.window_size,
+            config.stride,
+            mode="val",
+            seed=config.seed + 1,
+            aux_mask=full_aux_mask,
+            aux_mask_channel=preprocessing.aux_mask_channel,
+            selection_mask=refit_monitor_mask,
+            censor_mask=censor_full,
+        )
+        refit_loader = DataLoader(
+            refit_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            **_loader_options(config, config.train_loader_num_workers),
+            generator=torch.Generator().manual_seed(config.seed + 1),
+        )
+        refit_monitor_loader = DataLoader(
+            refit_monitor_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            **_loader_options(config, config.val_loader_num_workers),
+        )
+        refit_history_path = os.path.splitext(save_path)[0] + "_refit_history.csv"
+        print(
+            "[graph-temporal-vae] full-data refit: restored "
+            f"{int(selection_full.sum())} global-HO cells, "
+            f"max_epochs={config.full_data_refit_epochs}, "
+            f"dynamic-HO monitor cells={int(refit_monitor_mask.sum())}, "
+            f"monitor_seed={refit_monitor_seed}"
+        )
+        refit_summary = trainer.refit_full_data(
+            refit_loader,
+            refit_monitor_loader,
+            history_path=refit_history_path,
+        )
+        refit_summary["monitor_seed"] = refit_monitor_seed
+        refit_summary["monitor_cells"] = int(refit_monitor_mask.sum())
 
     input_transforms = {
         "chemistry": preprocessing.chemistry.transform,
@@ -1481,6 +1811,28 @@ def train_from_config(
         ],
         "censoring_report": censor_report,
         "history_csv": os.path.basename(history_path),
+        "refit_history_csv": (
+            None
+            if refit_history_path is None
+            else os.path.basename(refit_history_path)
+        ),
+        "training_summary": {
+            "selection_metric": config.validation_metric,
+            "selection_best_value": float(best_val),
+            "selection_best_epoch": (
+                None if trainer.best_epoch is None else trainer.best_epoch + 1
+            ),
+            "selection_epochs_completed": trainer.epochs_completed,
+            "global_heldout_cells": (
+                None if selection_full is None else int(selection_full.sum())
+            ),
+            "global_heldout_seed": (
+                config.selection_val_seed
+                if selection_full is not None
+                else None
+            ),
+            "refit": refit_summary,
+        },
         "data_schema": data_schema.to_dict(),
         "data_interface": data_interface,
         "time_grid": {
@@ -1489,7 +1841,11 @@ def train_from_config(
             "policy": data_schema.time_grid_policy,
             "duplicate_timestamp_policy": data_schema.duplicate_timestamp_policy,
         },
-        "selection_mask_protocol": f"fixed_{config.selection_mask_mode}_ho",
+        "selection_mask_protocol": (
+            f"shared_full_fixed_{config.selection_mask_mode}_ho"
+            if selection_full is not None
+            else f"fixed_{config.selection_mask_mode}_ho"
+        ),
         "schema": {
             "target_cols": list(target_cols),
             "aux_value_cols": list(aux_cols),

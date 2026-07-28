@@ -50,6 +50,11 @@ class TrainConfig:
     patience: int = 15
     train_loader_num_workers: int = 0
     val_loader_num_workers: int = 0
+    # None selects True automatically on CUDA; set False for constrained
+    # systems. Workers are kept opt-in for backwards-compatible CPU runs.
+    pin_memory: Optional[bool] = None
+    persistent_workers: bool = True
+    loader_prefetch_factor: int = 2
     # Legacy point-drop augmentation. Dynamic contiguous HO masking is the
     # default training protocol; this can be kept at zero unless an additional
     # random point-drop signal is explicitly desired.
@@ -62,6 +67,9 @@ class TrainConfig:
     dynamic_mask_chem_blocks: int = 1
     dynamic_mask_psd_blocks: int = 1
     dynamic_masking_mode: str = "block"
+    # window preserves the historical per-window sampler. timeline_epoch
+    # samples once on absolute time per epoch so overlapping windows agree.
+    dynamic_mask_scope: str = "window"
     dynamic_random_point_drop_prob: float = 0.0
     selection_val_seed: int = 100003
     selection_mask_mode: str = "block"
@@ -75,6 +83,15 @@ class TrainConfig:
     train_ho_ratio: Optional[float] = None
     shared_full_heldout_mask: bool = False
     validation_metric: str = "ho_nll"
+    # Optional second phase for the global-HO protocol. Stage one selects a
+    # checkpoint while ``shared_full_heldout_mask`` is excluded from both the
+    # input and loss. Stage two restores every observed cell and continues
+    # training with dynamic masking. ``full_data_refit_patience=None`` runs the
+    # complete refit budget; an integer enables a practical (not independent)
+    # early-stop monitor on a deterministic dynamic-pattern HO mask.
+    full_data_refit_epochs: int = 0
+    full_data_refit_lr: Optional[float] = None
+    full_data_refit_patience: Optional[int] = None
     val_crps_mc_samples: int = 20
     val_crps_every_n_epochs: int = 1
     # If omitted, uncertainty evaluation follows the reconstruction
@@ -105,6 +122,13 @@ class TrainConfig:
     kl_cycles: int = 4
     kl_cycle_ratio: float = 0.5
     kl_max_beta: float = 1.0
+    # Free-bits floor (nats) per latent dimension: below this, a dimension's
+    # KL contributes no gradient, so beta can't drag q(z|x) all the way to
+    # the prior before the encoder/decoder have learned to use it. 0.0 keeps
+    # the historical unclamped behavior. This only affects the loss term --
+    # train_kl/val_kl in model_history.csv stay unclamped so collapse is
+    # still visible even once free-bits is in use.
+    kl_free_bits_nats: float = 0.0
     use_amp: bool = False
     amp_dtype: str = "auto"
     prior_type: str = "gaussian"
@@ -207,6 +231,10 @@ class TrainConfig:
             raise ValueError("amp_dtype must be auto, bfloat16, float16, or float32")
         if self.dynamic_masking_mode not in {"block", "legacy"}:
             raise ValueError("dynamic_masking_mode must be 'block' or 'legacy'")
+        if self.dynamic_mask_scope not in {"window", "timeline_epoch"}:
+            raise ValueError("dynamic_mask_scope must be 'window' or 'timeline_epoch'")
+        if self.dynamic_masking_mode == "legacy" and self.dynamic_mask_scope != "window":
+            raise ValueError("legacy dynamic masking only supports dynamic_mask_scope='window'")
         if not 0 <= self.dynamic_random_point_drop_prob <= 1:
             raise ValueError("dynamic_random_point_drop_prob must be in [0, 1]")
         if self.selection_mask_mode not in {"block", "anchor_constrained"}:
@@ -225,8 +253,35 @@ class TrainConfig:
             raise ValueError("at least one feature weight must be positive")
         if self.train_loader_num_workers < 0 or self.val_loader_num_workers < 0:
             raise ValueError("loader worker counts must be non-negative")
+        if self.loader_prefetch_factor < 1:
+            raise ValueError("loader_prefetch_factor must be positive")
         if not 0 <= self.val_fraction < 1:
             raise ValueError("val_fraction must be in [0, 1)")
+        if self.shared_full_heldout_mask and self.val_fraction != 0:
+            raise ValueError(
+                "shared_full_heldout_mask requires val_fraction=0 so one global "
+                "mask is used for both training exclusion and checkpoint selection"
+            )
+        if self.shared_full_heldout_mask and self.train_ho_enabled:
+            raise ValueError(
+                "shared_full_heldout_mask and train_ho_enabled are mutually exclusive"
+            )
+        if self.full_data_refit_epochs < 0:
+            raise ValueError("full_data_refit_epochs must be non-negative")
+        if self.full_data_refit_lr is not None and self.full_data_refit_lr <= 0:
+            raise ValueError("full_data_refit_lr must be positive")
+        if self.full_data_refit_patience is not None and self.full_data_refit_patience < 1:
+            raise ValueError("full_data_refit_patience must be positive")
+        if self.full_data_refit_epochs:
+            if not self.shared_full_heldout_mask or self.val_fraction != 0:
+                raise ValueError(
+                    "full-data refit requires shared_full_heldout_mask=true and "
+                    "val_fraction=0"
+                )
+        elif self.full_data_refit_patience is not None:
+            raise ValueError(
+                "full_data_refit_patience requires full_data_refit_epochs > 0"
+            )
         if self.val_crps_mc_samples < 2 or self.val_crps_every_n_epochs < 1:
             raise ValueError("CRPS validation requires at least 2 MC samples and a positive interval")
         if self.val_mc_batch_size < 1:
@@ -247,6 +302,8 @@ class TrainConfig:
             raise ValueError("kl_strategy must be linear, cosine, or cyclical")
         if self.kl_cycles < 1 or not 0 < self.kl_cycle_ratio <= 1:
             raise ValueError("kl_cycles must be positive and kl_cycle_ratio in (0, 1]")
+        if self.kl_free_bits_nats < 0:
+            raise ValueError("kl_free_bits_nats must be non-negative")
 
     @classmethod
     def from_json(cls, path):

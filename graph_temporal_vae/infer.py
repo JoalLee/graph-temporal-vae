@@ -270,6 +270,10 @@ def load_bundle(path, device=None):
         "schema": bundle.get("schema"),
         "model_kwargs": dict(bundle["model_kwargs"]),
         "training_config": training_config,
+        "training_summary": bundle.get("training_summary", {}),
+        "history_csv": bundle.get("history_csv"),
+        "refit_history_csv": bundle.get("refit_history_csv"),
+        "selection_mask_protocol": bundle.get("selection_mask_protocol"),
         "uncertainty_dist_type": uncertainty_dist_type,
         "timestamp_col": data_schema.timestamp_col,
         "time_grid": bundle.get("time_grid", {}),
@@ -678,6 +682,27 @@ def impute(
         position_weights=position_weights,
         quantiles=(lower_q, upper_q),
     )
+    # Same weighted overlap-add as mean_aggregator (a variance is fed through
+    # as a degenerate single-draw "sample"), tracked separately so the two
+    # uncertainty sources can be reported instead of only their sum. A large
+    # epistemic contribution can mask a collapsing aleatoric term in the total
+    # interval width -- these make that visible per cell instead of requiring
+    # it to be inferred indirectly from training-time calibration curves.
+    epistemic_aggregator = StreamingWindowAggregator(
+        total_length=n,
+        window_size=window_size,
+        n_features=len(target_cols),
+        position_weights=position_weights,
+        quantiles=(),
+    )
+    aleatoric_aggregator = StreamingWindowAggregator(
+        total_length=n,
+        window_size=window_size,
+        n_features=len(target_cols),
+        position_weights=position_weights,
+        quantiles=(),
+    )
+    has_aleatoric = None
 
     model.eval()
     with torch.no_grad():
@@ -728,14 +753,33 @@ def impute(
                 samples_scaled * scaler_target.std_[None, None, None, :]
                 + scaler_target.mean_[None, None, None, :]
             )
+            epistemic_var_scaled = result[1].cpu().numpy()
+            aleatoric_var_scaled = result[2]
+            if has_aleatoric is None:
+                has_aleatoric = aleatoric_var_scaled is not None
+            var_scale = scaler_target.std_[None, None, :] ** 2
+            epistemic_var_model = epistemic_var_scaled * var_scale
+            aleatoric_var_model = (
+                aleatoric_var_scaled.cpu().numpy() * var_scale if has_aleatoric else None
+            )
+
             for index, start in enumerate(batch_starts):
                 mean_aggregator.add(
                     start, pred_mean_model[index][None, :, :]
                 )
                 distribution_aggregator.add(start, samples_model[:, index])
+                epistemic_aggregator.add(
+                    start, epistemic_var_model[index][None, :, :]
+                )
+                if has_aleatoric:
+                    aleatoric_aggregator.add(
+                        start, aleatoric_var_model[index][None, :, :]
+                    )
 
     mean_agg = mean_aggregator.finish()
     dist_agg = distribution_aggregator.finish()
+    epistemic_agg = epistemic_aggregator.finish()
+    aleatoric_agg = aleatoric_aggregator.finish() if has_aleatoric else None
     # Non-detects are reported under the constraint that produced them, so the
     # mean and interval respect the detection limit instead of contradicting it.
     mean_model, variance_model, p_below_limit = truncate_below_limit(
@@ -746,6 +790,19 @@ def impute(
     )
     q_lower_out = quantiles_out[lower_q]
     q_upper_out = quantiles_out[upper_q]
+    # Same delta-method linearization point (mean_model) as the total std, so
+    # the two components are on the same footing and add up consistently.
+    # Not truncated for censored cells like the total variance is above: this
+    # is a diagnostic decomposition, not the reported predictive interval.
+    _, epistemic_std_out, _ = summary_to_output_scale(
+        mean_model, epistemic_agg["mean"], {}, output_transforms
+    )
+    if aleatoric_agg is not None:
+        _, aleatoric_std_out, _ = summary_to_output_scale(
+            mean_model, aleatoric_agg["mean"], {}, output_transforms
+        )
+    else:
+        aleatoric_std_out = np.full_like(epistemic_std_out, np.nan)
 
     # Restore observed values in the public/raw output space; there's no
     # imputation uncertainty there.  The input CSV may already be transformed
@@ -754,6 +811,8 @@ def impute(
     observed_output = observed_targets_to_output(target_raw, data_schema, preprocessing)
     mean_out = np.where(obs_mask_full == 1, observed_output, mean_out)
     std_out = np.where(obs_mask_full == 1, 0.0, std_out)
+    epistemic_std_out = np.where(obs_mask_full == 1, 0.0, epistemic_std_out)
+    aleatoric_std_out = np.where(obs_mask_full == 1, 0.0, aleatoric_std_out)
     q_lower_out = np.where(obs_mask_full == 1, observed_output, q_lower_out)
     q_upper_out = np.where(obs_mask_full == 1, observed_output, q_upper_out)
 
@@ -794,6 +853,13 @@ def impute(
             "is_imputed": obs_mask_full[:, j] == 0,
             "imputed_mean": mean_out[:, j],
             "imputed_std": std_out[:, j],
+            # Decomposition of imputed_std: epistemic (spread across resampled
+            # posterior draws) vs. aleatoric (the decoder's own per-draw
+            # variance). A large epistemic share can keep imputed_std adequate
+            # even while the aleatoric term is collapsing -- these let that be
+            # checked directly instead of inferred from training curves.
+            "epistemic_std": epistemic_std_out[:, j],
+            "aleatoric_std": aleatoric_std_out[:, j],
             "q_lower": q_lower_out[:, j],
             "q_upper": q_upper_out[:, j],
             "interval_lower": lower_q,
@@ -811,3 +877,74 @@ def impute(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         result_df.to_csv(output_path, index=False)
     return result_df
+
+
+def write_imputed_wide_outputs(result_df, output_dir, data_schema):
+    """Write imputed means and interval bounds in the original wide shape.
+
+    ``impute`` intentionally returns a tidy long-format table so uncertainty
+    and observation-state diagnostics remain attached to every cell.  This
+    helper projects the mean and the configured lower/upper predictive bounds
+    back to the two target modality contracts: one row per timestamp and one
+    column per feature.  Observed values are already restored by ``impute``;
+    censored and missing cells therefore use the model's constrained/imputed
+    summaries.
+    """
+    required = {"timestamp", "feature", "imputed_mean", "q_lower", "q_upper"}
+    missing = sorted(required - set(result_df.columns))
+    if missing:
+        raise ValueError(
+            f"Imputed result is missing columns required for wide output: {missing}"
+        )
+
+    key_columns = result_df[["timestamp", "feature"]]
+    if key_columns.duplicated().any():
+        raise ValueError("Imputed result contains duplicate (timestamp, feature) rows")
+
+    expected_features = list(data_schema.target_cols)
+    present_features = set(result_df["feature"])
+    missing_features = [feature for feature in expected_features if feature not in present_features]
+    if missing_features:
+        raise ValueError(
+            f"Imputed result is missing schema features: {missing_features[:5]}"
+        )
+    unexpected_features = sorted(present_features - set(expected_features))
+    if unexpected_features:
+        raise ValueError(
+            f"Imputed result contains features outside the schema: {unexpected_features[:5]}"
+        )
+
+    timestamps = pd.Index(pd.unique(result_df["timestamp"]), name=data_schema.timestamp_col)
+    wide_frames = {}
+    for summary_name in ("imputed_mean", "q_lower", "q_upper"):
+        summary = result_df.pivot(
+            index="timestamp", columns="feature", values=summary_name
+        )
+        summary = summary.reindex(index=timestamps, columns=expected_features)
+        if summary.isna().any().any():
+            missing_cells = int(summary.isna().sum().sum())
+            raise ValueError(
+                f"Imputed wide {summary_name} output is incomplete: "
+                f"{missing_cells} timestamp-feature cells are missing"
+            )
+        wide_frames[summary_name] = summary
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {}
+    for modality, columns in (
+        ("chem", list(data_schema.chemistry_cols)),
+        ("psd", list(data_schema.psd_cols)),
+    ):
+        if not columns:
+            continue
+        mean_frame = wide_frames["imputed_mean"].loc[:, columns].reset_index()
+        mean_path = output_dir / f"imputed_{modality}.csv"
+        mean_frame.to_csv(mean_path, index=False)
+        outputs[modality] = mean_path
+        for summary_name, suffix in (("q_lower", "lower"), ("q_upper", "upper")):
+            bound_frame = wide_frames[summary_name].loc[:, columns].reset_index()
+            bound_path = output_dir / f"imputed_{modality}_{suffix}.csv"
+            bound_frame.to_csv(bound_path, index=False)
+            outputs[f"{modality}_{suffix}"] = bound_path
+    return outputs

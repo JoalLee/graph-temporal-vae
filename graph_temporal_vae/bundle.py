@@ -86,5 +86,9 @@ def inspect_bundle(bundle):
                 "selection_mask_mode"
             ),
             "seed": loaded.get("training_config", {}).get("seed"),
+            "selection_mask_protocol": loaded.get("selection_mask_protocol"),
+            "history_csv": loaded.get("history_csv"),
+            "refit_history_csv": loaded.get("refit_history_csv"),
+            "summary": loaded.get("training_summary", {}),
         },
     }

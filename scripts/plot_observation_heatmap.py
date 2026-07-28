@@ -26,7 +26,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from matplotlib.colors import ListedColormap  # noqa: E402
+from matplotlib.colors import BoundaryNorm, ListedColormap  # noqa: E402
+from matplotlib.ticker import ScalarFormatter  # noqa: E402
 
 STATE_CODE = {"missing": 0, "observed": 1, "censored": 2}
 STATE_COLORS = ["#bdbdbd", "#74c476", "#fd8d3c"]  # missing, observed, censored
@@ -59,26 +60,33 @@ def load_state_grid(imputed_csv, modality):
 def plot(imputed_csv, modality, output_path):
     timestamps, features, codes = load_state_grid(imputed_csv, modality)
     cmap = ListedColormap(STATE_COLORS)
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
 
     height = max(5, 0.16 * len(features)) if modality == "chem" else 6
     fig, ax = plt.subplots(figsize=(12, height))
-    ax.imshow(codes.T, aspect="auto", cmap=cmap, vmin=-0.5, vmax=2.5, interpolation="none")
+    x = np.arange(len(timestamps))
+
+    if modality == "psd":
+        # A real log-scale axis, not an index-spaced one: pcolormesh draws
+        # each bin at its true diameter, so unequal bin spacing (e.g. the
+        # SMPS/APS changeover) is honest rather than visually compressed to
+        # uniform rows the way imshow would render it.
+        diameters = np.asarray([float(f) for f in features])
+        ax.pcolormesh(x, diameters, codes.T, cmap=cmap, norm=norm, shading="nearest")
+        ax.set_yscale("log")
+        ax.set_ylabel("particle diameter (nm)")
+        ax.yaxis.set_major_formatter(ScalarFormatter())
+        ax.ticklabel_format(axis="y", style="plain")
+    else:
+        ax.imshow(codes.T, aspect="auto", cmap=cmap, norm=norm, interpolation="none")
+        ax.set_yticks(range(len(features)))
+        ax.set_yticklabels(features, fontsize=6)
+        ax.set_ylabel("chemistry species")
 
     n_ticks = min(8, len(timestamps))
     tick_idx = np.linspace(0, len(timestamps) - 1, n_ticks, dtype=int)
     ax.set_xticks(tick_idx)
     ax.set_xticklabels([str(timestamps[i])[:10] for i in tick_idx], rotation=30, ha="right")
-
-    if modality == "psd":
-        ax.set_ylabel("particle diameter (nm)")
-        n_y = min(12, len(features))
-        y_idx = np.linspace(0, len(features) - 1, n_y, dtype=int)
-        ax.set_yticks(y_idx)
-        ax.set_yticklabels([f"{float(features[i]):.0f}" for i in y_idx])
-    else:
-        ax.set_yticks(range(len(features)))
-        ax.set_yticklabels(features, fontsize=6)
-        ax.set_ylabel("chemistry species")
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in STATE_COLORS]
     ax.legend(handles, ["missing", "observed", "censored"], loc="upper right",

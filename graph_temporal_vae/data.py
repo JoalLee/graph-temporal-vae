@@ -599,6 +599,119 @@ def sample_dynamic_heldout_mask(observed_mask, config=None, seed=0, rng=None):
     return heldout
 
 
+def sample_block_heldout_mask_to_ratio(
+    observed_mask, config=None, seed=0, rng=None, row_weights=None
+):
+    """Fill block masks to a cell quota independently for Chem and PSD.
+
+    This sampler operates on a complete timeline. It keeps drawing contiguous
+    time blocks until each target family reaches the requested fraction of
+    eligible observed cells. The last block may be shortened to limit quota
+    overshoot. Optional row weights let dynamic training target the effective
+    number of overlapping-window occurrences rather than only unique cells.
+    """
+    observed_mask = np.asarray(observed_mask, dtype=bool)
+    if observed_mask.ndim != 2:
+        raise ValueError(f"observed_mask must be 2-D, got shape {observed_mask.shape}")
+    config = dict(config or {})
+    rng = rng or np.random.default_rng(seed)
+    target_ratio = float(config.get("target_ratio", 0.10))
+    if not 0 <= target_ratio <= 1:
+        raise ValueError("target_ratio must be in [0, 1]")
+    if target_ratio <= 0 or not observed_mask.any():
+        return np.zeros_like(observed_mask, dtype=bool)
+    if target_ratio >= 1:
+        return observed_mask.copy()
+
+    length, n_features = observed_mask.shape
+    if row_weights is None:
+        row_weights = np.ones(length, dtype=np.float64)
+    else:
+        row_weights = np.asarray(row_weights, dtype=np.float64)
+        if row_weights.shape != (length,):
+            raise ValueError(f"row_weights must have shape ({length},)")
+        if not np.isfinite(row_weights).all() or (row_weights < 0).any():
+            raise ValueError("row_weights must be finite and non-negative")
+    cell_weights = row_weights[:, None]
+    mean_duration = float(config.get("mean_duration", 48))
+    std_duration = float(config.get("std_duration", 24))
+    min_duration = max(1, int(config.get("min_duration", 3)))
+    max_duration = max(min_duration, int(config.get("max_duration", 168)))
+    n_chem = min(max(0, int(config.get("n_chem", 0))), n_features)
+    heldout = np.zeros_like(observed_mask, dtype=bool)
+
+    def trim_to_remaining(candidate, remaining):
+        if float((candidate * cell_weights).sum()) <= remaining:
+            return candidate
+        active_rows = np.flatnonzero(candidate.any(axis=1))
+        if active_rows.size == 0:
+            return candidate
+        first, last = int(active_rows[0]), int(active_rows[-1])
+        row_counts = (
+            candidate[first:last + 1]
+            * cell_weights[first:last + 1]
+        ).sum(axis=1)
+        prefix_counts = np.cumsum(row_counts)
+        suffix_counts = np.cumsum(row_counts[::-1])
+        prefix_len = int(np.argmin(np.abs(prefix_counts - remaining))) + 1
+        suffix_len = int(np.argmin(np.abs(suffix_counts - remaining))) + 1
+        prefix_error = abs(float(prefix_counts[prefix_len - 1]) - remaining)
+        suffix_error = abs(float(suffix_counts[suffix_len - 1]) - remaining)
+        use_prefix = prefix_error < suffix_error or (
+            prefix_error == suffix_error and bool(rng.integers(0, 2))
+        )
+        trimmed = np.zeros_like(candidate)
+        if use_prefix:
+            trimmed[first:first + prefix_len] = candidate[first:first + prefix_len]
+        else:
+            start = last - suffix_len + 1
+            trimmed[start:last + 1] = candidate[start:last + 1]
+        return trimmed
+
+    def fill_family(columns, blocks_per_round):
+        if len(columns) == 0:
+            return
+        eligible = observed_mask[:, columns]
+        family_weights = cell_weights * eligible
+        eligible_weight = float(family_weights.sum())
+        if eligible_weight <= 0:
+            return
+        target_count = max(1.0, eligible_weight * target_ratio)
+        attempts = 0
+        max_attempts = max(1000, 20 * length)
+
+        def current_count():
+            return float((heldout[:, columns] * cell_weights).sum())
+
+        while current_count() < target_count and attempts < max_attempts:
+            for _ in range(max(1, blocks_per_round)):
+                attempts += 1
+                time_mask = _sample_block_mask(
+                    length, rng, mean_duration, std_duration,
+                    min_duration, max_duration,
+                )
+                candidate = time_mask[:, None] & eligible & ~heldout[:, columns]
+                if not candidate.any():
+                    if attempts >= max_attempts:
+                        break
+                    continue
+                current = current_count()
+                candidate = trim_to_remaining(candidate, target_count - current)
+                heldout[:, columns] |= candidate
+                if current_count() >= target_count:
+                    break
+
+    fill_family(np.arange(n_chem), int(config.get("chem_blocks", 1)))
+    fill_family(np.arange(n_chem, n_features), int(config.get("psd_blocks", 1)))
+
+    if config.get("ensure_nonempty", False) and heldout.sum() == 0:
+        observed_positions = np.argwhere(observed_mask)
+        if len(observed_positions):
+            row, col = observed_positions[int(rng.integers(len(observed_positions)))]
+            heldout[row, col] = True
+    return heldout
+
+
 def _observed_runs(mask_1d):
     indices = np.flatnonzero(np.asarray(mask_1d, dtype=bool))
     if indices.size == 0:
@@ -712,6 +825,12 @@ class WindowedTimeSeriesDataset(Dataset):
         self.denoise_prob = denoise_prob if mode == "train" else 0.0
         self.aux_mask_channel = bool(aux_mask_channel)
         self.dynamic_mask_config = dict(dynamic_mask_config or {}) if mode == "train" else None
+        self.dynamic_mask_scope = (
+            self.dynamic_mask_config.get("scope", "window")
+            if self.dynamic_mask_config else "window"
+        )
+        if self.dynamic_mask_scope not in {"window", "timeline_epoch"}:
+            raise ValueError("dynamic mask scope must be 'window' or 'timeline_epoch'")
         self.selection_mask = None if selection_mask is None else np.asarray(selection_mask, dtype=bool)
         if self.selection_mask is not None and self.selection_mask.shape != self.target.shape:
             raise ValueError("selection_mask must have the same shape as target")
@@ -725,10 +844,34 @@ class WindowedTimeSeriesDataset(Dataset):
         if self.censor_mask is not None and self.censor_mask.shape != self.target.shape:
             raise ValueError("censor_mask must have the same shape as target")
         self.starts = compute_window_starts(len(self.target), window_size, stride)
+        self.window_coverage = np.zeros(len(self.target), dtype=np.float64)
+        for start in self.starts:
+            self.window_coverage[start:start + self.window_size] += 1.0
+        self.seed = int(seed)
         self.rng = np.random.default_rng(seed)
+        self._timeline_dynamic_mask = None
+        if self.dynamic_mask_scope == "timeline_epoch":
+            self.set_epoch(0)
 
     def __len__(self):
         return len(self.starts)
+
+    def set_epoch(self, epoch):
+        """Create one absolute-time dynamic mask shared by every window."""
+        if not self.dynamic_mask_config or self.dynamic_mask_scope != "timeline_epoch":
+            return
+        eligible = ~np.isnan(self.target)
+        if self.fixed_mask is not None:
+            eligible &= ~self.fixed_mask
+        epoch_seed = int(
+            np.random.SeedSequence([self.seed, int(epoch)]).generate_state(1)[0]
+        )
+        self._timeline_dynamic_mask = sample_block_heldout_mask_to_ratio(
+            eligible,
+            self.dynamic_mask_config,
+            seed=epoch_seed,
+            row_weights=self.window_coverage,
+        )
 
     def __getitem__(self, idx):
         start = self.starts[idx]
@@ -770,9 +913,12 @@ class WindowedTimeSeriesDataset(Dataset):
             # Non-detects are droppable from the input too, so the model has
             # to predict "below the limit" from context rather than by
             # reading the substituted value back out.
-            dynamic_mask = sample_dynamic_heldout_mask(
-                known_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
-            ).astype(np.float32)
+            if self.dynamic_mask_scope == "timeline_epoch":
+                dynamic_mask = self._timeline_dynamic_mask[start:end].astype(np.float32)
+            else:
+                dynamic_mask = sample_dynamic_heldout_mask(
+                    known_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
+                ).astype(np.float32)
             # Held-out metrics need a ground-truth scalar, which a censored
             # cell does not have: score only the observed positions.
             heldout_mask = np.maximum(heldout_mask, dynamic_mask * obs_mask)

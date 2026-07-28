@@ -45,7 +45,11 @@ from graph_temporal_vae.api import validate_multimodal_data  # noqa: E402
 from graph_temporal_vae.bundle import inspect_bundle  # noqa: E402
 from graph_temporal_vae.config import TrainConfig  # noqa: E402
 from graph_temporal_vae.contracts import InferenceConfig  # noqa: E402
-from graph_temporal_vae.infer import impute  # noqa: E402
+from graph_temporal_vae.infer import (  # noqa: E402
+    impute,
+    load_bundle,
+    write_imputed_wide_outputs,
+)
 from graph_temporal_vae.train import train_from_config  # noqa: E402
 
 DEFAULT_MODALITIES = {
@@ -82,6 +86,7 @@ def apply_smoke_overrides(config_dict):
     """Shrink the run to a few epochs and a tiny model, keeping every code path."""
     config_dict.update(
         epochs=4, patience=4, lr_warmup_epochs=1, kl_warmup_epochs=2,
+        full_data_refit_epochs=2, full_data_refit_patience=2,
         model_kwargs={
             "latent_dim": 16, "hidden_dims": [32, 32], "encoder_layers": 2,
             "decoder_layers": 2, "n_graph_heads": 2, "dropout": 0.0,
@@ -111,7 +116,22 @@ def step_train(config, out_dir):
     log("2/3 training")
     bundle_path = out_dir / "model.pt"
     best_val = train_from_config(config, str(bundle_path))
-    log(f"    best validation metric ({config.validation_metric}) = {best_val:.4f}")
+    selection_label = (
+        "global-HO" if config.shared_full_heldout_mask else "validation"
+    )
+    log(
+        f"    best {selection_label} metric "
+        f"({config.validation_metric}) = {best_val:.4f}"
+    )
+    training_summary = load_bundle(bundle_path).get("training_summary", {})
+    refit = training_summary.get("refit")
+    if refit is not None:
+        log(
+            "    full-data refit: "
+            f"{refit['epochs_completed']} epoch(s), "
+            f"best dynamic_ho_mse={refit['best_monitor_mse']:.4f}, "
+            f"early_stopping={refit['early_stopping_enabled']}"
+        )
     (out_dir / "bundle.json").write_text(
         json.dumps(inspect_bundle(str(bundle_path)), indent=2, sort_keys=True, default=str)
     )
@@ -120,9 +140,10 @@ def step_train(config, out_dir):
 
 def step_impute(bundle_path, modality_files, out_dir, args):
     log("3/3 imputing")
+    bundle = load_bundle(bundle_path)
     result = impute(
         None,
-        str(bundle_path),
+        bundle,
         str(out_dir / "imputed_long.csv"),
         modality_files=modality_files,
         inference_config=InferenceConfig(
@@ -133,6 +154,13 @@ def step_impute(bundle_path, modality_files, out_dir, args):
             interval_upper=0.95,
         ),
     )
+    wide_outputs = write_imputed_wide_outputs(
+        result,
+        out_dir,
+        bundle["data_schema"],
+    )
+    for modality, path in wide_outputs.items():
+        log(f"    {modality} wide output: {path}")
     return result
 
 
@@ -179,6 +207,17 @@ def step_plots(bundle_path, out_dir):
         [sys.executable, str(REPO_ROOT / "scripts" / "plot_training_history.py"), str(history_csv)],
         [sys.executable, str(REPO_ROOT / "scripts" / "plot_feature_diagnostics.py"),
          str(bundle_path), str(imputed_csv)],
+    ]
+    # A run with full_data_refit_epochs > 0 writes a second, differently
+    # shaped history file for the refit stage; plot_training_history.py
+    # auto-detects it by its dynamic_ho_* columns.
+    refit_history_csv = bundle_path.with_name(bundle_path.stem + "_refit_history.csv")
+    if refit_history_csv.exists():
+        calls.append(
+            [sys.executable, str(REPO_ROOT / "scripts" / "plot_training_history.py"),
+             str(refit_history_csv)]
+        )
+    calls += [
         [sys.executable, str(REPO_ROOT / "scripts" / "plot_observation_heatmap.py"),
          str(imputed_csv), "--modality", "chem"],
         [sys.executable, str(REPO_ROOT / "scripts" / "plot_observation_heatmap.py"),
@@ -332,7 +371,15 @@ def main(argv=None):
     violations = summarize(result, out_dir)
 
     if not args.skip_heldout_eval:
-        step_heldout_eval(bundle_path, modality_files, out_dir, args)
+        bundle_training = load_bundle(bundle_path).get("training_config", {})
+        if int(bundle_training.get("full_data_refit_epochs", 0)) > 0:
+            log(
+                "held-out evaluation skipped: the final refit restored the "
+                "global-HO targets, so they are no longer independent; use "
+                "the stage-one training history for selection evidence"
+            )
+        else:
+            step_heldout_eval(bundle_path, modality_files, out_dir, args)
 
     if not args.no_plots:
         step_plots(bundle_path, out_dir)

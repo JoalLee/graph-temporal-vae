@@ -219,23 +219,25 @@ def censoring_report(
         "censored": int((state == STATE_CENSORED).sum()),
         "missing": int((state == STATE_MISSING).sum()),
     }
+    # Every target column, not just censored ones: a caller building a
+    # per-feature missingness table (e.g. to plot against held-out accuracy)
+    # needs an entry for columns like PSD bins that are never censored, or
+    # they silently read back as "0% missing" instead of missing entirely.
     per_column: Dict[str, Dict[str, float]] = {}
     thresholds = resolve_thresholds(schema, config)
     for index, column in enumerate(schema.target_cols):
         column_state = state[:, index]
-        censored_fraction = float((column_state == STATE_CENSORED).mean())
-        if censored_fraction == 0.0:
-            continue
         per_column[column] = {
-            "censored_fraction": censored_fraction,
+            "censored_fraction": float((column_state == STATE_CENSORED).mean()),
             "missing_fraction": float((column_state == STATE_MISSING).mean()),
             "threshold": float(thresholds[index]) if np.isfinite(thresholds[index]) else None,
         }
+    n_censored_columns = sum(1 for stats in per_column.values() if stats["censored_fraction"] > 0)
     return {
         "cells": total,
         "counts": counts,
         "fractions": {key: (value / total if total else 0.0) for key, value in counts.items()},
-        "n_censored_columns": len(per_column),
+        "n_censored_columns": n_censored_columns,
         "per_column": per_column,
     }
 

@@ -17,6 +17,7 @@ from graph_temporal_vae.data import (
     inverse_target_values,
     load_frame,
     load_modality_frame,
+    sample_block_heldout_mask_to_ratio,
     transform_target_values,
 )
 from graph_temporal_vae.preprocessing import (
@@ -427,6 +428,93 @@ def test_windowed_dataset_exposes_aux_missingness_and_dynamic_heldout_mask():
     assert heldout.shape == (8, 2)
     assert bool((heldout <= sample["obs_mask"].numpy()).all())
     assert bool((sample["input_mask"].numpy() == sample["obs_mask"].numpy() - heldout).all())
+
+
+def test_block_heldout_mask_reaches_ratio_for_each_target_family():
+    observed = np.ones((672, 10), dtype=bool)
+    config = {
+        "target_ratio": 0.15,
+        "mean_duration": 24,
+        "std_duration": 0,
+        "min_duration": 24,
+        "max_duration": 24,
+        "n_chem": 4,
+        "chem_blocks": 1,
+        "psd_blocks": 1,
+    }
+
+    heldout = sample_block_heldout_mask_to_ratio(observed, config, seed=100003)
+    repeated = sample_block_heldout_mask_to_ratio(observed, config, seed=100003)
+
+    assert np.array_equal(heldout, repeated)
+    assert bool((heldout <= observed).all())
+    assert heldout[:, :4].mean() == pytest.approx(0.15, abs=0.002)
+    assert heldout[:, 4:].mean() == pytest.approx(0.15, abs=0.002)
+    # A 15% quota on a 672-row timeline needs several 24-row blocks, not the
+    # single block that previously produced only a few percent held out.
+    assert np.flatnonzero(heldout[:, :4].any(axis=1)).size > 24
+    assert np.flatnonzero(heldout[:, 4:].any(axis=1)).size > 24
+
+
+def test_timeline_epoch_dynamic_mask_is_shared_by_overlapping_windows():
+    target = np.ones((32, 4), dtype=np.float32)
+    aux = np.zeros((32, 0), dtype=np.float32)
+    fixed = np.zeros_like(target, dtype=bool)
+    fixed[10:12, 0] = True
+    dataset = WindowedTimeSeriesDataset(
+        target,
+        aux,
+        window_size=8,
+        stride=4,
+        mode="train",
+        denoise_prob=0.0,
+        dynamic_mask_config={
+            "scope": "timeline_epoch",
+            "target_ratio": 0.25,
+            "mean_duration": 4,
+            "std_duration": 0,
+            "min_duration": 4,
+            "max_duration": 4,
+            "n_chem": 2,
+        },
+        fixed_mask=fixed,
+        seed=7,
+    )
+
+    def collect_absolute_masks():
+        seen = {}
+        for idx, start in enumerate(dataset.starts):
+            local = dataset[idx]["heldout_mask"].numpy().astype(bool)
+            for offset in range(dataset.window_size):
+                absolute_row = start + offset
+                if absolute_row in seen:
+                    assert np.array_equal(seen[absolute_row], local[offset])
+                else:
+                    seen[absolute_row] = local[offset].copy()
+        return np.stack([seen[row] for row in range(len(target))])
+
+    dataset.set_epoch(3)
+    epoch_three = collect_absolute_masks()
+    dynamic_three = dataset._timeline_dynamic_mask.copy()
+    dataset.set_epoch(3)
+    assert np.array_equal(epoch_three, collect_absolute_masks())
+    dataset.set_epoch(4)
+    epoch_four = collect_absolute_masks()
+
+    assert not np.array_equal(epoch_three, epoch_four)
+    assert not bool((dataset._timeline_dynamic_mask & fixed).any())
+    eligible = ~fixed
+    coverage = dataset.window_coverage[:, None]
+    chem_ratio = (
+        (dynamic_three[:, :2] * coverage).sum()
+        / (eligible[:, :2] * coverage).sum()
+    )
+    psd_ratio = (
+        (dynamic_three[:, 2:] * coverage).sum()
+        / (eligible[:, 2:] * coverage).sum()
+    )
+    assert chem_ratio == pytest.approx(0.25, abs=0.03)
+    assert psd_ratio == pytest.approx(0.25, abs=0.03)
 
 
 def test_windowed_dataset_val_uses_fixed_selection_mask():

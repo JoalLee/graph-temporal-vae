@@ -36,19 +36,13 @@
   "window_size": 48,
   "stride": 4,
   "val_fraction": 0.0,
-  "batch_size": 32,
-  "epochs": 600,
+  "batch_size": 16,
+  "epochs": 200,
   "lr": 0.001,
   "lr_min": 1e-06,
   "weight_decay": 1e-05,
-  "patience": 80,
-  "train_loader_num_workers": 2,
-  "val_loader_num_workers": 2,
-  "pin_memory": true,
-  "persistent_workers": true,
-  "loader_prefetch_factor": 2,
+  "patience": 200,
   "dynamic_masking_mode": "block",
-  "dynamic_mask_scope": "timeline_epoch",
   "dynamic_mask_target_ratio": 0.15,
   "dynamic_mask_mean_duration": 24.0,
   "dynamic_mask_std_duration": 12.0,
@@ -62,9 +56,9 @@
   "selection_val_seed": 100003,
   "shared_full_heldout_mask": true,
   "validation_metric": "ho_mse",
-  "full_data_refit_epochs": 100,
-  "full_data_refit_lr": 0.0001,
-  "full_data_refit_patience": 20,
+  "full_data_refit_epochs": 0,
+  "full_data_refit_lr": null,
+  "full_data_refit_patience": null,
   "use_adaptive_lr": true,
   "lr_reduce_factor": 0.5,
   "lr_reduce_patience": 25,
@@ -162,5 +156,6 @@
       "Zn": 6.7e-05,
       "Zr": 0.00033
     }
-  }
+  },
+  "kl_free_bits_nats": 0.5
 }

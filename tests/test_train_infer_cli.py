@@ -24,10 +24,12 @@ from graph_temporal_vae.infer import (
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
+    write_imputed_wide_outputs,
 )
 from graph_temporal_vae.model_graph_uq import ImputationVAE_Graph
 from graph_temporal_vae.train import (
     Trainer,
+    _loader_options,
     _student_t_nll,
     empirical_crps_components,
     masked_nll_components,
@@ -430,6 +432,52 @@ def test_train_then_impute_round_trip(tmp_path):
     assert gap_rows["observed"].isna().all()
     assert np.isfinite(gap_rows["imputed_mean"]).all()
     assert (gap_rows["imputed_std"] > 0).all()
+
+
+def test_write_imputed_wide_outputs_preserves_modality_schema(tmp_path):
+    from graph_temporal_vae.contracts import DataSchema
+
+    timestamps = pd.date_range("2024-01-01", periods=3, freq="h")
+    schema = DataSchema(
+        timestamp_col="time",
+        chemistry_cols=["SO2", "NO3-"],
+        psd_cols=["12.0", "100.0"],
+        psd_diameters_nm=[12.0, 100.0],
+    )
+    rows = []
+    for i, timestamp in enumerate(timestamps):
+        for j, feature in enumerate(schema.target_cols):
+            rows.append({
+                "timestamp": timestamp,
+                "feature": feature,
+                "imputed_mean": float(i * 10 + j),
+                "q_lower": float(i * 10 + j - 1),
+                "q_upper": float(i * 10 + j + 1),
+            })
+    result = pd.DataFrame(rows)
+
+    outputs = write_imputed_wide_outputs(result, tmp_path, schema)
+
+    chem = pd.read_csv(outputs["chem"])
+    psd = pd.read_csv(outputs["psd"])
+    chem_lower = pd.read_csv(outputs["chem_lower"])
+    chem_upper = pd.read_csv(outputs["chem_upper"])
+    psd_lower = pd.read_csv(outputs["psd_lower"])
+    psd_upper = pd.read_csv(outputs["psd_upper"])
+    assert list(chem.columns) == ["time", "SO2", "NO3-"]
+    assert list(psd.columns) == ["time", "12.0", "100.0"]
+    assert list(chem_lower.columns) == list(chem.columns)
+    assert list(chem_upper.columns) == list(chem.columns)
+    assert list(psd_lower.columns) == list(psd.columns)
+    assert list(psd_upper.columns) == list(psd.columns)
+    assert len(chem) == len(timestamps)
+    assert len(psd) == len(timestamps)
+    assert np.isfinite(chem.iloc[:, 1:].to_numpy()).all()
+    assert np.isfinite(psd.iloc[:, 1:].to_numpy()).all()
+    assert np.allclose(chem_lower.iloc[0, 1:].to_numpy(), [-1.0, 0.0])
+    assert np.allclose(chem_upper.iloc[0, 1:].to_numpy(), [1.0, 2.0])
+    assert np.allclose(psd_lower.iloc[0, 1:].to_numpy(), [1.0, 2.0])
+    assert np.allclose(psd_upper.iloc[0, 1:].to_numpy(), [3.0, 4.0])
 
 
 def _load_heldout_eval_module():
@@ -1029,6 +1077,46 @@ def test_heldout_validation_metric_accepts_mse():
     assert config.validation_metric == "ho_mse"
 
 
+def test_dynamic_mask_scope_validates_timeline_and_legacy_compatibility():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        dynamic_mask_scope="timeline_epoch",
+    )
+    assert config.dynamic_mask_scope == "timeline_epoch"
+
+    with pytest.raises(ValueError, match="dynamic_mask_scope"):
+        TrainConfig(
+            csv=["unused.csv"],
+            timestamp_col="time",
+            target_cols=["target"],
+            dynamic_mask_scope="invalid",
+        )
+    with pytest.raises(ValueError, match="legacy dynamic masking"):
+        TrainConfig(
+            csv=["unused.csv"],
+            timestamp_col="time",
+            target_cols=["target"],
+            dynamic_masking_mode="legacy",
+            dynamic_mask_scope="timeline_epoch",
+        )
+
+
+def test_timeline_epoch_loader_does_not_keep_stale_worker_dataset_copies():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        dynamic_mask_scope="timeline_epoch",
+        train_loader_num_workers=2,
+        persistent_workers=True,
+    )
+    options = _loader_options(config, 2)
+    assert options["persistent_workers"] is False
+    assert options["prefetch_factor"] == 2
+
+
 def test_train_ho_config_resolves_a_distinct_fixed_mask_seed_and_ratio():
     config = TrainConfig(
         csv=["unused.csv"],
@@ -1076,6 +1164,89 @@ def test_train_ho_metrics_are_recorded_from_cells_excluded_from_training_loss(tm
     for column in ("train_ho_nll", "train_ho_mse", "val_ho_nll", "val_ho_mse"):
         assert column in history.columns
         assert np.isfinite(history.loc[0, column])
+
+
+def test_full_data_refit_requires_the_global_ho_protocol():
+    common = {
+        "csv": ["unused.csv"],
+        "timestamp_col": "time",
+        "target_cols": ["target"],
+        "full_data_refit_epochs": 2,
+    }
+    with pytest.raises(ValueError, match="shared_full_heldout_mask"):
+        TrainConfig(**common)
+    with pytest.raises(ValueError, match="val_fraction=0"):
+        TrainConfig(
+            **common,
+            shared_full_heldout_mask=True,
+            val_fraction=0.2,
+        )
+
+    config = TrainConfig(
+        **common,
+        shared_full_heldout_mask=True,
+        val_fraction=0.0,
+        full_data_refit_lr=1e-4,
+        full_data_refit_patience=2,
+    )
+    assert config.full_data_refit_epochs == 2
+    assert config.full_data_refit_lr == pytest.approx(1e-4)
+    assert config.full_data_refit_patience == 2
+
+
+def test_global_ho_selection_then_full_data_refit_records_both_phases(tmp_path):
+    csv_path = tmp_path / "global_ho.csv"
+    _write_synthetic_csv(csv_path, n=64)
+    config = TrainConfig(
+        csv=[str(csv_path)],
+        timestamp_col="time",
+        target_cols=["target_a", "target_b"],
+        aux_cols=["ws", "at"],
+        window_size=8,
+        stride=8,
+        val_fraction=0.0,
+        batch_size=4,
+        epochs=1,
+        patience=1,
+        selection_mask_mode="block",
+        selection_mask_ratio=0.2,
+        shared_full_heldout_mask=True,
+        validation_metric="ho_mse",
+        dynamic_mask_target_ratio=0.2,
+        dynamic_mask_mean_duration=2.0,
+        dynamic_mask_std_duration=0.0,
+        dynamic_mask_min_duration=1,
+        dynamic_mask_max_duration=3,
+        full_data_refit_epochs=2,
+        full_data_refit_lr=1e-4,
+        full_data_refit_patience=None,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+        },
+    )
+    bundle_path = tmp_path / "global_ho.pt"
+    best_value = train_from_config(config, str(bundle_path))
+
+    assert np.isfinite(best_value)
+    selection_history = pd.read_csv(tmp_path / "global_ho_history.csv")
+    refit_history = pd.read_csv(tmp_path / "global_ho_refit_history.csv")
+    assert len(selection_history) == 1
+    assert len(refit_history) == 2
+    assert np.isfinite(refit_history["dynamic_ho_mse"]).all()
+
+    bundle = load_bundle(bundle_path)
+    summary = bundle["training_summary"]
+    assert bundle["selection_mask_protocol"] == "shared_full_fixed_block_ho"
+    assert summary["global_heldout_cells"] > 0
+    assert summary["selection_best_epoch"] == 1
+    assert summary["refit"]["epochs_completed"] == 2
+    assert summary["refit"]["early_stopping_enabled"] is False
+    assert summary["refit"]["monitor_metric"] == "dynamic_ho_mse"
+    assert summary["refit"]["monitor_cells"] > 0
 
 
 def test_26e_training_controls_are_serializable():
@@ -1170,7 +1341,7 @@ def test_feature_weights_are_applied_before_window_reduction():
     mu = torch.zeros((1, 1))
     logvar = torch.zeros((1, 1))
 
-    loss, recon, _ = vae_loss(
+    loss, recon, _, _ = vae_loss(
         recon_mean,
         None,
         target,
@@ -1222,7 +1393,7 @@ def test_student_t_window_feature_loss_uses_experiment_normalization():
     mu = torch.zeros((1, 1))
     logvar = torch.zeros((1, 1))
 
-    loss, recon, kl = vae_loss(
+    loss, recon, kl, _ = vae_loss(
         recon_mean,
         recon_logvar,
         target,

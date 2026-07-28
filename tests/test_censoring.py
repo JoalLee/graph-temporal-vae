@@ -197,7 +197,7 @@ def test_censored_term_pushes_prediction_below_the_limit():
     recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(2.0)
     censor_mask = torch.ones((1, 2, 2))
     threshold = torch.zeros(2)
-    loss, _, _ = vae_loss(
+    loss, _, _, _ = vae_loss(
         recon_mean, recon_logvar, target, torch.zeros((1, 2, 2)), mu, logvar, beta=0.0,
         censor_mask=censor_mask, censor_threshold=threshold,
     )
@@ -209,7 +209,7 @@ def test_student_t_censored_term_uses_student_t_cdf():
     recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(1.0)
     censor_mask = torch.ones((1, 2, 2))
     threshold = torch.zeros(2)
-    loss, _, _ = vae_loss(
+    loss, _, _, _ = vae_loss(
         recon_mean,
         recon_logvar,
         target,
@@ -233,7 +233,7 @@ def test_censored_term_is_cheaper_when_already_below_the_limit():
     losses = []
     for mean_value in (-3.0, 3.0):
         recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(mean_value)
-        loss, _, _ = vae_loss(
+        loss, _, _, _ = vae_loss(
             recon_mean, recon_logvar, target, torch.zeros((1, 2, 2)), mu, logvar, beta=0.0,
             censor_mask=censor_mask, censor_threshold=threshold,
         )
@@ -245,12 +245,12 @@ def test_censored_cells_do_not_pull_the_mean_toward_zero():
     """A non-detect must not be supervised as if it were an exact zero."""
     recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(-4.0)
     threshold = torch.zeros(2)
-    censored_loss, _, _ = vae_loss(
+    censored_loss, _, _, _ = vae_loss(
         recon_mean, recon_logvar, target, torch.zeros((1, 2, 2)), mu, logvar, beta=0.0,
         censor_mask=torch.ones((1, 2, 2)), censor_threshold=threshold,
     )
     recon_mean2, recon_logvar2, target2, mu2, logvar2 = _loss_inputs(-4.0)
-    as_observed_loss, _, _ = vae_loss(
+    as_observed_loss, _, _, _ = vae_loss(
         recon_mean2, recon_logvar2, target2, torch.ones((1, 2, 2)), mu2, logvar2, beta=0.0,
     )
     # Treating it as an observed zero penalizes a far-below-limit prediction
@@ -262,7 +262,7 @@ def test_nan_threshold_for_uncensored_features_does_not_poison_gradients():
     recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(1.0)
     censor_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
     threshold = torch.tensor([0.0, float("nan")])
-    loss, _, _ = vae_loss(
+    loss, _, _, _ = vae_loss(
         recon_mean, recon_logvar, target, torch.tensor([[[0.0, 1.0], [0.0, 1.0]]]),
         mu, logvar, beta=0.0, censor_mask=censor_mask, censor_threshold=threshold,
     )
@@ -274,8 +274,8 @@ def test_nan_threshold_for_uncensored_features_does_not_poison_gradients():
 def test_loss_is_unchanged_when_no_cell_is_censored():
     recon_mean, recon_logvar, target, mu, logvar = _loss_inputs(1.0)
     obs = torch.ones((1, 2, 2))
-    baseline, _, _ = vae_loss(recon_mean, recon_logvar, target, obs, mu, logvar, beta=0.5)
-    with_empty_censor, _, _ = vae_loss(
+    baseline, _, _, _ = vae_loss(recon_mean, recon_logvar, target, obs, mu, logvar, beta=0.5)
+    with_empty_censor, _, _, _ = vae_loss(
         recon_mean, recon_logvar, target, obs, mu, logvar, beta=0.5,
         censor_mask=torch.zeros((1, 2, 2)), censor_threshold=torch.zeros(2),
     )

@@ -85,42 +85,82 @@ def plot(predictions_csv, bundle_path, family, top_n, min_points, output_path):
         )
     availability = load_availability(bundle_path) if bundle_path else None
 
+    is_psd_only = family == "psd"
     ranked = metrics.sort_values("r2", ascending=False)
     shown = ranked.head(top_n) if len(ranked) > top_n else ranked
 
     has_scatter = availability is not None
     fig, axes = plt.subplots(
         1, 2 if has_scatter else 1,
-        figsize=(14 if has_scatter else 8, max(4, 0.26 * len(shown))),
+        figsize=(14 if has_scatter else 8, max(4, 0.26 * len(shown)) if not is_psd_only else 6),
         squeeze=False,
     )
 
     ax = axes[0][0]
-    colors = ["tab:blue" if f == "chem" else "tab:orange" for f in shown["family"]]
-    y = np.arange(len(shown))
-    ax.barh(y, shown["r2"], color=colors)
-    ax.set_yticks(y)
-    ax.set_yticklabels(shown.index, fontsize=7)
-    ax.invert_yaxis()
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("held-out $R^2$ (model space)")
+    if is_psd_only:
+        # A ranked bar chart scrambles particle diameter out of order; the
+        # physically meaningful question for PSD is whether accuracy varies
+        # smoothly with size (e.g. degrading at the SMPS/APS changeover), which
+        # only shows up plotted against diameter on its natural log axis.
+        diam = metrics.index.to_series().astype(float)
+        order = diam.argsort()
+        ax.plot(diam.iloc[order], metrics["r2"].iloc[order], "o-", color="tab:orange",
+               markersize=4, linewidth=1)
+        ax.set_xscale("log")
+        ax.set_xlabel("particle diameter (nm)")
+        ax.set_ylabel(r"held-out $R^2$ (model space)")
+        r2_all = metrics["r2"].to_numpy()
+        q1, q3 = np.nanpercentile(r2_all, [25, 75])
+        iqr = max(q3 - q1, 1e-6)
+        ax.set_ylim(min(q1 - 1.5 * iqr, -0.05), max(q3 + 1.5 * iqr, 0.05))
+    else:
+        colors = ["tab:blue" if f == "chem" else "tab:orange" for f in shown["family"]]
+        y = np.arange(len(shown))
+        ax.barh(y, shown["r2"], color=colors)
+        ax.set_yticks(y)
+        ax.set_yticklabels(shown.index, fontsize=7)
+        ax.invert_yaxis()
+        ax.set_xlabel("held-out $R^2$ (model space)")
+    ax.axhline(0, color="black", linewidth=0.8) if is_psd_only else ax.axvline(0, color="black", linewidth=0.8)
     ax.set_title(f"Per-feature held-out accuracy ({family})")
-    ax.grid(axis="x", alpha=0.3)
+    ax.grid(alpha=0.3)
 
     if has_scatter:
         ax = axes[0][1]
         joined = metrics.join(availability, how="inner")
+        # A single catastrophically-fit feature (R^2 in the millions-negative
+        # range, from a near-zero-variance held-out subset) would otherwise
+        # set the axis scale and flatten every other point to a line at 0.
+        # The full values are unaffected — this only clips the view.
+        # A percentile cut (e.g. 2nd/98th) still gets dragged by a handful of
+        # catastrophic points when they are orders of magnitude worse than the
+        # rest; a Tukey IQR fence is robust to exactly that.
+        r2_values = joined["r2"].to_numpy()
+        q1, q3 = np.nanpercentile(r2_values, [25, 75])
+        iqr = max(q3 - q1, 1e-6)
+        y_lo, y_hi = min(q1 - 1.5 * iqr, -0.05), max(q3 + 1.5 * iqr, 0.05)
+        n_clipped = int(((r2_values < y_lo) | (r2_values > y_hi)).sum())
+
         for fam, color in (("chem", "tab:blue"), ("psd", "tab:orange")):
             subset = joined[joined["family"] == fam]
             if len(subset):
-                ax.scatter(subset["unavailable_fraction"] * 100, subset["r2"],
-                           s=18, alpha=0.7, color=color, label=fam)
+                ax.scatter(subset["unavailable_fraction"] * 100,
+                          subset["r2"].clip(y_lo, y_hi),
+                          s=18, alpha=0.7, color=color, label=fam)
         ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel("censored + missing (% of cells)")
-        ax.set_ylabel("held-out $R^2$")
-        ax.set_title("Accuracy vs. data availability")
+        ax.set_ylabel("held-out $R^2$" + (" (clipped)" if n_clipped else ""))
+        title = "Accuracy vs. data availability"
+        ax.set_title(title + (f"  ({n_clipped} point(s) off-scale)" if n_clipped else ""))
         ax.legend(fontsize=8)
         ax.grid(alpha=0.3)
+        if n_clipped:
+            print(
+                f"{n_clipped} feature(s) fell outside the plotted R2 range "
+                f"[{y_lo:.3f}, {y_hi:.3f}] and are drawn at the edge; "
+                "see the CSV for their true values."
+            )
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -129,7 +169,10 @@ def plot(predictions_csv, bundle_path, family, top_n, min_points, output_path):
     negative = ranked[ranked["r2"] < 0]
     print(
         f"scored {len(ranked)} features | median R2 {ranked['r2'].median():.3f} | "
-        f"median PICP {ranked['picp'].median():.1f}% (target 95%)"
+        # heldout_eval.py's PICP is defined on q05/q95, i.e. a 90% nominal
+        # interval -- not 95%. Comparing against the wrong target hides a
+        # genuine 7-point over-coverage as if it were within 2 points of target.
+        f"median PICP {ranked['picp'].median():.1f}% (target 90%, from the 5-95% interval)"
     )
     if len(negative):
         # Negative R^2 means the prediction is worse than that feature's own

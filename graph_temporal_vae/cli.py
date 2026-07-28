@@ -82,6 +82,9 @@ def build_parser():
     train_p.add_argument("--patience", type=int, default=15)
     train_p.add_argument("--train-loader-num-workers", type=int, default=0)
     train_p.add_argument("--val-loader-num-workers", type=int, default=0)
+    train_p.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
+    train_p.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    train_p.add_argument("--loader-prefetch-factor", type=int, default=2)
     train_p.add_argument("--denoise-prob", type=float, default=0.0,
                          help="Optional extra random point-drop probability; dynamic HO masking is always enabled.")
     train_p.add_argument("--dynamic-mask-target-ratio", type=float, default=0.10)
@@ -92,6 +95,11 @@ def build_parser():
     train_p.add_argument("--dynamic-mask-chem-blocks", type=int, default=1)
     train_p.add_argument("--dynamic-mask-psd-blocks", type=int, default=1)
     train_p.add_argument("--dynamic-masking-mode", choices=["block", "legacy"], default="block")
+    train_p.add_argument(
+        "--dynamic-mask-scope",
+        choices=["window", "timeline_epoch"],
+        default="window",
+    )
     train_p.add_argument("--dynamic-random-point-drop-prob", type=float, default=0.0)
     train_p.add_argument("--selection-val-seed", type=int, default=100003)
     train_p.add_argument("--selection-mask-mode", choices=["block", "anchor_constrained"], default="block")
@@ -106,6 +114,26 @@ def build_parser():
         help="Training-period fixed-HO ratio; defaults to --selection-mask-ratio.",
     )
     train_p.add_argument("--shared-full-heldout-mask", action="store_true")
+    train_p.add_argument(
+        "--full-data-refit-epochs",
+        type=int,
+        default=0,
+        help="After global-HO checkpoint selection, restore every observed cell "
+             "and continue training for at most this many epochs.",
+    )
+    train_p.add_argument(
+        "--full-data-refit-lr",
+        type=float,
+        default=None,
+        help="Constant LR for full-data refit; defaults to max(lr_min, 0.1 * lr).",
+    )
+    train_p.add_argument(
+        "--full-data-refit-patience",
+        type=int,
+        default=None,
+        help="Optional practical early stopping on deterministic dynamic-HO MSE. "
+             "Omit to run the complete refit epoch budget.",
+    )
     train_p.add_argument(
         "--validation-metric", choices=["ho_nll", "ho_mse", "ho_crps"], default="ho_nll",
         help="Held-out selection metric for early stopping.",
@@ -348,6 +376,9 @@ def main(argv=None):
             patience=args.patience,
             train_loader_num_workers=args.train_loader_num_workers,
             val_loader_num_workers=args.val_loader_num_workers,
+            pin_memory=args.pin_memory,
+            persistent_workers=args.persistent_workers,
+            loader_prefetch_factor=args.loader_prefetch_factor,
             denoise_prob=args.denoise_prob,
             dynamic_mask_target_ratio=args.dynamic_mask_target_ratio,
             dynamic_mask_mean_duration=args.dynamic_mask_mean_duration,
@@ -357,6 +388,7 @@ def main(argv=None):
             dynamic_mask_chem_blocks=args.dynamic_mask_chem_blocks,
             dynamic_mask_psd_blocks=args.dynamic_mask_psd_blocks,
             dynamic_masking_mode=args.dynamic_masking_mode,
+            dynamic_mask_scope=args.dynamic_mask_scope,
             dynamic_random_point_drop_prob=args.dynamic_random_point_drop_prob,
             selection_val_seed=args.selection_val_seed,
             selection_mask_mode=args.selection_mask_mode,
@@ -365,6 +397,9 @@ def main(argv=None):
             train_ho_seed=args.train_ho_seed,
             train_ho_ratio=args.train_ho_ratio,
             shared_full_heldout_mask=args.shared_full_heldout_mask,
+            full_data_refit_epochs=args.full_data_refit_epochs,
+            full_data_refit_lr=args.full_data_refit_lr,
+            full_data_refit_patience=args.full_data_refit_patience,
             validation_metric=args.validation_metric,
             val_crps_mc_samples=args.val_crps_mc_samples,
             val_crps_every_n_epochs=args.val_crps_every_n_epochs,

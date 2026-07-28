@@ -56,7 +56,7 @@ from graph_temporal_vae.data import (
     load_modality_frame,
     make_condition,
     sample_anchor_constrained_heldout_mask,
-    sample_dynamic_heldout_mask,
+    sample_block_heldout_mask_to_ratio,
 )
 from graph_temporal_vae.infer import (
     load_bundle,
@@ -317,7 +317,7 @@ def main():
     # Reproduce the protocol the checkpoint was trained under; a mismatch here
     # silently scores a different set of cells than the run's own val metric.
     if mask_mode == "block":
-        heldout_mask = sample_dynamic_heldout_mask(
+        heldout_mask = sample_block_heldout_mask_to_ratio(
             obs_mask_full,
             {
                 "mode": "block",
