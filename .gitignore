@@ -33,6 +33,8 @@ logs/
 
 !examples/data/
 !examples/data/*.csv
+!examples/data/multimodal_demo/
+!examples/data/multimodal_demo/*.csv
 
 .agent/
 .agents/
@@ -40,3 +42,5 @@ logs/
 .gemini/
 .vscode/
 .idea/
+
+dev_log/

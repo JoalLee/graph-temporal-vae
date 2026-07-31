@@ -180,6 +180,9 @@ class StreamingWindowAggregator:
         output_shape = (self.total_length, self.n_features)
         self.mean = np.full(output_shape, np.nan, dtype=np.float64)
         self.variance = np.full(output_shape, np.nan, dtype=np.float64)
+        self.overlap_count = np.zeros(self.total_length, dtype=np.int64)
+        self.sample_count = np.zeros(self.total_length, dtype=np.int64)
+        self.effective_sample_size = np.full(self.total_length, np.nan, dtype=np.float64)
         self.quantile_values = {
             quantile: np.full(output_shape, np.nan, dtype=np.float64)
             for quantile in self.quantiles
@@ -246,9 +249,14 @@ class StreamingWindowAggregator:
             self._finalize_position(position)
 
     def _finalize_position(self, position: int) -> None:
-        values = np.concatenate(self._active_values.pop(position), axis=0)
-        weights = np.concatenate(self._active_weights.pop(position), axis=0)
+        value_chunks = self._active_values.pop(position)
+        weight_chunks = self._active_weights.pop(position)
+        values = np.concatenate(value_chunks, axis=0)
+        weights = np.concatenate(weight_chunks, axis=0)
         normalizer = weights.sum()
+        self.overlap_count[position] = len(value_chunks)
+        self.sample_count[position] = values.shape[0]
+        self.effective_sample_size[position] = normalizer ** 2 / np.sum(weights ** 2)
         self.mean[position] = np.sum(values * weights[:, None], axis=0) / normalizer
         self.variance[position] = np.maximum(
             np.sum(values * values * weights[:, None], axis=0) / normalizer
@@ -279,6 +287,9 @@ class StreamingWindowAggregator:
         result = {
             "mean": self.mean,
             "variance": self.variance,
+            "overlap_count": self.overlap_count,
+            "sample_count": self.sample_count,
+            "effective_sample_size": self.effective_sample_size,
             "quantiles": self.quantile_values,
             "peak_active_positions": self.peak_active_positions,
             "peak_active_values": self.peak_active_values,

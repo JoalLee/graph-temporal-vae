@@ -116,6 +116,7 @@ def fit_multimodal(
         expected_frequency=train_config.expected_frequency,
         time_grid_policy=train_config.time_grid_policy,
         duplicate_timestamp_policy=train_config.duplicate_timestamp_policy,
+        add_time_cyclical_features=train_config.add_time_cyclical_features,
     )
     best_validation = train_from_config(
         train_config,

@@ -1,4 +1,5 @@
 """Load a checkpoint bundle produced by `train.py` and impute new CSVs."""
+import json
 import math
 from pathlib import Path
 
@@ -623,6 +624,12 @@ def impute(
             duplicate_timestamp_policy=time_grid.get(
                 "duplicate_timestamp_policy", "error"
             ),
+            # New bundles store the canonical wind_u/wind_v schema and accept
+            # raw WS/WD at inference. Keep legacy raw-wind bundles unchanged.
+            canonicalize_wind=(
+                {"wind_u", "wind_v"}.issubset(data_schema.meteorology_cols)
+                and not {"WS", "WD"}.issubset(data_schema.meteorology_cols)
+            ),
         )
     n = len(frame)
     starts = compute_window_starts(n, window_size, stride)
@@ -780,6 +787,9 @@ def impute(
     dist_agg = distribution_aggregator.finish()
     epistemic_agg = epistemic_aggregator.finish()
     aleatoric_agg = aleatoric_aggregator.finish() if has_aleatoric else None
+    overlap_count = dist_agg["overlap_count"]
+    sample_count = dist_agg["sample_count"]
+    effective_sample_size = dist_agg["effective_sample_size"]
     # Non-detects are reported under the constraint that produced them, so the
     # mean and interval respect the detection limit instead of contradicting it.
     mean_model, variance_model, p_below_limit = truncate_below_limit(
@@ -851,6 +861,9 @@ def impute(
             ),
             "p_below_limit": p_below_limit[:, j],
             "is_imputed": obs_mask_full[:, j] == 0,
+            "overlap_window_count": overlap_count,
+            "raw_sample_count": sample_count,
+            "effective_sample_size": effective_sample_size,
             "imputed_mean": mean_out[:, j],
             "imputed_std": std_out[:, j],
             # Decomposition of imputed_std: epistemic (spread across resampled
@@ -948,3 +961,88 @@ def write_imputed_wide_outputs(result_df, output_dir, data_schema):
             bound_frame.to_csv(bound_path, index=False)
             outputs[f"{modality}_{suffix}"] = bound_path
     return outputs
+
+
+def write_imputation_manifest(
+    manifest_path,
+    *,
+    bundle_path,
+    input_paths,
+    output_format,
+    output_files,
+    inference_config,
+    bundle,
+    result_df,
+):
+    """Persist the resolved inference contract next to CLI outputs.
+
+    The manifest is deliberately about execution semantics, not a copy of the
+    entire checkpoint.  It records the effective window geometry, MC settings,
+    interval bounds, output paths, and the fact that intervals came from raw
+    generative samples with position-weighted overlap aggregation.  This makes
+    an output directory self-describing without changing the numerical
+    aggregation performed by :func:`impute`.
+    """
+    if isinstance(inference_config, dict):
+        inference_config = InferenceConfig.from_dict(inference_config)
+    if not isinstance(inference_config, InferenceConfig):
+        raise TypeError("inference_config must be InferenceConfig or a compatible mapping")
+
+    window_size = int(bundle["window_size"])
+    configured_stride = inference_config.stride
+    resolved_stride = configured_stride
+    if resolved_stride is None:
+        resolved_stride = bundle.get("stride") or max(1, window_size // 2)
+
+    inference = inference_config.to_dict()
+    inference["configured_stride"] = inference.pop("stride")
+    inference["resolved_stride"] = int(resolved_stride)
+    inference["window_size"] = window_size
+    aggregation_summary = {}
+    for column in (
+        "overlap_window_count",
+        "raw_sample_count",
+        "effective_sample_size",
+    ):
+        if column not in result_df:
+            continue
+        values = pd.to_numeric(result_df[column], errors="coerce").to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size:
+            aggregation_summary[column] = {
+                "min": float(np.min(values)),
+                "mean": float(np.mean(values)),
+                "max": float(np.max(values)),
+            }
+    manifest = {
+        "command": "impute",
+        "bundle": str(bundle_path),
+        "inputs": [str(path) for path in (input_paths or [])],
+        "output_format": output_format,
+        "outputs": {
+            str(name): str(path) for name, path in output_files.items()
+        },
+        "rows": int(result_df["timestamp"].nunique()),
+        "features": int(result_df["feature"].nunique()),
+        "target_columns": list(bundle["data_schema"].target_cols),
+        "interval": {
+            "lower": float(inference_config.interval_lower),
+            "upper": float(inference_config.interval_upper),
+        },
+        "inference": inference,
+        "uncertainty_distribution": bundle.get("uncertainty_dist_type", "gaussian"),
+        "aggregation": {
+            "method": "sample_position_weighted",
+            "sample_source": "raw_generative_samples",
+            "quantile": "weighted_empirical_quantile",
+            "position_weighting": "trapezoidal",
+            "overlap_aggregation": "streaming_overlap_add",
+            "summary": aggregation_summary,
+        },
+    }
+    manifest_path = Path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n"
+    )
+    return manifest_path

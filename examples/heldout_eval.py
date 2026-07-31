@@ -287,7 +287,20 @@ def main():
         if not args.csv:
             raise ValueError("Provide --csv or modality-specific CSV flags")
         csv_paths = [v.strip() for v in args.csv.split(",") if v.strip()]
-        frame = load_frame(csv_paths, ts_col, target_cols, aux_cols)
+        # New bundles store the research-compatible wind vector schema. Keep
+        # older bundles with raw WS/WD readable, while allowing a canonical
+        # bundle to evaluate directly from a raw legacy CSV.
+        canonicalize_wind = (
+            {"wind_u", "wind_v"}.issubset(aux_cols)
+            and not {"WS", "WD"}.issubset(aux_cols)
+        )
+        frame = load_frame(
+            csv_paths,
+            ts_col,
+            target_cols,
+            aux_cols,
+            canonicalize_wind=canonicalize_wind,
+        )
     n = len(frame)
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
     # Non-detects are not point observations: they have no ground-truth scalar
@@ -328,6 +341,7 @@ def main():
                 "max_duration": training_config.get("dynamic_mask_max_duration", 168),
                 "chem_blocks": training_config.get("dynamic_mask_chem_blocks", 1),
                 "psd_blocks": training_config.get("dynamic_mask_psd_blocks", 1),
+                "duration_source": training_config.get("dynamic_mask_duration_source", "parametric"),
                 "n_chem": n_chem,
                 "ensure_nonempty": True,
             },
@@ -336,6 +350,11 @@ def main():
     else:
         heldout_mask = sample_anchor_constrained_heldout_mask(
             obs_mask_full, ratio=ratio, seed=seed, n_chem=n_chem,
+            mean_duration=training_config.get("dynamic_mask_mean_duration", 48.0),
+            std_duration=training_config.get("dynamic_mask_std_duration", 24.0),
+            min_duration=training_config.get("dynamic_mask_min_duration", 3),
+            max_duration=training_config.get("dynamic_mask_max_duration", 168),
+            duration_source=training_config.get("dynamic_mask_duration_source", "parametric"),
         ).astype(bool)
     print(
         f"[heldout_eval] selection protocol: mode={mask_mode} ratio={ratio} seed={seed}"

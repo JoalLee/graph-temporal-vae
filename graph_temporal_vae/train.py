@@ -34,6 +34,7 @@ from .config import TrainConfig
 from .contracts import DataSchema
 from .data import (
     WindowedTimeSeriesDataset,
+    canonicalize_wind_column_names,
     chronological_split_index,
     load_frame,
     load_modality_frame,
@@ -1321,6 +1322,116 @@ def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_c
     )
 
 
+def _build_bundle(
+    *, trainer, config, model_kwargs, target_cols, aux_cols, preprocessing,
+    censoring, censor_threshold_scaled, censor_report, history_path,
+    refit_history_path, refit_summary, selection_full, best_val,
+    data_schema, data_interface, scaler_target, scaler_aux,
+):
+    """Assemble a loadable checkpoint bundle from the trainer's current weights.
+
+    Factored out so a stage-1 (pre-refit) checkpoint and the final (post-refit)
+    checkpoint can both be built from the same logic -- the only difference
+    between the two calls is which state_dict/refit fields are passed in.
+    """
+    input_transforms = {
+        "chemistry": preprocessing.chemistry.transform,
+        "psd": preprocessing.psd.transform,
+        "meteorology": preprocessing.meteorology.transform,
+    }
+    output_transforms = target_output_transforms(data_schema, preprocessing)
+    present_input_transforms = []
+    if data_schema.chemistry_cols:
+        present_input_transforms.append(input_transforms["chemistry"])
+    if data_schema.psd_cols:
+        present_input_transforms.append(input_transforms["psd"])
+    uniform_input_transform = (
+        present_input_transforms[0]
+        if len(set(present_input_transforms)) == 1
+        else "mixed"
+    )
+    uniform_output_transform = (
+        output_transforms[0]
+        if output_transforms and len(set(output_transforms)) == 1
+        else "mixed"
+    )
+    return {
+        "bundle_version": 3,
+        "architecture_version": 1,
+        "state_dict_format_version": 1,
+        "state_dict": trainer.model.state_dict(),
+        "model_kwargs": model_kwargs,
+        "target_cols": list(target_cols),
+        "aux_cols": list(aux_cols),
+        "window_size": config.window_size,
+        "stride": config.stride,
+        "aux_missing_mode": (
+            "mask_channel" if preprocessing.aux_mask_channel else "legacy_zero_fill"
+        ),
+        "aux_mask_channel": preprocessing.aux_mask_channel,
+        "target_transform": uniform_input_transform,
+        "target_output_transform": uniform_output_transform,
+        "target_output_transforms": output_transforms,
+        "preprocessing": preprocessing.to_dict(),
+        "censoring": censoring.to_dict(),
+        # Scaled-space limits so inference can flag non-detects and report
+        # P(y <= MDL) without re-deriving the transform chain.
+        "censor_threshold_scaled": [
+            None if not np.isfinite(value) else float(value)
+            for value in censor_threshold_scaled
+        ],
+        "censoring_report": censor_report,
+        "history_csv": os.path.basename(history_path),
+        "refit_history_csv": (
+            None
+            if refit_history_path is None
+            else os.path.basename(refit_history_path)
+        ),
+        "training_summary": {
+            "selection_metric": config.validation_metric,
+            "selection_best_value": float(best_val),
+            "selection_best_epoch": (
+                None if trainer.best_epoch is None else trainer.best_epoch + 1
+            ),
+            "selection_epochs_completed": trainer.epochs_completed,
+            "global_heldout_cells": (
+                None if selection_full is None else int(selection_full.sum())
+            ),
+            "global_heldout_seed": (
+                config.selection_val_seed
+                if selection_full is not None
+                else None
+            ),
+            "refit": refit_summary,
+        },
+        "data_schema": data_schema.to_dict(),
+        "data_interface": data_interface,
+        "time_grid": {
+            "frequency": data_schema.frequency,
+            "timezone": data_schema.timezone,
+            "policy": data_schema.time_grid_policy,
+            "duplicate_timestamp_policy": data_schema.duplicate_timestamp_policy,
+        },
+        "selection_mask_protocol": (
+            f"shared_full_fixed_{config.selection_mask_mode}_ho"
+            if selection_full is not None
+            else f"fixed_{config.selection_mask_mode}_ho"
+        ),
+        "schema": {
+            "target_cols": list(target_cols),
+            "aux_value_cols": list(aux_cols),
+            "aux_mask_cols": [f"{col}__observed" for col in aux_cols],
+            "target_dim": data_schema.target_dim,
+            "cond_dim": (
+                (2 if preprocessing.aux_mask_channel else 1) * data_schema.aux_dim
+            ),
+        },
+        "scaler_target": scaler_target.to_dict(),
+        "scaler_aux": scaler_aux.to_dict(),
+        "config": config.to_dict(),
+    }
+
+
 def train_from_config(
     config: TrainConfig,
     save_path: str,
@@ -1367,6 +1478,7 @@ def train_from_config(
             expected_frequency=config.expected_frequency,
             time_grid_policy=config.time_grid_policy,
             duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+            add_time_cyclical_features=config.add_time_cyclical_features,
         )
         configured_n_chem = model_kwargs.get("n_chem")
         if configured_n_chem is not None and int(configured_n_chem) != data_schema.n_chem:
@@ -1385,7 +1497,9 @@ def train_from_config(
             expected_frequency=config.expected_frequency,
             time_grid_policy=config.time_grid_policy,
             duplicate_timestamp_policy=config.duplicate_timestamp_policy,
+            canonicalize_wind=True,
         )
+        resolved_aux_cols = canonicalize_wind_column_names(config.aux_cols)
         n_chem = int(model_kwargs.get("n_chem", 0))
         if not 0 <= n_chem <= len(config.target_cols):
             raise ValueError("n_chem must be between 0 and the number of target columns")
@@ -1393,7 +1507,7 @@ def train_from_config(
             timestamp_col=config.timestamp_col,
             chemistry_cols=list(config.target_cols[:n_chem]),
             psd_cols=list(config.target_cols[n_chem:]),
-            meteorology_cols=list(config.aux_cols),
+            meteorology_cols=resolved_aux_cols,
             frequency=frame.attrs.get("frequency"),
             timezone=frame.attrs.get("timezone"),
             time_grid_policy=config.time_grid_policy,
@@ -1485,6 +1599,7 @@ def train_from_config(
         "std_duration": config.dynamic_mask_std_duration,
         "min_duration": config.dynamic_mask_min_duration,
         "max_duration": config.dynamic_mask_max_duration,
+        "duration_source": config.dynamic_mask_duration_source,
         "chem_blocks": config.dynamic_mask_chem_blocks,
         "psd_blocks": config.dynamic_mask_psd_blocks,
         "legacy_chem_blocks": 8,
@@ -1686,6 +1801,25 @@ def train_from_config(
     refit_history_path = None
     refit_monitor_mask = None
     if config.full_data_refit_epochs > 0:
+        # Snapshot the stage-1 (pre-refit) weights before refit touches them
+        # any further -- this is the only way to later ask "how much did
+        # stage 2 change predictions", since refit trains the model in place
+        # and nothing else preserves this exact state.
+        stage1_bundle = _build_bundle(
+            trainer=trainer, config=config, model_kwargs=model_kwargs,
+            target_cols=target_cols, aux_cols=aux_cols, preprocessing=preprocessing,
+            censoring=censoring, censor_threshold_scaled=censor_threshold_scaled,
+            censor_report=censor_report, history_path=history_path,
+            refit_history_path=None, refit_summary=None,
+            selection_full=selection_full, best_val=best_val,
+            data_schema=data_schema, data_interface=data_interface,
+            scaler_target=scaler_target, scaler_aux=scaler_aux,
+        )
+        stage1_save_path = os.path.splitext(save_path)[0] + "_stage1.pt"
+        stage1_out_dir = os.path.dirname(stage1_save_path)
+        if stage1_out_dir:
+            os.makedirs(stage1_out_dir, exist_ok=True)
+        torch.save(stage1_bundle, stage1_save_path)
         # Stage two restores the global-HO cells to the loss and trains on the
         # full timeline. A separate deterministic mask with the same shape
         # family as dynamic training masks provides a stable, task-aligned
@@ -1763,102 +1897,16 @@ def train_from_config(
         refit_summary["monitor_seed"] = refit_monitor_seed
         refit_summary["monitor_cells"] = int(refit_monitor_mask.sum())
 
-    input_transforms = {
-        "chemistry": preprocessing.chemistry.transform,
-        "psd": preprocessing.psd.transform,
-        "meteorology": preprocessing.meteorology.transform,
-    }
-    output_transforms = target_output_transforms(data_schema, preprocessing)
-    present_input_transforms = []
-    if data_schema.chemistry_cols:
-        present_input_transforms.append(input_transforms["chemistry"])
-    if data_schema.psd_cols:
-        present_input_transforms.append(input_transforms["psd"])
-    uniform_input_transform = (
-        present_input_transforms[0]
-        if len(set(present_input_transforms)) == 1
-        else "mixed"
+    bundle = _build_bundle(
+        trainer=trainer, config=config, model_kwargs=model_kwargs,
+        target_cols=target_cols, aux_cols=aux_cols, preprocessing=preprocessing,
+        censoring=censoring, censor_threshold_scaled=censor_threshold_scaled,
+        censor_report=censor_report, history_path=history_path,
+        refit_history_path=refit_history_path, refit_summary=refit_summary,
+        selection_full=selection_full, best_val=best_val,
+        data_schema=data_schema, data_interface=data_interface,
+        scaler_target=scaler_target, scaler_aux=scaler_aux,
     )
-    uniform_output_transform = (
-        output_transforms[0]
-        if output_transforms and len(set(output_transforms)) == 1
-        else "mixed"
-    )
-    bundle = {
-        "bundle_version": 3,
-        "architecture_version": 1,
-        "state_dict_format_version": 1,
-        "state_dict": trainer.model.state_dict(),
-        "model_kwargs": model_kwargs,
-        "target_cols": list(target_cols),
-        "aux_cols": list(aux_cols),
-        "window_size": config.window_size,
-        "stride": config.stride,
-        "aux_missing_mode": (
-            "mask_channel" if preprocessing.aux_mask_channel else "legacy_zero_fill"
-        ),
-        "aux_mask_channel": preprocessing.aux_mask_channel,
-        "target_transform": uniform_input_transform,
-        "target_output_transform": uniform_output_transform,
-        "target_output_transforms": output_transforms,
-        "preprocessing": preprocessing.to_dict(),
-        "censoring": censoring.to_dict(),
-        # Scaled-space limits so inference can flag non-detects and report
-        # P(y <= MDL) without re-deriving the transform chain.
-        "censor_threshold_scaled": [
-            None if not np.isfinite(value) else float(value)
-            for value in censor_threshold_scaled
-        ],
-        "censoring_report": censor_report,
-        "history_csv": os.path.basename(history_path),
-        "refit_history_csv": (
-            None
-            if refit_history_path is None
-            else os.path.basename(refit_history_path)
-        ),
-        "training_summary": {
-            "selection_metric": config.validation_metric,
-            "selection_best_value": float(best_val),
-            "selection_best_epoch": (
-                None if trainer.best_epoch is None else trainer.best_epoch + 1
-            ),
-            "selection_epochs_completed": trainer.epochs_completed,
-            "global_heldout_cells": (
-                None if selection_full is None else int(selection_full.sum())
-            ),
-            "global_heldout_seed": (
-                config.selection_val_seed
-                if selection_full is not None
-                else None
-            ),
-            "refit": refit_summary,
-        },
-        "data_schema": data_schema.to_dict(),
-        "data_interface": data_interface,
-        "time_grid": {
-            "frequency": data_schema.frequency,
-            "timezone": data_schema.timezone,
-            "policy": data_schema.time_grid_policy,
-            "duplicate_timestamp_policy": data_schema.duplicate_timestamp_policy,
-        },
-        "selection_mask_protocol": (
-            f"shared_full_fixed_{config.selection_mask_mode}_ho"
-            if selection_full is not None
-            else f"fixed_{config.selection_mask_mode}_ho"
-        ),
-        "schema": {
-            "target_cols": list(target_cols),
-            "aux_value_cols": list(aux_cols),
-            "aux_mask_cols": [f"{col}__observed" for col in aux_cols],
-            "target_dim": data_schema.target_dim,
-            "cond_dim": (
-                (2 if preprocessing.aux_mask_channel else 1) * data_schema.aux_dim
-            ),
-        },
-        "scaler_target": scaler_target.to_dict(),
-        "scaler_aux": scaler_aux.to_dict(),
-        "config": config.to_dict(),
-    }
     out_dir = os.path.dirname(save_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

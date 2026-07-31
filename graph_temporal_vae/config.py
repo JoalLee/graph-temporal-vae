@@ -37,6 +37,12 @@ class TrainConfig:
     expected_frequency: Optional[str] = None
     time_grid_policy: str = "strict"
     duplicate_timestamp_policy: str = "error"
+    # Appends hour/day-of-week/month sin-cos features (derived from the
+    # timestamp index) to the auxiliary conditioning input. Off by default;
+    # previously there was no time-of-day/seasonality signal reaching the
+    # model at all. Only supported with modality_files, not the legacy
+    # csv/target_cols/aux_cols interface.
+    add_time_cyclical_features: bool = False
 
     window_size: int = 48
     stride: int = 24
@@ -66,6 +72,14 @@ class TrainConfig:
     dynamic_mask_max_duration: int = 168
     dynamic_mask_chem_blocks: int = 1
     dynamic_mask_psd_blocks: int = 1
+    # "parametric" draws block duration from Normal(mean_duration,
+    # std_duration) -- a poor fit for the heavy-tailed, right-skewed gap
+    # lengths real sensor dropouts actually produce. "empirical" instead
+    # bootstraps duration from the real contiguous-NaN run lengths observed
+    # in that column's own data, so the synthetic mask's shape matches
+    # reality instead of a single mean/median summary statistic. Falls back
+    # to the parametric draw when a family has no real gaps to sample from.
+    dynamic_mask_duration_source: str = "parametric"
     dynamic_masking_mode: str = "block"
     # window preserves the historical per-window sampler. timeline_epoch
     # samples once on absolute time per epoch so overlapping windows agree.
@@ -174,6 +188,11 @@ class TrainConfig:
             overlap = sorted(set(self.target_cols) & set(self.aux_cols))
             if overlap:
                 raise ValueError(f"Columns cannot be both target and auxiliary: {overlap}")
+            if self.add_time_cyclical_features:
+                raise ValueError(
+                    "add_time_cyclical_features requires modality_files; "
+                    "it is not wired into the legacy csv/target_cols/aux_cols interface"
+                )
         for derived in ("target_dim", "aux_dim", "window_size"):
             self.model_kwargs.pop(derived, None)
         unknown_model_fields = set(self.model_kwargs) - ModelConfig.field_names()
@@ -235,6 +254,8 @@ class TrainConfig:
             raise ValueError("dynamic_mask_scope must be 'window' or 'timeline_epoch'")
         if self.dynamic_masking_mode == "legacy" and self.dynamic_mask_scope != "window":
             raise ValueError("legacy dynamic masking only supports dynamic_mask_scope='window'")
+        if self.dynamic_mask_duration_source not in {"parametric", "empirical"}:
+            raise ValueError("dynamic_mask_duration_source must be 'parametric' or 'empirical'")
         if not 0 <= self.dynamic_random_point_drop_prob <= 1:
             raise ValueError("dynamic_random_point_drop_prob must be in [0, 1]")
         if self.selection_mask_mode not in {"block", "anchor_constrained"}:

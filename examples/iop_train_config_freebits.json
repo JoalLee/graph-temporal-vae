@@ -157,5 +157,6 @@
       "Zr": 0.00033
     }
   },
-  "kl_free_bits_nats": 0.1
+  "kl_free_bits_nats": 0.1,
+  "dynamic_mask_duration_source": "empirical"
 }

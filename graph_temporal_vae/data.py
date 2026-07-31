@@ -13,10 +13,40 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .contracts import DataSchema, ModalityFiles, ModalityInputs
+from .contracts import TIME_CYCLICAL_COLS, DataSchema, ModalityFiles, ModalityInputs
 
 
 SUPPORTED_TARGET_TRANSFORMS = {"none", "log1p"}
+WIND_RAW_COLUMNS = ("WS", "WD")
+WIND_COMPONENT_COLUMNS = ("wind_u", "wind_v")
+WIND_ENCODING = "ws_wd_to_uv_v1"
+
+
+def compute_time_cyclical_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Hour/day-of-week/month sin-cos features derived from a timestamp index.
+
+    Column order matches ``TIME_CYCLICAL_COLS``. These are computed from the
+    timestamp only, so they are always fully observed and reproduce
+    identically at training and inference time -- unlike meteorology, there
+    is no gap to fill or mismatch to guard against.
+    """
+    hour_frac = index.hour + index.minute / 60.0
+    dow = index.dayofweek
+    month = index.month - 1
+    hour_angle = 2 * np.pi * hour_frac / 24.0
+    dow_angle = 2 * np.pi * dow / 7.0
+    month_angle = 2 * np.pi * month / 12.0
+    return pd.DataFrame(
+        {
+            "time_hour_sin": np.sin(hour_angle),
+            "time_hour_cos": np.cos(hour_angle),
+            "time_dow_sin": np.sin(dow_angle),
+            "time_dow_cos": np.cos(dow_angle),
+            "time_month_sin": np.sin(month_angle),
+            "time_month_cos": np.cos(month_angle),
+        },
+        index=index,
+    )[TIME_CYCLICAL_COLS]
 
 
 def transform_target_values(array, transform="none"):
@@ -138,6 +168,151 @@ def _read_tabular_source(source, *, header_only=False):
     return pd.read_csv(source, nrows=0 if header_only else None)
 
 
+def _matching_column(columns, wanted):
+    """Find one column by case-insensitive name, rejecting ambiguous headers."""
+    matches = [
+        column
+        for column in columns
+        if isinstance(column, str) and column.casefold() == wanted.casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple columns match {wanted!r}: {matches}")
+    return matches[0] if matches else None
+
+
+def canonicalize_wind_column_names(columns):
+    """Replace a raw ``WS``/``WD`` pair with the canonical ``wind_u``/``wind_v`` pair."""
+    columns = list(columns)
+    raw_speed = _matching_column(columns, WIND_RAW_COLUMNS[0])
+    raw_direction = _matching_column(columns, WIND_RAW_COLUMNS[1])
+    if raw_speed is None and raw_direction is None:
+        return columns
+    if raw_speed is None or raw_direction is None:
+        # Leave a one-sided pair untouched so generic datasets can still use a
+        # standalone WS or WD column. A schema that requires wind_u/wind_v will
+        # fail later with the normal missing-column error.
+        return columns
+
+    vector_u = _matching_column(columns, WIND_COMPONENT_COLUMNS[0])
+    vector_v = _matching_column(columns, WIND_COMPONENT_COLUMNS[1])
+    if vector_u is not None or vector_v is not None:
+        raise ValueError(
+            "Meteorology contains both raw WS/WD and derived wind_u/wind_v; "
+            "provide only one wind representation"
+        )
+
+    output = []
+    inserted = False
+    raw_columns = {raw_speed, raw_direction}
+    for column in columns:
+        if column in raw_columns:
+            if not inserted:
+                output.extend(WIND_COMPONENT_COLUMNS)
+                inserted = True
+        else:
+            output.append(column)
+    return output
+
+
+def canonicalize_wind_columns(frame, auxiliary_columns=None):
+    """Convert raw meteorological WS/WD values into circular-safe vector components.
+
+    The conversion follows the research pipeline's meteorological convention:
+    ``theta = (270 - WD)`` in mathematical-angle degrees, followed by
+    ``wind_u = WS*cos(theta)`` and ``wind_v = WS*sin(theta)``.  Only columns
+    named in ``auxiliary_columns`` are eligible for conversion, so a target
+    column with a coincidental name is never rewritten.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("frame must be a pandas DataFrame")
+    auxiliary_columns = list(frame.columns if auxiliary_columns is None else auxiliary_columns)
+    output_auxiliary_columns = canonicalize_wind_column_names(auxiliary_columns)
+    if output_auxiliary_columns == auxiliary_columns:
+        return frame
+
+    raw_speed = _matching_column(auxiliary_columns, WIND_RAW_COLUMNS[0])
+    raw_direction = _matching_column(auxiliary_columns, WIND_RAW_COLUMNS[1])
+    if raw_speed not in frame.columns or raw_direction not in frame.columns:
+        raise ValueError(
+            "WS/WD were requested as auxiliary columns but could not be found "
+            "in the loaded frame"
+        )
+
+    original_columns = list(frame.columns)
+    output = frame.copy()
+    speed = pd.to_numeric(output[raw_speed], errors="coerce").to_numpy(dtype=float)
+    direction = pd.to_numeric(output[raw_direction], errors="coerce").to_numpy(dtype=float)
+    direction_rad = np.deg2rad((270.0 - direction) % 360.0)
+    output[WIND_COMPONENT_COLUMNS[0]] = speed * np.cos(direction_rad)
+    output[WIND_COMPONENT_COLUMNS[1]] = speed * np.sin(direction_rad)
+
+    keep_columns = []
+    inserted = False
+    raw_columns = {raw_speed, raw_direction}
+    for column in original_columns:
+        if column in raw_columns:
+            if not inserted:
+                keep_columns.extend(WIND_COMPONENT_COLUMNS)
+                inserted = True
+        else:
+            keep_columns.append(column)
+    output = output.loc[:, keep_columns]
+    output.attrs = frame.attrs.copy()
+    output.attrs["wind_encoding"] = WIND_ENCODING
+    return output
+
+
+def _available_source_columns(csv_paths):
+    columns = []
+    for source in csv_paths:
+        table = _read_tabular_source(source, header_only=True)
+        for column in table.columns:
+            if column not in columns:
+                columns.append(column)
+    return columns
+
+
+def _resolve_wind_source_columns(csv_paths, target_cols, aux_cols):
+    """Resolve canonical wind requests to raw source aliases when necessary."""
+    aux_cols = list(aux_cols)
+    requested_u = _matching_column(aux_cols, WIND_COMPONENT_COLUMNS[0])
+    requested_v = _matching_column(aux_cols, WIND_COMPONENT_COLUMNS[1])
+    if requested_u is None or requested_v is None:
+        return aux_cols
+
+    # Do not reinterpret a raw pair that is explicitly part of the target.
+    if (
+        _matching_column(target_cols, WIND_RAW_COLUMNS[0]) is not None
+        or _matching_column(target_cols, WIND_RAW_COLUMNS[1]) is not None
+    ):
+        return aux_cols
+
+    available = _available_source_columns(csv_paths)
+    source_u = _matching_column(available, WIND_COMPONENT_COLUMNS[0])
+    source_v = _matching_column(available, WIND_COMPONENT_COLUMNS[1])
+    source_speed = _matching_column(available, WIND_RAW_COLUMNS[0])
+    source_direction = _matching_column(available, WIND_RAW_COLUMNS[1])
+    if source_u is not None or source_v is not None:
+        if source_speed is not None or source_direction is not None:
+            raise ValueError(
+                "Input sources contain both raw WS/WD and derived wind_u/wind_v"
+            )
+        return aux_cols
+    if source_speed is None or source_direction is None:
+        return aux_cols
+
+    return [
+        (
+            source_speed
+            if column == requested_u
+            else source_direction
+            if column == requested_v
+            else column
+        )
+        for column in aux_cols
+    ]
+
+
 def _prepare_timestamp_index(df, timestamp_col, source_label):
     if timestamp_col in df.columns:
         raw_timestamps = df[timestamp_col]
@@ -167,6 +342,7 @@ def load_frame(
     expected_frequency=None,
     time_grid_policy="strict",
     duplicate_timestamp_policy="error",
+    canonicalize_wind=False,
 ):
     """Load named time-series columns and enforce an explicit time-grid contract.
 
@@ -195,7 +371,12 @@ def load_frame(
             "duplicate_timestamp_policy must be 'error' or 'first'"
         )
 
-    required = target_cols + aux_cols
+    source_aux_cols = (
+        _resolve_wind_source_columns(csv_paths, target_cols, aux_cols)
+        if canonicalize_wind
+        else aux_cols
+    )
+    required = target_cols + source_aux_cols
     selected_frames = []
     sources = {}
     for source_index, source in enumerate(csv_paths):
@@ -279,9 +460,20 @@ def load_frame(
             merged = merged.reindex(full_index)
             merged.index.name = timestamp_col
 
+    resolved_aux_cols = (
+        canonicalize_wind_column_names(source_aux_cols)
+        if canonicalize_wind
+        else aux_cols
+    )
+    if canonicalize_wind:
+        merged = canonicalize_wind_columns(merged, source_aux_cols)
+    merged = merged[[*target_cols, *resolved_aux_cols]]
+
     merged.attrs["frequency"] = frequency.freqstr if frequency is not None else None
     merged.attrs["timezone"] = str(merged.index.tz) if merged.index.tz is not None else None
     merged.attrs["time_grid_policy"] = time_grid_policy
+    if canonicalize_wind and set(WIND_COMPONENT_COLUMNS).issubset(resolved_aux_cols):
+        merged.attrs["wind_encoding"] = WIND_ENCODING
     return merged
 
 
@@ -339,6 +531,7 @@ def load_modality_frame(
     expected_frequency=None,
     time_grid_policy="strict",
     duplicate_timestamp_policy="error",
+    add_time_cyclical_features=False,
 ):
     """Load Chem, PSD, and meteorology CSVs without manual column lists.
 
@@ -365,9 +558,10 @@ def load_modality_frame(
         files.psd, timestamp_col, "PSD"
     ) if files.psd else []
     psd_cols, psd_diameters = _resolve_psd_columns(psd_discovered) if psd_discovered else ([], [])
-    meteorology_cols = _discover_modality_columns(
+    meteorology_input_cols = _discover_modality_columns(
         files.meteorology, timestamp_col, "meteorology"
     ) if files.meteorology else []
+    canonicalize_wind = True
 
     if expected_schema is not None:
         if timestamp_col != expected_schema.timestamp_col:
@@ -375,6 +569,25 @@ def load_modality_frame(
                 f"timestamp_col={timestamp_col!r} does not match bundle schema "
                 f"{expected_schema.timestamp_col!r}"
             )
+        # Keep older bundles whose schema explicitly contains raw WS/WD
+        # readable. New schemas use wind_u/wind_v and accept either raw or
+        # already-derived input at inference time.
+        expected_uses_raw_wind = (
+            _matching_column(expected_schema.meteorology_cols, WIND_RAW_COLUMNS[0])
+            is not None
+            and _matching_column(expected_schema.meteorology_cols, WIND_RAW_COLUMNS[1])
+            is not None
+            and _matching_column(expected_schema.meteorology_cols, WIND_COMPONENT_COLUMNS[0])
+            is None
+            and _matching_column(expected_schema.meteorology_cols, WIND_COMPONENT_COLUMNS[1])
+            is None
+        )
+        canonicalize_wind = not expected_uses_raw_wind
+        meteorology_cols = (
+            canonicalize_wind_column_names(meteorology_input_cols)
+            if canonicalize_wind
+            else list(meteorology_input_cols)
+        )
         discovered_by_modality = {
             "chemistry": chemistry_cols,
             "psd": psd_cols,
@@ -401,6 +614,9 @@ def load_modality_frame(
         expected_frequency = expected_schema.frequency or expected_frequency
         time_grid_policy = expected_schema.time_grid_policy
         duplicate_timestamp_policy = expected_schema.duplicate_timestamp_policy
+        add_time_cyclical_features = expected_schema.add_time_cyclical_features
+    else:
+        meteorology_cols = canonicalize_wind_column_names(meteorology_input_cols)
 
     all_modality_columns = [*chemistry_cols, *psd_cols, *meteorology_cols]
     cross_modality_duplicates = sorted(
@@ -417,10 +633,11 @@ def load_modality_frame(
         files.all_sources,
         timestamp_col,
         target_cols,
-        meteorology_cols,
+        meteorology_input_cols,
         expected_frequency=expected_frequency,
         time_grid_policy=time_grid_policy,
         duplicate_timestamp_policy=duplicate_timestamp_policy,
+        canonicalize_wind=canonicalize_wind,
     )
     actual_timezone = frame.attrs.get("timezone")
     if expected_schema is not None and actual_timezone != expected_schema.timezone:
@@ -428,6 +645,8 @@ def load_modality_frame(
             "timezone does not match training schema: "
             f"expected={expected_schema.timezone!r}, actual={actual_timezone!r}"
         )
+    if add_time_cyclical_features:
+        frame = pd.concat([frame, compute_time_cyclical_features(frame.index)], axis=1)
     schema = DataSchema(
         timestamp_col=timestamp_col,
         chemistry_cols=chemistry_cols,
@@ -438,6 +657,7 @@ def load_modality_frame(
         time_grid_policy=time_grid_policy,
         duplicate_timestamp_policy=duplicate_timestamp_policy,
         psd_diameters_nm=psd_diameters,
+        add_time_cyclical_features=add_time_cyclical_features,
     )
     frame = frame[[*schema.target_cols, *schema.auxiliary_cols]]
     frame.attrs.update(
@@ -492,10 +712,41 @@ def make_condition(aux, aux_observed=None, use_mask_channel=True):
     return np.concatenate([values, aux_observed.astype(np.float32)], axis=-1)
 
 
-def _sample_block_mask(length, rng, mean_duration, std_duration, min_duration, max_duration):
+def _empirical_gap_durations(observed_mask):
+    """Real contiguous-missing run lengths (in rows), pooled across columns.
+
+    Sensor dropouts are heavy-tailed and right-skewed (many short blips, a
+    few long outages) -- no Normal(mean, std) draw can match that shape.
+    Bootstrapping straight from the real run lengths sidesteps picking a
+    single summary statistic entirely. Returns an empty array when the
+    column set has no missing runs (e.g. synthetic all-observed data), so
+    callers can fall back to the parametric draw.
+    """
+    observed_mask = np.asarray(observed_mask, dtype=bool)
+    durations = []
+    for col in range(observed_mask.shape[1]):
+        missing = (~observed_mask[:, col]).astype(np.int8)
+        if not missing.any():
+            continue
+        edges = np.diff(np.concatenate(([0], missing, [0])))
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1)
+        durations.extend((ends - starts).tolist())
+    return np.asarray(durations, dtype=np.int64)
+
+
+def _sample_block_mask(
+    length, rng, mean_duration, std_duration, min_duration, max_duration,
+    duration_pool=None,
+):
     if length <= 0:
         return np.zeros(0, dtype=bool)
-    duration = int(round(rng.normal(mean_duration, std_duration))) if std_duration else int(mean_duration)
+    if duration_pool is not None and len(duration_pool):
+        duration = int(rng.choice(duration_pool))
+    elif std_duration:
+        duration = int(round(rng.normal(mean_duration, std_duration)))
+    else:
+        duration = int(mean_duration)
     duration = max(int(min_duration), min(int(max_duration), duration, length))
     start = int(rng.integers(0, length - duration + 1))
     mask = np.zeros(length, dtype=bool)
@@ -563,16 +814,22 @@ def sample_dynamic_heldout_mask(observed_mask, config=None, seed=0, rng=None):
 
     heldout = np.zeros_like(observed_mask, dtype=bool)
 
+    use_empirical_duration = config.get("duration_source") == "empirical"
+
     def add_block(columns, count, per_feature, block_prob):
         nonlocal heldout
         if len(columns) == 0:
             return
+        duration_pool = (
+            _empirical_gap_durations(observed_mask[:, columns])
+            if use_empirical_duration else None
+        )
         for _ in range(count):
             if rng.random() >= min(max(block_prob, 0.0), 1.0):
                 continue
             time_mask = _sample_block_mask(
                 window_size, rng, mean_duration, std_duration,
-                min_duration, max_duration,
+                min_duration, max_duration, duration_pool=duration_pool,
             )
             if per_feature:
                 for col in columns:
@@ -679,6 +936,10 @@ def sample_block_heldout_mask_to_ratio(
         target_count = max(1.0, eligible_weight * target_ratio)
         attempts = 0
         max_attempts = max(1000, 20 * length)
+        duration_pool = (
+            _empirical_gap_durations(eligible)
+            if config.get("duration_source") == "empirical" else None
+        )
 
         def current_count():
             return float((heldout[:, columns] * cell_weights).sum())
@@ -688,7 +949,7 @@ def sample_block_heldout_mask_to_ratio(
                 attempts += 1
                 time_mask = _sample_block_mask(
                     length, rng, mean_duration, std_duration,
-                    min_duration, max_duration,
+                    min_duration, max_duration, duration_pool=duration_pool,
                 )
                 candidate = time_mask[:, None] & eligible & ~heldout[:, columns]
                 if not candidate.any():
@@ -723,7 +984,8 @@ def _observed_runs(mask_1d):
 
 def _sample_anchor_constrained_series(observed_1d, target_count, rng,
                                       mean_duration=48.0, std_duration=24.0,
-                                      min_duration=3, max_duration=168):
+                                      min_duration=3, max_duration=168,
+                                      duration_pool=None):
     available = np.asarray(observed_1d, dtype=bool).copy()
     heldout = np.zeros_like(available, dtype=bool)
     target_count = int(target_count)
@@ -732,9 +994,12 @@ def _sample_anchor_constrained_series(observed_1d, target_count, rng,
     while current < target_count and attempts < 200_000:
         attempts += 1
         remaining = target_count - current
-        duration = int(np.clip(
-            rng.normal(mean_duration, std_duration), min_duration, max_duration
-        ))
+        if duration_pool is not None and len(duration_pool):
+            duration = int(np.clip(rng.choice(duration_pool), min_duration, max_duration))
+        else:
+            duration = int(np.clip(
+                rng.normal(mean_duration, std_duration), min_duration, max_duration
+            ))
         if remaining < min_duration or current + duration > target_count:
             duration = remaining
         candidates = []
@@ -758,11 +1023,22 @@ def _sample_anchor_constrained_series(observed_1d, target_count, rng,
     return heldout
 
 
-def sample_anchor_constrained_heldout_mask(observed_mask, ratio=0.10, seed=42, n_chem=None):
+def sample_anchor_constrained_heldout_mask(
+    observed_mask, ratio=0.10, seed=42, n_chem=None,
+    mean_duration=48.0, std_duration=24.0, min_duration=3, max_duration=168,
+    duration_source="parametric",
+):
     """Generate 26e-style held-out gaps bounded by observed anchors.
 
     Chemistry is sampled per feature. PSD-like features share time gaps and
     require every PSD feature to be observed at the candidate timestamps.
+
+    ``duration_source="empirical"`` bootstraps gap duration from each
+    family's own real contiguous-missing run lengths instead of drawing from
+    Normal(mean_duration, std_duration) -- see ``_empirical_gap_durations``
+    for why a single mean/std can't represent real, heavy-tailed gap
+    statistics. Falls back to the parametric draw when a family has no real
+    gaps to bootstrap from.
     """
     observed_mask = np.asarray(observed_mask, dtype=bool)
     if observed_mask.ndim != 2:
@@ -771,17 +1047,32 @@ def sample_anchor_constrained_heldout_mask(observed_mask, ratio=0.10, seed=42, n
     n_chem = n_features if n_chem is None else min(max(int(n_chem), 0), n_features)
     rng = np.random.default_rng(seed)
     heldout = np.zeros_like(observed_mask, dtype=bool)
+    use_empirical = duration_source == "empirical"
+    duration_kwargs = dict(
+        mean_duration=mean_duration, std_duration=std_duration,
+        min_duration=min_duration, max_duration=max_duration,
+    )
 
+    chem_pool = (
+        _empirical_gap_durations(observed_mask[:, :n_chem])
+        if use_empirical and n_chem > 0 else None
+    )
     for feature in range(n_chem):
         observed_count = int(observed_mask[:, feature].sum())
         heldout[:, feature] = _sample_anchor_constrained_series(
-            observed_mask[:, feature], int(observed_count * ratio), rng
+            observed_mask[:, feature], int(observed_count * ratio), rng,
+            duration_pool=chem_pool, **duration_kwargs,
         )
 
     if n_chem < n_features:
         psd_observed = observed_mask[:, n_chem:].all(axis=1)
+        psd_pool = (
+            _empirical_gap_durations(observed_mask[:, n_chem:])
+            if use_empirical else None
+        )
         heldout_time = _sample_anchor_constrained_series(
-            psd_observed, int(psd_observed.sum() * ratio), rng
+            psd_observed, int(psd_observed.sum() * ratio), rng,
+            duration_pool=psd_pool, **duration_kwargs,
         )
         heldout[np.ix_(heldout_time, np.arange(n_chem, n_features))] = True
     return heldout

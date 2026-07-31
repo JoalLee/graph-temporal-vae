@@ -1,6 +1,8 @@
 """`graph-temporal-vae train` / `graph-temporal-vae impute` command-line entry point."""
 import argparse
 import json
+import sys
+from pathlib import Path
 
 from .api import validate_multimodal_data
 from .bundle import inspect_bundle
@@ -12,14 +14,50 @@ from .contracts import (
     ModalityPreprocessing,
     PreprocessingConfig,
 )
-from .data import load_frame, load_modality_frame
-from .infer import impute as run_impute, load_bundle
+from .data import canonicalize_wind_column_names, load_frame, load_modality_frame
+from .infer import (
+    impute as run_impute,
+    load_bundle,
+    write_imputation_manifest,
+    write_imputed_wide_outputs,
+)
 from .model_config import ModelConfig
 from .train import train_from_config
 
 
 def _csv_list(value):
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _present_long_options(argv):
+    """Return long option names explicitly present in the raw CLI arguments."""
+    return {
+        token.split("=", 1)[0]
+        for token in argv
+        if token.startswith("--")
+    }
+
+
+def _reject_config_overrides(
+    parser,
+    argv,
+    *,
+    config_option,
+    allowed_options=(),
+    conflict_options=None,
+):
+    """Reject settings that would otherwise be silently ignored by a config file."""
+    present = _present_long_options(argv)
+    if conflict_options is None:
+        conflicts = present - set(allowed_options)
+    else:
+        conflicts = present & set(conflict_options)
+    if conflicts:
+        parser.error(
+            f"{config_option} cannot be combined with CLI overrides: "
+            f"{', '.join(sorted(conflicts))}. "
+            "Put these settings in the config file or remove the config option."
+        )
 
 
 def build_parser():
@@ -29,7 +67,7 @@ def build_parser():
     train_p = sub.add_parser("train", help="Train a model and save a checkpoint bundle.")
     train_p.add_argument(
         "--train-config", default=None,
-        help="JSON file accepted by TrainConfig; when provided, other train settings are ignored.",
+        help="JSON file accepted by TrainConfig; cannot be combined with individual train flags.",
     )
     train_p.add_argument(
         "--csv", default=None,
@@ -212,7 +250,7 @@ def build_parser():
     infer_p.add_argument("--bundle", required=True)
     infer_p.add_argument(
         "--inference-config", default=None,
-        help="Optional JSON file accepted by InferenceConfig.",
+        help="Optional JSON file accepted by InferenceConfig; cannot be combined with runtime sampling flags.",
     )
     infer_p.add_argument("--csv", default=None, help="Legacy comma-separated CSV path(s).")
     infer_p.add_argument("--chem-csv", default=None)
@@ -233,7 +271,26 @@ def build_parser():
         default=72,
         help="Rows on each side used for operational gap-support diagnostics.",
     )
-    infer_p.add_argument("-o", "--output", required=True)
+    infer_p.add_argument(
+        "--output-format",
+        choices=["tidy", "wide", "both"],
+        default="tidy",
+        help="Write the uncertainty-rich tidy table, modality-wide files, or both.",
+    )
+    infer_p.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for wide outputs and run_manifest.json; defaults tidy output to imputed_long.csv.",
+    )
+    infer_p.add_argument(
+        "--manifest",
+        default=None,
+        help="Optional path for the resolved run manifest; defaults to <output-dir>/run_manifest.json.",
+    )
+    infer_p.add_argument(
+        "-o", "--output", required=False, default=None,
+        help="Tidy CSV path; defaults to <output-dir>/imputed_long.csv when --output-dir is set.",
+    )
 
     inspect_p = sub.add_parser(
         "inspect-bundle", help="Validate and summarize a checkpoint bundle."
@@ -273,6 +330,31 @@ def _modality_files_from_args(args):
     if not chemistry and not psd and not meteorology:
         return None
     return ModalityFiles(chemistry=chemistry, psd=psd, meteorology=meteorology)
+
+
+def _resolve_impute_outputs(parser, args):
+    """Resolve mutually clear output paths for the impute command."""
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    if args.output_format in {"wide", "both"} and output_dir is None:
+        parser.error("--output-format wide/both requires --output-dir")
+    if args.output_format == "wide" and args.output:
+        parser.error("--output cannot be used with --output-format wide; use both instead")
+
+    if args.output_format == "wide":
+        output_csv = None
+    elif args.output:
+        output_csv = Path(args.output)
+    elif output_dir is not None:
+        output_csv = output_dir / "imputed_long.csv"
+    else:
+        parser.error("tidy output requires -o/--output or --output-dir")
+
+    manifest_path = None
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+    elif output_dir is not None:
+        manifest_path = output_dir / "run_manifest.json"
+    return output_dir, output_csv, manifest_path
 
 
 def _preprocessing_from_args(args):
@@ -339,10 +421,17 @@ def _model_kwargs_from_args(args, *, include_n_chem=True):
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
 
     if args.command == "train":
         if args.train_config:
+            _reject_config_overrides(
+                parser,
+                raw_argv,
+                config_option="--train-config",
+                allowed_options={"--train-config", "--output"},
+            )
             config = TrainConfig.from_json(args.train_config)
             best_val = train_from_config(config, args.output)
             print(f"saved checkpoint bundle to {args.output} (best val loss={best_val:.4f})")
@@ -438,7 +527,22 @@ def main(argv=None):
             parser.error("Use modality CSV flags or legacy --csv, not both")
         if modality_files is None and not args.csv:
             parser.error("Provide --csv or modality-specific CSV flags")
+        output_dir, output_csv, manifest_path = _resolve_impute_outputs(parser, args)
         if args.inference_config:
+            _reject_config_overrides(
+                parser,
+                raw_argv,
+                config_option="--inference-config",
+                conflict_options={
+                    "--stride",
+                    "--n-mc-samples",
+                    "--interval-lower",
+                    "--interval-upper",
+                    "--inference-batch-size",
+                    "--mc-batch-size",
+                    "--support-context-window",
+                },
+            )
             with open(args.inference_config) as handle:
                 inference_config = InferenceConfig.from_dict(json.load(handle))
         else:
@@ -451,15 +555,46 @@ def main(argv=None):
                 interval_upper=args.interval_upper,
                 support_context_window=args.support_context_window,
             )
-        run_impute(
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        bundle = load_bundle(args.bundle)
+        result = run_impute(
             _csv_list(args.csv) if args.csv else None,
-            args.bundle,
-            args.output,
+            bundle,
+            str(output_csv) if output_csv is not None else None,
             timestamp_col=args.timestamp_col,
             modality_files=modality_files,
             inference_config=inference_config,
         )
-        print(f"wrote imputed output to {args.output}")
+        output_files = {}
+        if output_csv is not None:
+            output_files["tidy"] = output_csv
+        if args.output_format in {"wide", "both"}:
+            output_files.update(
+                write_imputed_wide_outputs(result, output_dir, bundle["data_schema"])
+            )
+        if manifest_path is not None:
+            write_imputation_manifest(
+                manifest_path,
+                bundle_path=args.bundle,
+                input_paths=(
+                    modality_files.all_paths
+                    if modality_files is not None
+                    else _csv_list(args.csv)
+                ),
+                output_format=args.output_format,
+                output_files=output_files,
+                inference_config=inference_config,
+                bundle=bundle,
+                result_df=result,
+            )
+        if args.output_format == "tidy" and manifest_path is None:
+            print(f"wrote imputed output to {output_csv}")
+        else:
+            for label, path in output_files.items():
+                print(f"wrote {label} output to {path}")
+            if manifest_path is not None:
+                print(f"wrote run manifest to {manifest_path}")
 
     elif args.command == "inspect-bundle":
         print(json.dumps(inspect_bundle(args.bundle), indent=2, sort_keys=True))
@@ -495,6 +630,13 @@ def main(argv=None):
                     parser.error("Legacy validation without --bundle requires --target-cols")
                 target_cols = _csv_list(args.target_cols)
                 aux_cols = _csv_list(args.aux_cols)
+            canonicalize_wind = (
+                loaded is None
+                or (
+                    {"wind_u", "wind_v"}.issubset(expected_schema.meteorology_cols)
+                    and not {"WS", "WD"}.issubset(expected_schema.meteorology_cols)
+                )
+            )
             frame = load_frame(
                 _csv_list(args.csv),
                 timestamp_col,
@@ -512,6 +654,12 @@ def main(argv=None):
                     expected_schema.duplicate_timestamp_policy if expected_schema is not None
                     else args.duplicate_timestamp_policy
                 ),
+                canonicalize_wind=canonicalize_wind,
+            )
+            resolved_aux_cols = (
+                canonicalize_wind_column_names(aux_cols)
+                if canonicalize_wind
+                else list(aux_cols)
             )
             report = {
                 "valid": True,
@@ -522,8 +670,8 @@ def main(argv=None):
                 "timezone": frame.attrs.get("timezone"),
                 "data_schema": expected_schema.to_dict() if expected_schema else None,
                 "target_missing_fraction": frame[target_cols].isna().mean().to_dict(),
-                "auxiliary_missing_fraction": frame[aux_cols].isna().mean().to_dict()
-                if aux_cols else {},
+                "auxiliary_missing_fraction": frame[resolved_aux_cols].isna().mean().to_dict()
+                if resolved_aux_cols else {},
             }
         print(json.dumps(report, indent=2, sort_keys=True))
 

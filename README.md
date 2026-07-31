@@ -128,6 +128,23 @@ The preferred interface supplies each measurement modality separately:
 - `--timestamp-col`: shared timestamp column, default `time`;
 - missing measurements are represented by empty CSV cells/`NaN`.
 
+When a meteorology file contains the raw wind-speed/direction pair `WS` and
+`WD`, the loader automatically applies the research convention and stores the
+canonical components `wind_u` and `wind_v` instead of passing circular
+direction values directly to the model:
+
+```text
+theta = radians((270 - WD) % 360)
+wind_u = WS * cos(theta)
+wind_v = WS * sin(theta)
+```
+
+The checkpoint schema therefore records `wind_u`/`wind_v`; inference accepts
+either the same derived columns or the original `WS`/`WD` pair and applies the
+same conversion. Supplying both representations is rejected to avoid an
+ambiguous input contract. Existing auxiliary preprocessing and missingness
+mask handling are applied after this conversion.
+
 At least one of Chem or PSD is required. Files are outer-joined on timestamp, Chem targets are placed before PSD targets, and `n_chem` is inferred automatically. The exact discovered columns and ordering are stored in `DataSchema` and enforced on future inference data.
 
 ```bash
@@ -157,6 +174,17 @@ graph-temporal-vae impute \
   --inference-config examples/inference_config.example.json \
   -o imputed.csv
 
+# For a shareable run directory, write the tidy table, modality-wide files,
+# and the resolved run manifest together.
+graph-temporal-vae impute \
+  --bundle checkpoints/run1.pt \
+  --chem-csv data/new_chemistry.csv \
+  --psd-csv data/new_psd.csv \
+  --met-csv data/new_meteorology.csv \
+  --inference-config examples/inference_config.example.json \
+  --output-format both \
+  --output-dir outputs/run1_impute
+
 graph-temporal-vae inspect-bundle --bundle checkpoints/run1.pt
 
 graph-temporal-vae validate-data \
@@ -184,7 +212,9 @@ graph-temporal-vae train \
   -o checkpoints/pretransformed_run.pt
 ```
 
-`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with `observed`, `is_imputed`, `imputed_mean`, `imputed_std`, `q_lower`, `q_upper`, and the interval probabilities. The default 5–95% interval also provides compatibility aliases `q05`/`q95`. Observed points are restored in the configured output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use exact sample-level overlap-add with a trapezoidal position envelope. The bounded-memory aggregator keeps samples only for timestamps that can still be covered by a later window, then finalizes and releases them. Aggregation occurs before each feature's output transform, avoiding biased sample-wise exponentiation.
+`impute` writes a tidy, long-format CSV: one row per `(timestamp, feature)`, with `observed`, `is_imputed`, `imputed_mean`, `imputed_std`, `q_lower`, `q_upper`, interval probabilities, and aggregation diagnostics (`overlap_window_count`, `raw_sample_count`, `effective_sample_size`). The default 5–95% interval also provides compatibility aliases `q05`/`q95`. Observed points are restored in the configured output scale with zero reported uncertainty; only genuinely missing points get a model-derived estimate. Overlapping inference windows use exact sample-level overlap-add with a trapezoidal position envelope. The bounded-memory aggregator keeps samples only for timestamps that can still be covered by a later window, then finalizes and releases them. Aggregation occurs before each feature's output transform, avoiding biased sample-wise exponentiation.
+
+For output-oriented workflows, `--output-format tidy` preserves the single-file behavior. `--output-format wide` writes `imputed_chem.csv`/`imputed_psd.csv` and matching lower/upper bound files; `--output-format both` writes those files plus the tidy table. Both wide modes require `--output-dir`. Supplying `--output-dir` also writes `run_manifest.json`, which records the resolved window/stride, MC and interval settings, input/output paths, and the raw-generative-sample, position-weighted aggregation contract. A config file cannot be combined with individual runtime sampling flags; put the settings in the JSON file or omit it.
 
 For the 26e Chem/PSD weighting protocol, set `--n-chem 32 --chem-feature-weight 12 --psd-feature-weight 1 --loss-normalization window_feature_sum`. The defaults are 1/1 general-dataset weighting with `observed_mean` normalization.
 
@@ -217,7 +247,7 @@ input is an already log1p-transformed artifact, pass
 `--target-transform none`; the preparation helper above writes raw targets and
 therefore uses the runner default `--target-transform log1p`.
 
-Any validated `ModelConfig` field (see `graph_temporal_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`.
+Any validated `ModelConfig` field (see `graph_temporal_vae/model_config.py`) can be set via `--model-config path/to/config.json`. Unknown or stale fields fail before training starts. A complete nested train configuration can instead be supplied with `--train-config examples/multimodal_train_config.example.json`; when that option is used, do not append individual train flags because the CLI rejects ambiguous overrides before loading the file.
 
 The preferred Python interface accepts paths, pandas DataFrames, or mixtures of both:
 
@@ -273,7 +303,7 @@ Training uses dynamic contiguous held-out masking on observed target values. Set
 
 For final imputation on one complete historical dataset, set `val_fraction=0` and `shared_full_heldout_mask=true`. Stage one then trains on the full timeline while excluding one fixed global HO mask from both input and loss, and uses that same mask for checkpoint selection. Setting `full_data_refit_epochs>0` adds a second phase that restores every observed global-HO cell, resets the optimizer, fixes KL at its fully annealed weight, and continues full-data training. `full_data_refit_patience` optionally stops this phase on a deterministic dynamic-pattern HO MSE monitor; because those target values are included in full-data training, this is an operational stopping rule rather than independent validation. Omitting patience runs the complete refit budget.
 
-The IOP runner writes `imputed_long.csv` with per-cell uncertainty fields and also writes wide mean files (`imputed_chem.csv`, `imputed_psd.csv`) plus matching lower/upper bound files (`imputed_chem_lower.csv`, `imputed_chem_upper.csv`, `imputed_psd_lower.csv`, `imputed_psd_upper.csv`). The bound files use the configured predictive interval, which is 5%--95% in the IOP runner.
+The public `impute --output-format both --output-dir ...` command and the IOP runner write `imputed_long.csv` with per-cell uncertainty fields plus wide mean files (`imputed_chem.csv`, `imputed_psd.csv`) and matching lower/upper bound files (`imputed_chem_lower.csv`, `imputed_chem_upper.csv`, `imputed_psd_lower.csv`, `imputed_psd_upper.csv`). The bound files use the configured predictive interval; the IOP runner explicitly uses 5%--95%.
 
 `impute` always reports zero uncertainty at genuinely observed points, so it cannot answer "how accurate is this model on data it never saw?" For bundles that have not run full-data refit, `examples/heldout_eval.py` fills that gap: it regenerates the exact fixed held-out mask a bundle was trained with (same `--n-chem`/ratio/seed), forces those points to look unobserved at inference time, and reports R²/MAE/PICP against their true values, split by Chem/PSD. Once full-data refit restores those targets, they are no longer independent and this evaluation must not be presented as held-out performance. The evaluator preserves the existing physical-output Gaussian CRPS for reference comparability and additionally reports `empirical_crps_model_space`, computed exactly from the bounded-memory overlap mixture using a sorted weighted-sample formula:
 

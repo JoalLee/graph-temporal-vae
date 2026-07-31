@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 import torch
 
+import graph_temporal_vae.cli as cli_module
 from graph_temporal_vae.api import fit_multimodal, impute_multimodal
 from graph_temporal_vae.bundle import inspect_bundle
 from graph_temporal_vae.cli import main as cli_main
@@ -24,6 +25,7 @@ from graph_temporal_vae.infer import (
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
+    write_imputation_manifest,
     write_imputed_wide_outputs,
 )
 from graph_temporal_vae.model_graph_uq import ImputationVAE_Graph
@@ -354,6 +356,41 @@ def test_nested_train_config_json_builds_public_contract():
     assert config.preprocessing.meteorology.scaler == "standard"
 
 
+def test_nested_multimodal_demo_assets_are_present():
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "examples" / "multimodal_train_config.example.json"
+    config = TrainConfig.from_json(config_path)
+
+    for path in config.modality_files.all_paths:
+        assert (repo_root / path).is_file(), f"missing bundled demo asset: {path}"
+
+
+def test_train_config_rejects_cli_overrides_before_loading_config(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli_main([
+            "train",
+            "--train-config", str(tmp_path / "missing.json"),
+            "--epochs", "1",
+            "-o", str(tmp_path / "bundle.pt"),
+        ])
+
+    assert "--train-config cannot be combined" in capsys.readouterr().err
+
+
+def test_inference_config_rejects_runtime_overrides_before_loading_inputs(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli_main([
+            "impute",
+            "--bundle", str(tmp_path / "missing.pt"),
+            "--csv", str(tmp_path / "missing.csv"),
+            "--inference-config", str(tmp_path / "missing.json"),
+            "--n-mc-samples", "100",
+            "-o", str(tmp_path / "imputed.csv"),
+        ])
+
+    assert "--inference-config cannot be combined" in capsys.readouterr().err
+
+
 def test_model_config_json_rejects_unknown_fields_early(tmp_path):
     csv_path = tmp_path / "synthetic.csv"
     _write_synthetic_csv(csv_path, n=40)
@@ -419,6 +456,7 @@ def test_train_then_impute_round_trip(tmp_path):
     result = pd.read_csv(output_path)
     assert set(result["feature"].unique()) == {"target_a", "target_b"}
     assert {"timestamp", "observed", "imputed_mean", "imputed_std", "q05", "q95"} <= set(result.columns)
+    assert {"overlap_window_count", "raw_sample_count", "effective_sample_size"} <= set(result.columns)
     assert len(result) == 200 * 2  # n rows * n target columns
 
     # Observed positions are restored verbatim with zero reported uncertainty.
@@ -478,6 +516,98 @@ def test_write_imputed_wide_outputs_preserves_modality_schema(tmp_path):
     assert np.allclose(chem_upper.iloc[0, 1:].to_numpy(), [1.0, 2.0])
     assert np.allclose(psd_lower.iloc[0, 1:].to_numpy(), [1.0, 2.0])
     assert np.allclose(psd_upper.iloc[0, 1:].to_numpy(), [3.0, 4.0])
+
+
+def test_write_imputation_manifest_records_resolved_inference_contract(tmp_path):
+    from graph_temporal_vae.contracts import DataSchema
+
+    schema = DataSchema(
+        timestamp_col="time",
+        chemistry_cols=["SO2"],
+        psd_cols=["12.0"],
+        psd_diameters_nm=[12.0],
+    )
+    result = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=2, freq="h").repeat(2),
+        "feature": ["SO2", "12.0", "SO2", "12.0"],
+        "overlap_window_count": [1, 2, 1, 2],
+        "raw_sample_count": [5, 10, 5, 10],
+        "effective_sample_size": [5.0, 8.0, 5.0, 8.0],
+    })
+    config = InferenceConfig(n_mc_samples=5, stride=None, interval_lower=0.025, interval_upper=0.975)
+    manifest_path = write_imputation_manifest(
+        tmp_path / "run_manifest.json",
+        bundle_path="model.pt",
+        input_paths=["chem.csv", "psd.csv"],
+        output_format="both",
+        output_files={"tidy": tmp_path / "imputed_long.csv"},
+        inference_config=config,
+        bundle={"window_size": 8, "stride": 4, "data_schema": schema},
+        result_df=result,
+    )
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["command"] == "impute"
+    assert manifest["inputs"] == ["chem.csv", "psd.csv"]
+    assert manifest["outputs"]["tidy"].endswith("imputed_long.csv")
+    assert manifest["inference"]["configured_stride"] is None
+    assert manifest["inference"]["resolved_stride"] == 4
+    assert manifest["inference"]["window_size"] == 8
+    assert manifest["interval"] == {"lower": 0.025, "upper": 0.975}
+    assert manifest["aggregation"]["sample_source"] == "raw_generative_samples"
+    assert manifest["aggregation"]["summary"]["effective_sample_size"] == {
+        "min": 5.0, "mean": 6.5, "max": 8.0,
+    }
+    assert manifest["rows"] == 2
+    assert manifest["features"] == 2
+
+
+def test_impute_cli_both_format_writes_tidy_wide_and_manifest(tmp_path, monkeypatch):
+    from graph_temporal_vae.contracts import DataSchema
+
+    schema = DataSchema(
+        timestamp_col="time",
+        chemistry_cols=["SO2"],
+        psd_cols=["12.0"],
+        psd_diameters_nm=[12.0],
+    )
+    timestamps = pd.date_range("2024-01-01", periods=2, freq="h")
+    result = pd.DataFrame({
+        "timestamp": timestamps.repeat(2),
+        "feature": ["SO2", "12.0", "SO2", "12.0"],
+        "imputed_mean": [1.0, 2.0, 3.0, 4.0],
+        "q_lower": [0.5, 1.5, 2.5, 3.5],
+        "q_upper": [1.5, 2.5, 3.5, 4.5],
+    })
+    bundle = {"data_schema": schema, "window_size": 8, "stride": 4}
+    monkeypatch.setattr(cli_module, "load_bundle", lambda _: bundle)
+
+    def fake_run_impute(*args, **kwargs):
+        if args[2] is not None:
+            Path(args[2]).parent.mkdir(parents=True, exist_ok=True)
+            result.to_csv(args[2], index=False)
+        return result.copy()
+
+    monkeypatch.setattr(cli_module, "run_impute", fake_run_impute)
+
+    output_dir = tmp_path / "outputs"
+    cli_module.main([
+        "impute",
+        "--bundle", str(tmp_path / "model.pt"),
+        "--csv", str(tmp_path / "input.csv"),
+        "--output-format", "both",
+        "--output-dir", str(output_dir),
+        "--n-mc-samples", "3",
+    ])
+
+    assert (output_dir / "imputed_long.csv").exists()
+    assert (output_dir / "imputed_chem.csv").exists()
+    assert (output_dir / "imputed_psd_upper.csv").exists()
+    manifest = json.loads((output_dir / "run_manifest.json").read_text())
+    assert manifest["output_format"] == "both"
+    assert set(manifest["outputs"]) == {
+        "tidy", "chem", "chem_lower", "chem_upper", "psd", "psd_lower", "psd_upper",
+    }
 
 
 def _load_heldout_eval_module():
@@ -785,6 +915,12 @@ def test_streaming_aggregation_matches_full_history_and_bounds_active_state():
     np.testing.assert_allclose(result["mean"], reference_mean)
     np.testing.assert_allclose(result["variance"], reference_variance)
     np.testing.assert_allclose(result["quantiles"][0.5], reference_median)
+    np.testing.assert_array_equal(
+        result["overlap_count"], [1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1]
+    )
+    np.testing.assert_array_equal(result["sample_count"], result["overlap_count"] * n_mc)
+    assert result["effective_sample_size"][0] == pytest.approx(3.0)
+    assert result["effective_sample_size"][2] == pytest.approx(5.4)
     assert result["peak_active_positions"] <= window_size
 
 
@@ -1100,6 +1236,17 @@ def test_dynamic_mask_scope_validates_timeline_and_legacy_compatibility():
             target_cols=["target"],
             dynamic_masking_mode="legacy",
             dynamic_mask_scope="timeline_epoch",
+        )
+
+
+def test_add_time_cyclical_features_rejects_legacy_csv_interface():
+    with pytest.raises(ValueError, match="add_time_cyclical_features requires modality_files"):
+        TrainConfig(
+            csv=["unused.csv"],
+            timestamp_col="time",
+            target_cols=["target"],
+            aux_cols=["ws"],
+            add_time_cyclical_features=True,
         )
 
 

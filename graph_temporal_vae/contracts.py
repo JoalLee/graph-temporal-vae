@@ -14,6 +14,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 SUPPORTED_TRANSFORMS = {"none", "log1p"}
 SUPPORTED_SCALERS = {"standard", "robust", "minmax", "none"}
 
+# Synthetic auxiliary columns computed from the timestamp index when
+# DataSchema.add_time_cyclical_features is set. These are never read from a
+# CSV -- they are derived deterministically from each row's timestamp, so
+# they are always fully observed (no missingness) and reproduce identically
+# between training and inference.
+TIME_CYCLICAL_COLS = [
+    "time_hour_sin",
+    "time_hour_cos",
+    "time_dow_sin",
+    "time_dow_cos",
+    "time_month_sin",
+    "time_month_cos",
+]
+
 
 def _normalize_paths(values: Optional[Sequence[str]]) -> List[str]:
     if values is None:
@@ -174,6 +188,10 @@ class DataSchema:
     time_grid_policy: str = "strict"
     duplicate_timestamp_policy: str = "error"
     psd_diameters_nm: List[float] = field(default_factory=list)
+    # Appends TIME_CYCLICAL_COLS (hour/day-of-week/month sin-cos, derived from
+    # the timestamp index) to auxiliary_cols. Off by default so existing
+    # bundles/configs keep their exact aux_dim and behavior.
+    add_time_cyclical_features: bool = False
 
     def __post_init__(self):
         self.chemistry_cols = list(self.chemistry_cols)
@@ -182,7 +200,7 @@ class DataSchema:
         self.psd_diameters_nm = [float(value) for value in self.psd_diameters_nm]
         if not self.chemistry_cols and not self.psd_cols:
             raise ValueError("DataSchema requires at least one chemistry or PSD column")
-        all_columns = [*self.chemistry_cols, *self.psd_cols, *self.meteorology_cols]
+        all_columns = [*self.chemistry_cols, *self.psd_cols, *self.auxiliary_cols]
         duplicates = sorted({column for column in all_columns if all_columns.count(column) > 1})
         if duplicates:
             raise ValueError(f"Columns cannot appear in multiple modalities: {duplicates}")
@@ -206,7 +224,8 @@ class DataSchema:
 
     @property
     def auxiliary_cols(self) -> List[str]:
-        return list(self.meteorology_cols)
+        extra = TIME_CYCLICAL_COLS if self.add_time_cyclical_features else []
+        return [*self.meteorology_cols, *extra]
 
     @property
     def n_chem(self) -> int:
@@ -218,7 +237,7 @@ class DataSchema:
 
     @property
     def aux_dim(self) -> int:
-        return len(self.meteorology_cols)
+        return len(self.auxiliary_cols)
 
     @property
     def modality_slices(self) -> Dict[str, Tuple[int, int]]:
