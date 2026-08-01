@@ -31,7 +31,7 @@ from graph_temporal_vae.infer import (
 from graph_temporal_vae.model_graph_uq import ImputationVAE_Graph
 from graph_temporal_vae.train import (
     Trainer,
-    _load_external_heldout_mask,
+    load_external_heldout_mask,
     _loader_options,
     _student_t_nll,
     empirical_crps_components,
@@ -791,6 +791,19 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
 
     output_path = tmp_path / "heldout_metrics.json"
     predictions_path = tmp_path / "heldout_predictions.csv"
+    synthetic_frame = pd.read_csv(csv_path)
+    external_mask = sample_anchor_constrained_heldout_mask(
+        synthetic_frame[["target_a", "target_b"]].notna().to_numpy(),
+        ratio=0.2,
+        seed=42,
+        n_chem=1,
+    )
+    external_mask_path = tmp_path / "heldout_mask_full.npy"
+    external_columns_path = tmp_path / "heldout_mask_full_columns.csv"
+    np.save(external_mask_path, external_mask)
+    pd.DataFrame({"target_col": ["target_a", "target_b"]}).to_csv(
+        external_columns_path, index=False
+    )
     script = Path(__file__).resolve().parents[1] / "examples" / "heldout_eval.py"
     proc = subprocess.run(
         [
@@ -800,6 +813,8 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
             "--n-chem", "1",
             "--n-mc-samples", "3",
             "--stride", "8",
+            "--selection-mask-path", str(external_mask_path),
+            "--selection-mask-columns-path", str(external_columns_path),
             "-o", str(output_path),
             "--predictions-csv", str(predictions_path),
         ],
@@ -808,6 +823,8 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
     results = json.loads(output_path.read_text())
+    assert results["selection_mask_protocol"]["mode"] == "external"
+    assert results["selection_mask_protocol"]["requested_cells"] == int(external_mask.sum())
     for group in ("overall", "chem", "psd"):
         assert f"{group}_heldout_n" in results
         assert results[f"{group}_heldout_n"] > 0
@@ -1292,7 +1309,7 @@ def test_external_heldout_mask_loader_preserves_matrix_and_reports_overlap(tmp_p
         [[True, True], [True, False], [True, True]], dtype=bool
     )
 
-    loaded, diagnostics = _load_external_heldout_mask(
+    loaded, diagnostics = load_external_heldout_mask(
         mask_path,
         columns_path,
         expected_rows=3,
@@ -1313,7 +1330,7 @@ def test_external_heldout_mask_loader_rejects_target_order_mismatch(tmp_path):
     pd.DataFrame({"target_col": ["psd", "chem"]}).to_csv(columns_path, index=False)
 
     with pytest.raises(ValueError, match="target order"):
-        _load_external_heldout_mask(
+        load_external_heldout_mask(
             mask_path,
             columns_path,
             expected_rows=2,

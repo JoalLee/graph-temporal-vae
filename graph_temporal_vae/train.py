@@ -1322,7 +1322,7 @@ def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_c
     )
 
 
-def _load_external_heldout_mask(
+def load_external_heldout_mask(
     mask_path,
     columns_path,
     *,
@@ -1390,6 +1390,12 @@ def _load_external_heldout_mask(
         "natural_missing_overlap_cells": int(overlap.sum()),
     }
     return mask, diagnostics
+
+
+# Kept as a compatibility alias for the initial private helper name. New
+# callers should use the public loader so training and held-out evaluation can
+# share exactly the same validation and provenance behavior.
+_load_external_heldout_mask = load_external_heldout_mask
 
 
 def _build_bundle(

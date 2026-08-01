@@ -18,7 +18,7 @@ from .model_config import ModelConfig
 from .model_graph_pred import PredictionVAE_Graph
 from .model_graph_uq import ImputationVAE_Graph
 from .model_uq import ImputationVAE_UQ
-from .train import train_from_config
+from .train import load_external_heldout_mask, train_from_config
 
 __all__ = [
     "CensoringConfig",
@@ -39,6 +39,7 @@ __all__ = [
     "validate_multimodal_data",
     "inspect_bundle",
     "train_from_config",
+    "load_external_heldout_mask",
     "load_bundle",
     "impute",
 ]

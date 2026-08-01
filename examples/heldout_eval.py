@@ -63,6 +63,7 @@ from graph_temporal_vae.infer import (
     summary_to_output_scale,
     trapezoid_position_weights,
 )
+from graph_temporal_vae.train import load_external_heldout_mask
 from graph_temporal_vae.preprocessing import (
     observed_targets_to_output,
     transform_auxiliary,
@@ -244,6 +245,15 @@ def main():
                     help="Defaults to the ratio stored in the checkpoint.")
     ap.add_argument("--selection-val-seed", type=int, default=None,
                     help="Defaults to the seed stored in the checkpoint.")
+    ap.add_argument(
+        "--selection-mask-path", default=None,
+        help="Optional external full-timeline .npy held-out mask. When supplied, "
+             "do not resample a mask; validate and score this exact matrix.",
+    )
+    ap.add_argument(
+        "--selection-mask-columns-path", default=None,
+        help="Optional one-column target_col CSV used to validate external mask order.",
+    )
     ap.add_argument("--n-mc-samples", type=int, default=50)
     ap.add_argument("--stride", type=int, default=None, help="Defaults to window_size // 2.")
     ap.add_argument("--inference-batch-size", type=int, default=4)
@@ -327,9 +337,28 @@ def main():
         seed = training_config.get("selection_val_seed", 42)
     n_chem = data_schema.n_chem if args.n_chem is None else args.n_chem
 
-    # Reproduce the protocol the checkpoint was trained under; a mismatch here
-    # silently scores a different set of cells than the run's own val metric.
-    if mask_mode == "block":
+    external_mask_diagnostics = None
+    if args.selection_mask_columns_path and not args.selection_mask_path:
+        raise ValueError(
+            "--selection-mask-columns-path requires --selection-mask-path"
+        )
+
+    # An external mask is a benchmark artifact: validate its shape and target
+    # order, but do not resample or intersect it here. Natural missingness is
+    # still excluded from metric validity below, and its overlap is reported.
+    if args.selection_mask_path:
+        heldout_mask, external_mask_diagnostics = load_external_heldout_mask(
+            args.selection_mask_path,
+            args.selection_mask_columns_path,
+            expected_rows=n,
+            target_cols=target_cols,
+            observed_mask=obs_mask_full,
+        )
+        mask_mode = "external"
+    # Reproduce the protocol the checkpoint was trained under when no external
+    # matrix is supplied; a mismatch here silently scores a different set of
+    # cells than the run's own validation metric.
+    elif mask_mode == "block":
         heldout_mask = sample_block_heldout_mask_to_ratio(
             obs_mask_full,
             {
@@ -356,12 +385,20 @@ def main():
             max_duration=training_config.get("dynamic_mask_max_duration", 168),
             duration_source=training_config.get("dynamic_mask_duration_source", "parametric"),
         ).astype(bool)
-    print(
-        f"[heldout_eval] selection protocol: mode={mask_mode} ratio={ratio} seed={seed}"
-        + (f", {int(censor_mask_full.sum())} censored cells excluded from scoring"
-           if censoring.active else "")
-        + f", dist={bundle.get('uncertainty_dist_type', 'gaussian')}"
+    protocol_text = (
+        f"[heldout_eval] selection protocol: mode={mask_mode} "
+        f"ratio={ratio} seed={seed}"
     )
+    if external_mask_diagnostics is not None:
+        protocol_text += (
+            f", source={external_mask_diagnostics['source']}"
+            f", requested={external_mask_diagnostics['requested_cells']}"
+            f", observed={external_mask_diagnostics['observed_cells']}"
+            f", natural_missing_overlap={external_mask_diagnostics['natural_missing_overlap_cells']}"
+        )
+    if censoring.active:
+        protocol_text += f", {int(censor_mask_full.sum())} censored cells excluded from scoring"
+    print(protocol_text + f", dist={bundle.get('uncertainty_dist_type', 'gaussian')}" )
 
     # Force held-out points to look unobserved to the model, exactly as
     # training did (fixed_mask carved out of the training input mask).
@@ -485,6 +522,13 @@ def main():
             f"--n-chem={n_chem} conflicts with bundle schema n_chem={data_schema.n_chem}"
         )
     results = {}
+    if external_mask_diagnostics is not None:
+        results["selection_mask_protocol"] = {
+            "mode": "external",
+            "ratio_argument": ratio,
+            "seed_argument": seed,
+            **external_mask_diagnostics,
+        }
     for cat_name, cols in category_indices(target_cols, n_chem):
         y_true_g = observed_output[:, cols]
         y_pred_g = mean_out[:, cols]
