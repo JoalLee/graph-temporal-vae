@@ -31,6 +31,7 @@ from graph_temporal_vae.infer import (
 from graph_temporal_vae.model_graph_uq import ImputationVAE_Graph
 from graph_temporal_vae.train import (
     Trainer,
+    _load_external_heldout_mask,
     _loader_options,
     _student_t_nll,
     empirical_crps_components,
@@ -1277,6 +1278,58 @@ def test_train_ho_config_resolves_a_distinct_fixed_mask_seed_and_ratio():
     assert config.train_ho_enabled is True
     assert config.train_ho_seed == 100004
     assert config.train_ho_ratio == pytest.approx(0.2)
+
+
+def test_external_heldout_mask_loader_preserves_matrix_and_reports_overlap(tmp_path):
+    mask = np.array(
+        [[True, False], [False, True], [True, True]], dtype=bool
+    )
+    mask_path = tmp_path / "heldout_mask.npy"
+    columns_path = tmp_path / "heldout_mask_columns.csv"
+    np.save(mask_path, mask)
+    pd.DataFrame({"target_col": ["chem", "psd"]}).to_csv(columns_path, index=False)
+    observed = np.array(
+        [[True, True], [True, False], [True, True]], dtype=bool
+    )
+
+    loaded, diagnostics = _load_external_heldout_mask(
+        mask_path,
+        columns_path,
+        expected_rows=3,
+        target_cols=["chem", "psd"],
+        observed_mask=observed,
+    )
+
+    np.testing.assert_array_equal(loaded, mask)
+    assert diagnostics["requested_cells"] == 4
+    assert diagnostics["observed_cells"] == 3
+    assert diagnostics["natural_missing_overlap_cells"] == 1
+
+
+def test_external_heldout_mask_loader_rejects_target_order_mismatch(tmp_path):
+    mask_path = tmp_path / "heldout_mask.npy"
+    columns_path = tmp_path / "heldout_mask_columns.csv"
+    np.save(mask_path, np.zeros((2, 2), dtype=bool))
+    pd.DataFrame({"target_col": ["psd", "chem"]}).to_csv(columns_path, index=False)
+
+    with pytest.raises(ValueError, match="target order"):
+        _load_external_heldout_mask(
+            mask_path,
+            columns_path,
+            expected_rows=2,
+            target_cols=["chem", "psd"],
+            observed_mask=np.ones((2, 2), dtype=bool),
+        )
+
+
+def test_external_mask_config_requires_global_heldout_protocol():
+    with pytest.raises(ValueError, match="shared_full_heldout_mask"):
+        TrainConfig(
+            csv=["unused.csv"],
+            timestamp_col="time",
+            target_cols=["target"],
+            selection_mask_path="heldout.npy",
+        )
 
 
 def test_train_ho_metrics_are_recorded_from_cells_excluded_from_training_loss(tmp_path):

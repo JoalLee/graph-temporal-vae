@@ -96,6 +96,12 @@ class TrainConfig:
     train_ho_seed: Optional[int] = None
     train_ho_ratio: Optional[float] = None
     shared_full_heldout_mask: bool = False
+    # Optional externally generated global HO mask. When supplied, the
+    # trainer must use this matrix verbatim instead of regenerating a mask
+    # from selection_val_seed. The companion columns file makes the target
+    # ordering auditable before training starts.
+    selection_mask_path: Optional[str] = None
+    selection_mask_columns_path: Optional[str] = None
     validation_metric: str = "ho_nll"
     # Optional second phase for the global-HO protocol. Stage one selects a
     # checkpoint while ``shared_full_heldout_mask`` is excluded from both the
@@ -286,6 +292,14 @@ class TrainConfig:
         if self.shared_full_heldout_mask and self.train_ho_enabled:
             raise ValueError(
                 "shared_full_heldout_mask and train_ho_enabled are mutually exclusive"
+            )
+        if self.selection_mask_columns_path and not self.selection_mask_path:
+            raise ValueError(
+                "selection_mask_columns_path requires selection_mask_path"
+            )
+        if self.selection_mask_path and not self.shared_full_heldout_mask:
+            raise ValueError(
+                "selection_mask_path requires shared_full_heldout_mask=true"
             )
         if self.full_data_refit_epochs < 0:
             raise ValueError("full_data_refit_epochs must be non-negative")

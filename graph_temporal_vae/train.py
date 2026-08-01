@@ -1322,10 +1322,81 @@ def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_c
     )
 
 
+def _load_external_heldout_mask(
+    mask_path,
+    columns_path,
+    *,
+    expected_rows,
+    target_cols,
+    observed_mask,
+):
+    """Load and validate an externally generated full-timeline HO mask.
+
+    The matrix is deliberately not intersected with ``observed_mask`` here:
+    the supplied mask is a benchmark artifact and must remain byte-for-byte
+    semantically intact. ``WindowedTimeSeriesDataset`` already intersects a
+    fixed mask with the actually observed cells when constructing its
+    training/evaluation masks. The overlap is reported so a changed QC
+    source cannot silently look like the original benchmark.
+    """
+    if not mask_path:
+        raise ValueError("mask_path is required")
+    raw = np.load(mask_path, allow_pickle=False)
+    if raw.ndim != 2:
+        raise ValueError(
+            f"External held-out mask must be 2-D, got shape {raw.shape}"
+        )
+    expected_shape = (int(expected_rows), len(target_cols))
+    if tuple(raw.shape) != expected_shape:
+        raise ValueError(
+            "External held-out mask shape does not match the loaded data: "
+            f"expected={expected_shape}, got={tuple(raw.shape)}"
+        )
+    if raw.dtype == np.bool_:
+        mask = raw.copy()
+    else:
+        if not np.isfinite(raw).all() or not np.isin(raw, [0, 1]).all():
+            raise ValueError("External held-out mask must contain only boolean/0/1 values")
+        mask = raw.astype(bool)
+
+    target_cols = [str(column) for column in target_cols]
+    if columns_path:
+        columns_frame = pd.read_csv(columns_path)
+        if list(columns_frame.columns) != ["target_col"]:
+            raise ValueError(
+                "External held-out mask columns file must contain exactly one "
+                "'target_col' column"
+            )
+        mask_cols = columns_frame["target_col"].astype(str).tolist()
+        if mask_cols != target_cols:
+            raise ValueError(
+                "External held-out mask columns do not match the loaded target order: "
+                f"mask_first={mask_cols[:5]}, target_first={target_cols[:5]}"
+            )
+
+    observed_mask = np.asarray(observed_mask, dtype=bool)
+    if observed_mask.shape != mask.shape:
+        raise ValueError(
+            "observed_mask shape does not match external held-out mask: "
+            f"observed={observed_mask.shape}, mask={mask.shape}"
+        )
+    overlap = mask & ~observed_mask
+    diagnostics = {
+        "source": os.fspath(mask_path),
+        "columns_source": None if columns_path is None else os.fspath(columns_path),
+        "shape": [int(value) for value in mask.shape],
+        "requested_cells": int(mask.sum()),
+        "observed_cells": int((mask & observed_mask).sum()),
+        "natural_missing_overlap_cells": int(overlap.sum()),
+    }
+    return mask, diagnostics
+
+
 def _build_bundle(
     *, trainer, config, model_kwargs, target_cols, aux_cols, preprocessing,
     censoring, censor_threshold_scaled, censor_report, history_path,
     refit_history_path, refit_summary, selection_full, best_val,
+    selection_mask_diagnostics,
     data_schema, data_interface, scaler_target, scaler_aux,
 ):
     """Assemble a loadable checkpoint bundle from the trainer's current weights.
@@ -1402,6 +1473,7 @@ def _build_bundle(
                 if selection_full is not None
                 else None
             ),
+            "external_selection_mask": selection_mask_diagnostics,
             "refit": refit_summary,
         },
         "data_schema": data_schema.to_dict(),
@@ -1610,6 +1682,7 @@ def train_from_config(
     train_fixed_mask = None
     train_selection_mask = None
     selection_full = None
+    selection_mask_diagnostics = None
     val_selection_mask = None
     # Held-out selection scores predictions against a ground-truth scalar, so
     # only real detections are eligible: a non-detect has no such value.
@@ -1621,14 +1694,30 @@ def train_from_config(
         # One global fixed mask serves both roles: it is excluded from the
         # stage-one input/loss and scored by the validation loader. This is the
         # research-repo protocol and works for both block and anchor masks.
-        selection_full = _make_fixed_ho_mask(
-            observed_full,
-            mode=config.selection_mask_mode,
-            ratio=config.selection_mask_ratio,
-            seed=config.selection_val_seed,
-            dynamic_config=dynamic_mask_config,
-            n_chem=n_chem,
-        )
+        if config.selection_mask_path:
+            selection_full, selection_mask_diagnostics = _load_external_heldout_mask(
+                config.selection_mask_path,
+                config.selection_mask_columns_path,
+                expected_rows=len(frame),
+                target_cols=target_cols,
+                observed_mask=observed_full,
+            )
+            if selection_mask_diagnostics["natural_missing_overlap_cells"]:
+                print(
+                    "[graph-temporal-vae] external HO mask: "
+                    f"{selection_mask_diagnostics['natural_missing_overlap_cells']} "
+                    "requested cells overlap natural missingness; they will not "
+                    "contribute to HO metrics"
+                )
+        else:
+            selection_full = _make_fixed_ho_mask(
+                observed_full,
+                mode=config.selection_mask_mode,
+                ratio=config.selection_mask_ratio,
+                seed=config.selection_val_seed,
+                dynamic_config=dynamic_mask_config,
+                n_chem=n_chem,
+            )
         train_fixed_mask = selection_full
         val_selection_mask = selection_full
     elif config.train_ho_enabled:
@@ -1812,6 +1901,7 @@ def train_from_config(
             censor_report=censor_report, history_path=history_path,
             refit_history_path=None, refit_summary=None,
             selection_full=selection_full, best_val=best_val,
+            selection_mask_diagnostics=selection_mask_diagnostics,
             data_schema=data_schema, data_interface=data_interface,
             scaler_target=scaler_target, scaler_aux=scaler_aux,
         )
@@ -1904,6 +1994,7 @@ def train_from_config(
         censor_report=censor_report, history_path=history_path,
         refit_history_path=refit_history_path, refit_summary=refit_summary,
         selection_full=selection_full, best_val=best_val,
+        selection_mask_diagnostics=selection_mask_diagnostics,
         data_schema=data_schema, data_interface=data_interface,
         scaler_target=scaler_target, scaler_aux=scaler_aux,
     )
