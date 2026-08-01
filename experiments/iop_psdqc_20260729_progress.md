@@ -1,7 +1,7 @@
 # IOP PSD/QC model-diagnosis progress
 
 Date: 2026-08-01  
-Status: paused by user before the next experiment was evaluated
+Status: paused by user after the outstanding remote run was stopped
 
 ## Scope and provenance
 
@@ -20,12 +20,11 @@ Status: paused by user before the next experiment was evaluated
 ## Rejected or unresolved interventions
 
 - `family_loss_scale="target_dim"` with family-balanced reconstruction was rejected as a solution. Although its seed-7 aggregate R² was `0.7216` and PSD raw mean R² was `0.7824`, chemistry raw mean R² fell to `0.3878`; the training objective also became strongly negative and validation latent variance grew to an implausible scale, indicating a variance-collapse/overconfidence pathology.
-- A follow-up run was launched with the same family-balanced setup but `family_loss_scale="mean"` and the old-runtime equivalent of target-feature KL (`kl_max_beta=1/304`). It was intended to test whether objective-scale alignment removes the preceding pathology. The checkpoint/evaluation result was deliberately not collected before pausing.
+- A follow-up run was launched with the same family-balanced setup but `family_loss_scale="mean"` and the old-runtime equivalent of target-feature KL (`kl_max_beta=1/304`). It was stopped at epoch `120/200` before checkpoint evaluation. Even before stopping, `train_loss` had reached approximately `-3074` and latent `z²` was approximately `64.5/95.3`, so objective-scale alignment did not remove the same variance/scale pathology. This run is rejected as a solution; it has no fixed-protocol held-out result.
 
 ## Next resumption point
 
-1. Confirm or terminate the outstanding remote run before starting another experiment; do not treat it as evidence until its checkpoint, history, fixed-protocol held-out metrics, and per-feature table are archived.
-2. If the stable family-mean result is promising, repeat it on at least two additional seeds under the same evaluator and compare chemistry, PSD, raw-minimum, CRPS, PICP90, interval width, and per-feature bias.
-3. Port only evidence-supported changes into the active implementation with test-first coverage: explicit KL normalization semantics, stable family-loss scaling, and the sparse robust-scale fallback. Keep defaults unchanged until paired multi-seed evidence supports changing them.
-4. Commit each logical implementation/evidence boundary and update this record with the exact command, checkpoint, evaluator JSON, and acceptance/rejection decision.
-
+1. Do not treat the interrupted family-balanced runs as solutions. First isolate why the family-balanced objective permits negative training values and exploding latent variance before trying another multi-seed comparison.
+2. Port only evidence-supported changes into the active implementation with test-first coverage: explicit KL normalization semantics and the sparse robust-scale fallback. Keep defaults unchanged until paired multi-seed evidence supports changing them.
+3. Any resumed experiment must use the same evaluator and archive the exact command, checkpoint, history, fixed-protocol held-out metrics, and per-feature table before it is considered evidence.
+4. Commit each logical implementation/evidence boundary and update this record with the acceptance/rejection decision.
