@@ -15,9 +15,10 @@ Two things the reported numbers depend on, both worth stating in any writeup:
   a per-feature R^2; the training loop's own `block` protocol draws one block
   per modality per window, which is right for augmentation but too sparse to
   score features individually. Pass `--selection-mask-mode block` to use it.
-* Below-detection-limit cells are excluded from scoring. A non-detect has no
-  ground-truth scalar, so including it would score "did the model predict
-  exactly zero?" -- the very error the censored likelihood exists to prevent.
+* Below-detection-limit cells may be selected for the held-out set, but they
+  are never mixed into exact-value metrics. They are scored separately by an
+  interval probability/NLL and the reported prediction is conditioned on
+  ``y <= MDL``.
 
 Usage:
     python examples/heldout_eval.py \\
@@ -44,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from graph_temporal_vae.censoring import (
     STATE_CENSORED,
+    STATE_MISSING,
     STATE_OBSERVED,
     CensoringConfig,
     apply_input_fill,
@@ -52,6 +54,7 @@ from graph_temporal_vae.censoring import (
 from graph_temporal_vae.contracts import ModalityFiles
 from graph_temporal_vae.data import (
     compute_window_starts,
+    extract_censor_marker_mask,
     load_frame,
     load_modality_frame,
     make_condition,
@@ -59,12 +62,15 @@ from graph_temporal_vae.data import (
     sample_block_heldout_mask_to_ratio,
 )
 from graph_temporal_vae.infer import (
+    _bundle_censor_thresholds,
     load_bundle,
     summary_to_output_scale,
     trapezoid_position_weights,
+    truncate_below_limit,
 )
 from graph_temporal_vae.train import load_external_heldout_mask
 from graph_temporal_vae.preprocessing import (
+    inverse_targets,
     observed_targets_to_output,
     transform_auxiliary,
     transform_targets,
@@ -313,12 +319,15 @@ def main():
         )
     n = len(frame)
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
-    # Non-detects are not point observations: they have no ground-truth scalar
-    # to score against, so they must be excluded from the held-out set exactly
-    # as training excludes them. Scoring them would ask "did the model predict
-    # exactly zero?", which is the error the censored likelihood exists to avoid.
     censoring = bundle.get("censoring") or CensoringConfig()
-    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    if isinstance(censoring, dict):
+        censoring = CensoringConfig.from_dict(censoring)
+    marker_mask = extract_censor_marker_mask(frame, target_cols)
+    if data_schema.n_chem < marker_mask.shape[1]:
+        marker_mask[:, data_schema.n_chem:] = False
+    state_full = build_state_matrix(
+        target_raw, data_schema, censoring, marker_mask=marker_mask
+    )
     censor_mask_full = state_full == STATE_CENSORED
     target_input_raw = apply_input_fill(target_raw, state_full, data_schema, censoring)
     target_model_space = transform_targets(target_input_raw, data_schema, preprocessing)
@@ -326,6 +335,11 @@ def main():
     aux_model_space = transform_auxiliary(aux_raw, preprocessing)
     obs_mask_full = state_full == STATE_OBSERVED
     known_mask_full = obs_mask_full | censor_mask_full
+    eligible_mask_full = state_full != STATE_MISSING
+    censor_threshold_scaled = _bundle_censor_thresholds(bundle, data_schema)
+    censor_threshold_model = (
+        censor_threshold_scaled * scaler_target.std_ + scaler_target.mean_
+    )
 
     training_config = bundle.get("training_config", {})
     mask_mode = args.selection_mask_mode
@@ -345,7 +359,8 @@ def main():
 
     # An external mask is a benchmark artifact: validate its shape and target
     # order, but do not resample or intersect it here. Natural missingness is
-    # still excluded from metric validity below, and its overlap is reported.
+    # excluded from exact/interval metric validity below; censored overlap is
+    # retained for interval scoring and reported separately.
     if args.selection_mask_path:
         heldout_mask, external_mask_diagnostics = load_external_heldout_mask(
             args.selection_mask_path,
@@ -353,6 +368,7 @@ def main():
             expected_rows=n,
             target_cols=target_cols,
             observed_mask=obs_mask_full,
+            censored_mask=censor_mask_full,
         )
         mask_mode = "external"
     # Reproduce the protocol the checkpoint was trained under when no external
@@ -360,7 +376,7 @@ def main():
     # cells than the run's own validation metric.
     elif mask_mode == "block":
         heldout_mask = sample_block_heldout_mask_to_ratio(
-            obs_mask_full,
+            eligible_mask_full,
             {
                 "mode": "block",
                 "target_ratio": ratio,
@@ -378,7 +394,7 @@ def main():
         ).astype(bool)
     else:
         heldout_mask = sample_anchor_constrained_heldout_mask(
-            obs_mask_full, ratio=ratio, seed=seed, n_chem=n_chem,
+            eligible_mask_full, ratio=ratio, seed=seed, n_chem=n_chem,
             mean_duration=training_config.get("dynamic_mask_mean_duration", 48.0),
             std_duration=training_config.get("dynamic_mask_std_duration", 24.0),
             min_duration=training_config.get("dynamic_mask_min_duration", 3),
@@ -395,9 +411,13 @@ def main():
             f", requested={external_mask_diagnostics['requested_cells']}"
             f", observed={external_mask_diagnostics['observed_cells']}"
             f", natural_missing_overlap={external_mask_diagnostics['natural_missing_overlap_cells']}"
+            f", censored_overlap={external_mask_diagnostics['censored_overlap_cells']}"
         )
     if censoring.active:
-        protocol_text += f", {int(censor_mask_full.sum())} censored cells excluded from scoring"
+        protocol_text += (
+            f", {int(censor_mask_full.sum())} censored cells; selected censored cells "
+            "use interval scoring"
+        )
     print(protocol_text + f", dist={bundle.get('uncertainty_dist_type', 'gaussian')}" )
 
     # Force held-out points to look unobserved to the model, exactly as
@@ -421,8 +441,8 @@ def main():
     n_batches = math.ceil(len(starts) / args.inference_batch_size)
     print(
         f"[heldout_eval] {n} rows -> {len(starts)} windows ({n_batches} batches), "
-        f"{heldout_mask.sum()}/{obs_mask_full.sum()} observed points held out "
-        f"({100 * heldout_mask.sum() / obs_mask_full.sum():.2f}%), "
+        f"{heldout_mask.sum()}/{eligible_mask_full.sum()} eligible cells held out "
+        f"({100 * heldout_mask.sum() / eligible_mask_full.sum():.2f}%), "
         f"{args.n_mc_samples} MC samples, stride={stride}, "
         f"dist={bundle.get('uncertainty_dist_type', 'gaussian')}, device={device}"
     )
@@ -509,10 +529,41 @@ def main():
     # 0.05/0.95 (90% interval) matches the research repo's PICP definition;
     # 0.025/0.975 is retained for the wider predictions CSV diagnostic.
     dist_agg = distribution_aggregator.finish()
-    mean_out, std_out, quantiles_out = summary_to_output_scale(
+    heldout_observed_mask = heldout_mask & obs_mask_full
+    heldout_censored_mask = heldout_mask & censor_mask_full
+    # Keep the unconstrained prediction for the diagnostic below, but use the
+    # same conditional/truncated distribution as ``impute()`` for censored HO
+    # output. This enforces the known interval without treating the marker's
+    # numeric payload as an exact target or hard-clamping every prediction.
+    constrained_mean_model, constrained_variance_model, p_below_limit = truncate_below_limit(
+        mean_agg["mean"],
+        dist_agg["variance"],
+        censor_threshold_model,
+        heldout_censored_mask,
+    )
+    mean_eval_model = np.where(
+        heldout_censored_mask, constrained_mean_model, mean_agg["mean"]
+    )
+    variance_eval_model = np.where(
+        heldout_censored_mask, constrained_variance_model, dist_agg["variance"]
+    )
+    mean_out_unconstrained, _, _ = summary_to_output_scale(
         mean_agg["mean"], dist_agg["variance"], dist_agg["quantiles"], output_transforms
     )
+    mean_out, std_out, quantiles_out = summary_to_output_scale(
+        mean_eval_model, variance_eval_model, dist_agg["quantiles"], output_transforms
+    )
     q025, q05, q95, q975 = quantiles_out[0.025], quantiles_out[0.05], quantiles_out[0.95], quantiles_out[0.975]
+    limit_output = inverse_targets(
+        censor_threshold_model[None, :], data_schema, preprocessing
+    )[0]
+    finite_limit = np.isfinite(limit_output)[None, :]
+    for array in (q025, q05, q95, q975):
+        np.copyto(
+            array,
+            np.minimum(array, np.broadcast_to(limit_output[None, :], array.shape)),
+            where=heldout_censored_mask & finite_limit,
+        )
 
     observed_output = observed_targets_to_output(target_raw, data_schema, preprocessing)
 
@@ -541,7 +592,7 @@ def main():
         # category -- matches the research repo's ablation_heldout_eval.py
         # compute_heldout_metrics exactly. This is what a reference run's
         # own reported "chem_r2"/"psd_r2" means.
-        held_mask_g = heldout_mask[:, cols]
+        held_mask_g = heldout_observed_mask[:, cols]
         held = _macro_average_metrics(
             y_true_g,
             y_pred_g,
@@ -583,6 +634,34 @@ def main():
         results[f"{cat_name}_heldout_mae_pooled"] = _mae(y_true_p[valid_p], y_pred_p[valid_p])
         results[f"{cat_name}_heldout_n"] = int(valid_p.sum())
 
+        # Censored HO cells have no exact scalar target. Report the model's
+        # unconstrained Gaussian-approximate interval probability/NLL and a
+        # raw-limit violation diagnostic, while the public prediction above is
+        # the truncated conditional mean used for a final imputation result.
+        censored_g = heldout_censored_mask[:, cols]
+        censored_valid = (
+            censored_g
+            & np.isfinite(p_below_limit[:, cols])
+            & np.isfinite(limit_output[None, :][:, cols])
+        )
+        censored_n = int(censored_valid.sum())
+        results[f"{cat_name}_censored_ho_n"] = censored_n
+        if censored_n:
+            p_below = p_below_limit[:, cols][censored_valid]
+            raw_mean = mean_out_unconstrained[:, cols][censored_valid]
+            constrained_mean = mean_out[:, cols][censored_valid]
+            limits = limit_output[None, :][:, cols][censored_valid]
+            results[f"{cat_name}_censored_ho_p_below_mdl"] = float(np.mean(p_below))
+            results[f"{cat_name}_censored_ho_gaussian_nll"] = float(
+                np.mean(-np.log(np.clip(p_below, 1e-12, 1.0)))
+            )
+            results[f"{cat_name}_censored_ho_raw_mean_above_mdl_rate"] = float(
+                np.mean(raw_mean > limits)
+            )
+            results[f"{cat_name}_censored_ho_constrained_mean_above_mdl_rate"] = float(
+                np.mean(constrained_mean > limits)
+            )
+
     print(json.dumps(results, indent=2))
     if args.output:
         with open(args.output, "w") as f:
@@ -604,7 +683,7 @@ def main():
         # aggregation is a weighted average, which commutes with any affine
         # transform, so this is exactly the same value a separate aggregation
         # pass over pred_mean_scaled would give.
-        model_pred_mean = mean_agg["mean"]
+        model_pred_mean = mean_eval_model
         scaled_pred_mean = (model_pred_mean - scaler_target.mean_[None, :]) / scaler_target.std_[None, :]
         rows, cols = np.nonzero(heldout_mask)
         families = np.where(cols < n_chem, "chem", "psd")
@@ -612,6 +691,10 @@ def main():
             "timestamp": frame.index[rows],
             "feature": [target_cols[c] for c in cols],
             "family": families,
+            "observation_state": np.where(
+                heldout_censored_mask[rows, cols], "censored", "observed"
+            ),
+            "detection_limit": limit_output[cols],
             "scaled_observed": target_scaled[rows, cols],
             "scaled_pred_mean": scaled_pred_mean[rows, cols],
             "model_observed": target_model_space[rows, cols],
@@ -622,6 +705,7 @@ def main():
             "physical_pred_std": std_out[rows, cols],
             "physical_q025": q025[rows, cols],
             "physical_q975": q975[rows, cols],
+            "p_below_mdl": p_below_limit[rows, cols],
         })
         frames_out.to_csv(args.predictions_csv, index=False)
         print(f"wrote {len(frames_out)} held-out predictions to {args.predictions_csv}")

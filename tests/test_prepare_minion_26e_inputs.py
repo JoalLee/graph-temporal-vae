@@ -5,7 +5,7 @@ from graph_temporal_vae.censoring import CensoringConfig
 from scripts.prepare_minion_26e_inputs import _generate_anchor_mask
 
 
-def test_generated_anchor_mask_uses_censor_aware_observed_pool():
+def test_generated_anchor_mask_includes_present_censored_cells_but_not_missing():
     n_rows = 240
     time = pd.date_range("2024-02-01", periods=n_rows, freq="h")
     chemistry = pd.DataFrame({
@@ -14,7 +14,9 @@ def test_generated_anchor_mask_uses_censor_aware_observed_pool():
         "K": np.ones(n_rows, dtype=object),
     })
     chemistry.loc[20:24, "Al"] = 0.0
-    chemistry.loc[50:54, "K"] = "0.05_"
+    # Put the marker in the deterministic seed-42 selected eligible run so
+    # this test checks that `_` cells are genuinely allowed into HO.
+    chemistry.loc[114:118, "K"] = "0.05_"
     chemistry.loc[80:84, "Al"] = np.nan
 
     psd = pd.DataFrame({
@@ -48,6 +50,7 @@ def test_generated_anchor_mask_uses_censor_aware_observed_pool():
     assert mask_columns["target_col"].tolist() == ["Al", "K", "11.8", "19.8"]
     assert mask.any()
     assert diagnostics["natural_missing_overlap_cells"] == 0
-    assert diagnostics["censored_overlap_cells"] == 0
+    assert diagnostics["censored_overlap_cells"] > 0
+    assert diagnostics["censored_overlap_cells"] <= diagnostics["marker_cells"] + 10
     assert diagnostics["psd_zero_cells"] == 10
     assert diagnostics["psd_zero_censored_cells"] == 0

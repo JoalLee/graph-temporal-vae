@@ -892,7 +892,7 @@ class Trainer:
         }
 
     def _run_validation(self, loader, epoch, loader_name="Validation"):
-        """Evaluate only on the fixed selection-HO positions."""
+        """Evaluate point-HO and censored-HO positions with separate metrics."""
         self.model.eval()
         self._set_epoch_state(epoch)
         zero = torch.zeros((), device=self.device)
@@ -920,6 +920,16 @@ class Trainer:
                 target = batch["target"].to(self.device, non_blocking=self.non_blocking_transfer)
                 obs_mask = batch["obs_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
                 heldout_mask = batch["heldout_mask"].to(self.device, non_blocking=self.non_blocking_transfer)
+                heldout_censor_mask = batch.get("heldout_censor_mask")
+                if heldout_censor_mask is None:
+                    # Backward-compatible with hand-built/test batches from
+                    # before censored cells could be selected for HO. Such a
+                    # batch has no interval-HO positions to score.
+                    heldout_censor_mask = torch.zeros_like(heldout_mask)
+                else:
+                    heldout_censor_mask = heldout_censor_mask.to(
+                        self.device, non_blocking=self.non_blocking_transfer
+                    )
 
                 with self._autocast_context():
                     recon_mean, recon_logvar, mu, logvar, _ = self.model(input_x, cond, input_mask)
@@ -952,12 +962,12 @@ class Trainer:
                 total_mse += mse_sum.detach()
                 total_heldout_count += heldout_count.detach()
 
-                if self.censor_threshold is not None and "censor_mask" in batch:
+                if self.censor_threshold is not None and float(heldout_censor_mask.sum()) > 0.0:
                     cens_sum, cens_count = masked_censored_nll_components(
                         recon_mean.float(),
                         recon_logvar,
                         self.censor_threshold,
-                        batch["censor_mask"].to(self.device, non_blocking=self.non_blocking_transfer),
+                        heldout_censor_mask,
                         model=self.model,
                         use_student_t_nll=self.config.use_student_t_nll,
                         var_min=var_min,
@@ -1002,8 +1012,9 @@ class Trainer:
                 if crps_count_value > 0
                 else None
             ),
-            # Reported, not selected on: model selection stays on the
-            # observed held-out set so the metric keeps a ground-truth scalar.
+            # Reported separately, not selected on: model selection stays on
+            # the exact-value held-out set while this interval metric checks
+            # whether the predictive distribution respects the censor label.
             "censored_nll": (
                 float((total_censored_nll / censored_count_value).item())
                 if censored_count_value > 0
@@ -1309,15 +1320,15 @@ class Trainer:
         }
 
 
-def _make_fixed_ho_mask(observed_mask, *, mode, ratio, seed, dynamic_config, n_chem):
-    """Build a deterministic HO mask without exposing its targets."""
-    observed_mask = np.asarray(observed_mask, dtype=bool)
+def _make_fixed_ho_mask(eligible_mask, *, mode, ratio, seed, dynamic_config, n_chem):
+    """Build a deterministic HO mask from present (including censored) cells."""
+    eligible_mask = np.asarray(eligible_mask, dtype=bool)
     if mode == "anchor_constrained":
         return sample_anchor_constrained_heldout_mask(
-            observed_mask, ratio=ratio, seed=seed, n_chem=n_chem
+            eligible_mask, ratio=ratio, seed=seed, n_chem=n_chem
         )
     return sample_block_heldout_mask_to_ratio(
-        observed_mask,
+        eligible_mask,
         {**dynamic_config, "target_ratio": ratio, "ensure_nonempty": True},
         seed=seed,
     )
@@ -1724,11 +1735,13 @@ def train_from_config(
     selection_full = None
     selection_mask_diagnostics = None
     val_selection_mask = None
-    # Held-out selection scores predictions against a ground-truth scalar, so
-    # only real detections are eligible: a non-detect has no such value.
-    observed_full = (~np.isnan(target_model_space)) & ~censor_full
-    observed_train = (~np.isnan(train_target)) & ~train_censor
-    observed_val = (~np.isnan(val_target)) & ~val_censor
+    # Natural missing cells are not eligible for HO. Censored cells are
+    # present observations and can be selected, but are scored separately by
+    # their interval constraint rather than by exact-value metrics.
+    eligible_full = ~np.isnan(target_model_space)
+    eligible_train = ~np.isnan(train_target)
+    eligible_val = ~np.isnan(val_target)
+    observed_full = eligible_full & ~censor_full
 
     if full_data_validation and config.shared_full_heldout_mask:
         # One global fixed mask serves both roles: it is excluded from the
@@ -1752,12 +1765,12 @@ def train_from_config(
                     f"{selection_mask_diagnostics['natural_missing_overlap_cells']} "
                     "requested cells overlap natural missingness and "
                     f"{selection_mask_diagnostics['censored_overlap_cells']} "
-                    "overlap censored cells; non-observed cells will not "
-                    "contribute to HO metrics"
+                    "overlap censored cells; censored overlaps use interval "
+                    "metrics and natural-missing overlaps are excluded"
                 )
         else:
             selection_full = _make_fixed_ho_mask(
-                observed_full,
+                eligible_full,
                 mode=config.selection_mask_mode,
                 ratio=config.selection_mask_ratio,
                 seed=config.selection_val_seed,
@@ -1768,7 +1781,7 @@ def train_from_config(
         val_selection_mask = selection_full
     elif config.train_ho_enabled:
         train_selection_mask = _make_fixed_ho_mask(
-            observed_train,
+            eligible_train,
             mode=config.selection_mask_mode,
             ratio=config.train_ho_ratio,
             seed=config.train_ho_seed,
@@ -1783,7 +1796,7 @@ def train_from_config(
 
     if val_selection_mask is None and len(val_target):
         val_selection_mask = _make_fixed_ho_mask(
-            observed_val,
+            eligible_val,
             mode=config.selection_mask_mode,
             ratio=config.selection_mask_ratio,
             seed=config.selection_val_seed,
@@ -1900,13 +1913,13 @@ def train_from_config(
     if train_selection_mask is not None:
         print(
             f"[graph-temporal-vae] train-HO: {int(train_selection_mask.sum())} "
-            f"observed cells held out with seed={config.train_ho_seed}, "
+            f"eligible target cells held out with seed={config.train_ho_seed}, "
             f"ratio={config.train_ho_ratio}"
         )
     if selection_full is not None:
         print(
             f"[graph-temporal-vae] global-HO: {int(selection_full.sum())} "
-            f"observed cells excluded from stage-one input/loss with "
+            f"eligible target cells excluded from stage-one input/loss with "
             f"seed={config.selection_val_seed}, ratio={config.selection_mask_ratio}"
         )
     if censoring.active:
@@ -1969,7 +1982,7 @@ def train_from_config(
         full_aux_mask = ~np.isnan(aux_model_space)
         refit_monitor_seed = config.selection_val_seed + 2
         refit_monitor_mask = sample_block_heldout_mask_to_ratio(
-            observed_full,
+            eligible_full,
             {**dynamic_mask_config, "ensure_nonempty": True},
             seed=refit_monitor_seed,
         )

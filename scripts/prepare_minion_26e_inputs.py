@@ -8,8 +8,9 @@ the graph package then canonicalizes WS/WD to wind_u/wind_v in that order.
 
 The mask may either be copied from an existing artifact or generated from the
 prepared data with the historical 26e anchor-constrained protocol. Generated
-masks use the post-censoring observed state, so natural missing and chemistry
-non-detects cannot accidentally become held-out targets.
+masks use every present target cell, including chemistry non-detect markers;
+natural missing cells cannot become held-out targets. Censored cells are
+scored with their interval constraint rather than as exact scalar values.
 """
 
 from __future__ import annotations
@@ -230,9 +231,13 @@ def _generate_anchor_mask(
         time_grid_policy="strict",
     )
     state = build_state_matrix(raw_targets, schema, censoring, marker_mask)
-    observed_mask = state == STATE_OBSERVED
+    # A numeric ``_`` marker is a present chemistry observation with an upper
+    # bound, not natural missingness. It is therefore eligible for the fixed
+    # HO mask, while the later evaluator must keep it out of exact-value
+    # metrics and score it with the MDL interval instead.
+    eligible_mask = state != STATE_MISSING
     heldout = sample_anchor_constrained_heldout_mask(
-        observed_mask,
+        eligible_mask,
         ratio=ratio,
         seed=seed,
         n_chem=len(schema.chemistry_cols),

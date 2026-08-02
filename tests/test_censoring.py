@@ -342,6 +342,24 @@ def test_heldout_selection_never_scores_a_censored_cell():
         assert (heldout * item["censor_mask"].numpy()).sum() == 0
 
 
+def test_fixed_selection_holds_out_censored_cells_for_interval_scoring():
+    censor = np.zeros((12, 4), dtype=bool)
+    censor[:, 0] = True
+    fixed = np.zeros((12, 4), dtype=bool)
+    fixed[0, 0] = True   # censored marker: interval HO
+    fixed[0, 1] = True   # exact observation: point HO
+    dataset = _dataset(censor, mode="train", fixed_mask=fixed)
+    item = dataset[0]
+
+    assert item["heldout_censor_mask"][0, 0].item() == 1.0
+    assert item["heldout_mask"][0, 0].item() == 0.0
+    assert item["censor_mask"][0, 0].item() == 0.0
+    assert item["input_mask"][0, 0].item() == 0.0
+    assert item["heldout_mask"][0, 1].item() == 1.0
+    assert item["obs_mask"][0, 1].item() == 0.0
+    assert item["input_mask"][0, 1].item() == 0.0
+
+
 def test_dataset_without_censor_mask_matches_previous_behaviour():
     target = np.tile(np.arange(4, dtype=np.float64), (12, 1))
     aux = np.zeros((12, 1))

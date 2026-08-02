@@ -1161,7 +1161,10 @@ class WindowedTimeSeriesDataset(Dataset):
 
     In 'train' mode, dynamic contiguous blocks of already-observed target
     points are hidden from the input while remaining in the loss target. In
-    'val' mode, an externally generated selection mask is held fixed.
+    'val' mode, an externally generated selection mask is held fixed. Exact
+    observations and censored observations use separate held-out masks: the
+    former is scored as a point value, while the latter is scored as an
+    interval (for example, ``y <= MDL``).
     """
 
     def __init__(
@@ -1266,8 +1269,11 @@ class WindowedTimeSeriesDataset(Dataset):
         known_mask = obs_mask + censor_mask
         input_mask = known_mask.copy()
         heldout_mask = np.zeros_like(obs_mask)
+        heldout_censor_mask = np.zeros_like(censor_mask)
         if self.fixed_mask is not None:
-            heldout_mask = (self.fixed_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
+            fixed = self.fixed_mask[start:end]
+            heldout_mask = (fixed & obs_mask.astype(bool)).astype(np.float32)
+            heldout_censor_mask = (fixed & censor_mask.astype(bool)).astype(np.float32)
             # A fixed selection mask is a permanent blind held-out set, not a
             # per-epoch denoising drop: exclude it from obs_mask (not just
             # input_mask) so the reconstruction loss -- computed over
@@ -1276,6 +1282,10 @@ class WindowedTimeSeriesDataset(Dataset):
             # signal to reconstruct exactly the points later reported as
             # held-out accuracy, inflating held-out metrics.
             obs_mask = obs_mask * (1.0 - heldout_mask)
+            # A fixed mask may also select a censored marker cell. Remove it
+            # from the training censor loss and encoder input; it is evaluated
+            # separately with its interval constraint.
+            censor_mask = censor_mask * (1.0 - heldout_censor_mask)
             known_mask = obs_mask + censor_mask
             input_mask = known_mask.copy()
         if self.dynamic_mask_config:
@@ -1288,14 +1298,24 @@ class WindowedTimeSeriesDataset(Dataset):
                 dynamic_mask = sample_dynamic_heldout_mask(
                     known_mask.astype(bool), self.dynamic_mask_config, rng=self.rng
                 ).astype(np.float32)
-            # Held-out metrics need a ground-truth scalar, which a censored
-            # cell does not have: score only the observed positions.
+            # Dynamic training masks remain scalar-HO masks. Censored cells
+            # may be dropped from the input, but they stay under their Tobit
+            # training supervision rather than being reported as exact-value
+            # held-out points.
             heldout_mask = np.maximum(heldout_mask, dynamic_mask * obs_mask)
             input_mask = known_mask * (1.0 - dynamic_mask)
         elif self.selection_mask is not None:
-            selection_mask = (self.selection_mask[start:end] & obs_mask.astype(bool)).astype(np.float32)
-            heldout_mask = np.maximum(heldout_mask, selection_mask)
-            input_mask = known_mask * (1.0 - selection_mask)
+            selection = self.selection_mask[start:end]
+            selection_observed = (selection & obs_mask.astype(bool)).astype(np.float32)
+            selection_censored = (selection & censor_mask.astype(bool)).astype(np.float32)
+            heldout_mask = np.maximum(heldout_mask, selection_observed)
+            heldout_censor_mask = np.maximum(heldout_censor_mask, selection_censored)
+            # The selected censored cells must not remain in the ordinary
+            # censor loss or input; their interval score is computed from the
+            # dedicated heldout_censor_mask below.
+            censor_mask = censor_mask * (1.0 - heldout_censor_mask)
+            known_mask = obs_mask + censor_mask
+            input_mask = known_mask * (1.0 - (selection_observed + selection_censored))
         if self.denoise_prob > 0:
             drop = (known_mask == 1.0) & (self.rng.random(known_mask.shape) < self.denoise_prob)
             input_mask[drop] = 0.0
@@ -1307,6 +1327,7 @@ class WindowedTimeSeriesDataset(Dataset):
             "obs_mask": torch.from_numpy(obs_mask),
             "censor_mask": torch.from_numpy(censor_mask),
             "heldout_mask": torch.from_numpy(heldout_mask),
+            "heldout_censor_mask": torch.from_numpy(heldout_censor_mask),
             "input_x": torch.from_numpy(input_x),
             "input_mask": torch.from_numpy(input_mask),
         }
