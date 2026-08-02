@@ -1,13 +1,13 @@
 {
   "modality_files": {
     "chemistry": [
-      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42/chemistry_26e_core_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42_with_censored_ho/chemistry_26e_core_20240201_20251031.csv"
     ],
     "psd": [
-      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42/psd_26e_full_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42_with_censored_ho/psd_26e_full_20240201_20251031.csv"
     ],
     "meteorology": [
-      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42/meteorology_26e_at_rh_wind_blh_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42_with_censored_ho/meteorology_26e_at_rh_wind_blh_20240201_20251031.csv"
     ]
   },
   "timestamp_col": "time",
@@ -67,8 +67,8 @@
   "selection_mask_mode": "anchor_constrained",
   "selection_mask_ratio": 0.1,
   "shared_full_heldout_mask": true,
-  "selection_mask_path": "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42/heldout_mask_full_seed42.npy",
-  "selection_mask_columns_path": "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42/heldout_mask_full_columns_seed42.csv",
+  "selection_mask_path": "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42_with_censored_ho/heldout_mask_full_seed42.npy",
+  "selection_mask_columns_path": "data/research_data/minion_2024_2025_26e_split_censored_anchor_seed42_with_censored_ho/heldout_mask_full_columns_seed42.csv",
   "validation_metric": "ho_mse",
   "full_data_refit_epochs": 0,
   "val_crps_mc_samples": 20,
