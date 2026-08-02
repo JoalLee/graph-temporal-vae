@@ -23,7 +23,13 @@ from .contracts import (
     ModalityInputs,
     PreprocessingConfig,
 )
-from .data import compute_window_starts, load_frame, load_modality_frame, make_condition
+from .data import (
+    compute_window_starts,
+    extract_censor_marker_mask,
+    load_frame,
+    load_modality_frame,
+    make_condition,
+)
 from .model_config import ModelConfig
 from .model_graph_uq import ImputationVAE_Graph
 from .preprocessing import (
@@ -643,7 +649,12 @@ def impute(
     censoring = bundle.get("censoring") or CensoringConfig()
     if isinstance(censoring, dict):
         censoring = CensoringConfig.from_dict(censoring)
-    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    marker_mask = extract_censor_marker_mask(frame, target_cols)
+    if data_schema.n_chem < marker_mask.shape[1]:
+        marker_mask[:, data_schema.n_chem:] = False
+    state_full = build_state_matrix(
+        target_raw, data_schema, censoring, marker_mask=marker_mask
+    )
     censor_mask_full = (state_full == STATE_CENSORED).astype(np.float32)
     target_input_raw = apply_input_fill(target_raw, state_full, data_schema, censoring)
     target_model_space = transform_targets(target_input_raw, data_schema, preprocessing)

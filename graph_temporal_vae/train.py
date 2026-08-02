@@ -36,6 +36,7 @@ from .data import (
     WindowedTimeSeriesDataset,
     canonicalize_wind_column_names,
     chronological_split_index,
+    extract_censor_marker_mask,
     load_frame,
     load_modality_frame,
     sample_anchor_constrained_heldout_mask,
@@ -1604,9 +1605,17 @@ def train_from_config(
     aux_cols = data_schema.auxiliary_cols
     n_chem = data_schema.n_chem
     target_raw = frame[target_cols].to_numpy(dtype=np.float64)
+    # Source-QC markers are meaningful for chemistry only. PSD zeros (and any
+    # future PSD marker convention) must never enter below-detection-limit
+    # censoring unless a separate PSD policy is explicitly added.
+    marker_mask = extract_censor_marker_mask(frame, target_cols)
+    if n_chem < marker_mask.shape[1]:
+        marker_mask[:, n_chem:] = False
     censoring = config.censoring or CensoringConfig()
     # Classify before transforming: detection is defined on physical values.
-    state_full = build_state_matrix(target_raw, data_schema, censoring)
+    state_full = build_state_matrix(
+        target_raw, data_schema, censoring, marker_mask=marker_mask
+    )
     censor_full = state_full == STATE_CENSORED
     # loss='ignore' demotes non-detects to missing, so drop their values too.
     if censoring.active and censoring.loss == "ignore":

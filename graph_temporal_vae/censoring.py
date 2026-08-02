@@ -129,28 +129,65 @@ def build_state_matrix(
     raw_targets,
     schema: DataSchema,
     config: Optional[CensoringConfig],
+    marker_mask=None,
 ) -> np.ndarray:
-    """Classify every raw target cell as MISSING, OBSERVED, or CENSORED."""
+    """Classify every raw target cell as MISSING, OBSERVED, or CENSORED.
+
+    ``marker_mask`` is an optional source-QC mask for values such as
+    ``52.4_``.  The numeric payload remains in ``raw_targets``; the mask only
+    supplies the observation state.  Marker cells require an active threshold
+    for their column so the interval upper bound is unambiguous.
+    """
     values = np.asarray(raw_targets, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != schema.target_dim:
         raise ValueError(
             f"raw_targets must be (rows, {schema.target_dim}), got {values.shape}"
         )
     state = np.where(np.isnan(values), STATE_MISSING, STATE_OBSERVED).astype(np.int8)
+    markers = _validate_marker_mask(marker_mask, values.shape)
+    thresholds = resolve_thresholds(schema, config)
+    marker_without_limit = markers & ~np.isfinite(thresholds)[None, :]
+    if marker_without_limit.any():
+        columns = [
+            schema.target_cols[index]
+            for index in np.flatnonzero(marker_without_limit.any(axis=0))
+        ]
+        raise ValueError(
+            "Censored marker(s) have no detection limit for target column(s): "
+            f"{columns}"
+        )
     if config is None or not config.active or config.loss == "ignore":
         if config is not None and config.active and config.loss == "ignore":
-            censored = _detect_censored(values, schema, config)
+            censored = _detect_censored(values, schema, config, markers)
             state[censored] = STATE_MISSING
+        elif markers.any():
+            raise ValueError(
+                "Censored markers require an enabled CensoringConfig with thresholds"
+            )
         return state
-    state[_detect_censored(values, schema, config)] = STATE_CENSORED
+    state[_detect_censored(values, schema, config, markers)] = STATE_CENSORED
     return state
 
 
-def _detect_censored(values, schema: DataSchema, config: CensoringConfig) -> np.ndarray:
+def _validate_marker_mask(marker_mask, shape):
+    if marker_mask is None:
+        return np.zeros(shape, dtype=bool)
+    markers = np.asarray(marker_mask, dtype=bool)
+    if markers.shape != shape:
+        raise ValueError(
+            "censor marker mask shape must match raw targets: "
+            f"expected={shape}, got={markers.shape}"
+        )
+    return markers
+
+
+def _detect_censored(values, schema: DataSchema, config: CensoringConfig, marker_mask=None) -> np.ndarray:
     thresholds = resolve_thresholds(schema, config)
     has_threshold = np.isfinite(thresholds)
     observed = ~np.isnan(values)
     censored = observed & has_threshold[None, :] & (values == 0.0)
+    if marker_mask is not None:
+        censored |= marker_mask & observed & has_threshold[None, :]
     if config.detect == "at_or_below_threshold":
         # NaN thresholds compare False, so uncensored columns stay untouched.
         with np.errstate(invalid="ignore"):

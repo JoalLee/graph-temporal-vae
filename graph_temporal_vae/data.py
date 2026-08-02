@@ -6,6 +6,7 @@ plus named target/auxiliary columns, NaN = missing) into the
 expects. Column selection is config-driven (explicit name lists), not
 positional, so it works for any dataset shape.
 """
+import re
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,57 @@ SUPPORTED_TARGET_TRANSFORMS = {"none", "log1p"}
 WIND_RAW_COLUMNS = ("WS", "WD")
 WIND_COMPONENT_COLUMNS = ("wind_u", "wind_v")
 WIND_ENCODING = "ws_wd_to_uv_v1"
+
+# A trailing underscore is the QC convention used by the Minion source files
+# for a numeric result that is below the detection limit.  Keep the numeric
+# payload and carry the marker separately; replacing it with NaN or zero would
+# destroy the distinction between a non-detect and a genuinely absent/zero
+# observation.
+_CENSORED_NUMERIC_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)_\s*$"
+)
+
+
+def _parse_censored_numeric_series(series):
+    """Parse numeric values and return a boolean mask for trailing ``_`` markers."""
+    text = series.astype("string")
+    marker = text.str.fullmatch(_CENSORED_NUMERIC_RE).fillna(False).to_numpy(dtype=bool)
+    if marker.any():
+        text = text.str.replace(_CENSORED_NUMERIC_RE, r"\1", regex=True)
+    numeric = pd.to_numeric(text, errors="raise")
+    return numeric, marker
+
+
+def extract_censor_marker_mask(frame, target_cols):
+    """Return the loader-produced marker mask in ``target_cols`` order.
+
+    The mask is stored in ``DataFrame.attrs`` so the numeric frame remains
+    compatible with the existing public data contract.  Frames created by
+    callers that have no marker metadata receive an all-False mask.
+    """
+    target_cols = list(target_cols)
+    expected = (len(frame), len(target_cols))
+    raw_mask = frame.attrs.get("censor_marker_mask")
+    if raw_mask is None:
+        return np.zeros(expected, dtype=bool)
+    raw_mask = np.asarray(raw_mask, dtype=bool)
+    raw_cols = list(frame.attrs.get("censor_marker_columns", target_cols))
+    if raw_mask.ndim != 2 or raw_mask.shape[0] != len(frame):
+        raise ValueError(
+            "censor marker mask must have one row per loaded timestamp: "
+            f"expected_rows={len(frame)}, got={raw_mask.shape}"
+        )
+    if len(raw_cols) != raw_mask.shape[1] or len(set(raw_cols)) != len(raw_cols):
+        raise ValueError("censor marker metadata has invalid column ordering")
+    missing = sorted(set(target_cols) - set(raw_cols))
+    extra = sorted(set(raw_cols) - set(target_cols))
+    if missing or extra:
+        raise ValueError(
+            "censor marker columns do not match loaded targets: "
+            f"missing={missing}, extra={extra}"
+        )
+    order = [raw_cols.index(column) for column in target_cols]
+    return raw_mask[:, order]
 
 
 def compute_time_cyclical_features(index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -378,6 +430,7 @@ def load_frame(
     )
     required = target_cols + source_aux_cols
     selected_frames = []
+    marker_frames = []
     sources = {}
     for source_index, source in enumerate(csv_paths):
         label = _source_label(source, source_index)
@@ -401,7 +454,19 @@ def load_frame(
                 )
             sources[column] = label
         if present:
-            selected_frames.append(df[present])
+            selected = df[present].copy()
+            marker_frame = pd.DataFrame(False, index=df.index, columns=present)
+            for column in present:
+                if column in target_cols:
+                    try:
+                        selected[column], marker = _parse_censored_numeric_series(
+                            selected[column]
+                        )
+                    except Exception as exc:
+                        raise ValueError(f"Column {column!r} must be numeric") from exc
+                    marker_frame[column] = marker
+            selected_frames.append(selected)
+            marker_frames.append(marker_frame)
 
     missing = [column for column in required if column not in sources]
     if missing:
@@ -410,6 +475,7 @@ def load_frame(
         raise ValueError("No requested columns were loaded")
 
     merged = pd.concat(selected_frames, axis=1, join="outer").sort_index()
+    marker_merged = pd.concat(marker_frames, axis=1, join="outer").sort_index()
     if not merged.index.is_monotonic_increasing:
         raise ValueError("Timestamp index could not be sorted monotonically")
     if merged.index.has_duplicates:
@@ -459,6 +525,8 @@ def load_frame(
                 )
             merged = merged.reindex(full_index)
             merged.index.name = timestamp_col
+            marker_merged = marker_merged.reindex(full_index, fill_value=False)
+            marker_merged.index.name = timestamp_col
 
     resolved_aux_cols = (
         canonicalize_wind_column_names(source_aux_cols)
@@ -468,12 +536,15 @@ def load_frame(
     if canonicalize_wind:
         merged = canonicalize_wind_columns(merged, source_aux_cols)
     merged = merged[[*target_cols, *resolved_aux_cols]]
+    marker_merged = marker_merged.reindex(columns=target_cols, fill_value=False).fillna(False)
 
     merged.attrs["frequency"] = frequency.freqstr if frequency is not None else None
     merged.attrs["timezone"] = str(merged.index.tz) if merged.index.tz is not None else None
     merged.attrs["time_grid_policy"] = time_grid_policy
     if canonicalize_wind and set(WIND_COMPONENT_COLUMNS).issubset(resolved_aux_cols):
         merged.attrs["wind_encoding"] = WIND_ENCODING
+    merged.attrs["censor_marker_mask"] = marker_merged.to_numpy(dtype=bool)
+    merged.attrs["censor_marker_columns"] = list(target_cols)
     return merged
 
 
@@ -645,6 +716,8 @@ def load_modality_frame(
             "timezone does not match training schema: "
             f"expected={expected_schema.timezone!r}, actual={actual_timezone!r}"
         )
+    marker_mask = frame.attrs.get("censor_marker_mask")
+    marker_columns = frame.attrs.get("censor_marker_columns")
     if add_time_cyclical_features:
         frame = pd.concat([frame, compute_time_cyclical_features(frame.index)], axis=1)
     schema = DataSchema(
@@ -665,6 +738,11 @@ def load_modality_frame(
         timezone=schema.timezone,
         time_grid_policy=schema.time_grid_policy,
     )
+    if marker_mask is not None:
+        frame.attrs["censor_marker_mask"] = marker_mask
+        frame.attrs["censor_marker_columns"] = (
+            list(marker_columns) if marker_columns is not None else list(schema.target_cols)
+        )
     return frame, schema
 
 

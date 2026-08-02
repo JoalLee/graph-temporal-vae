@@ -89,6 +89,30 @@ def test_three_states_are_distinguished():
     assert state[2, 0] == STATE_OBSERVED
 
 
+def test_source_marker_is_censored_without_treating_payload_as_zero():
+    schema = _schema()
+    config = CensoringConfig(enabled=True, thresholds={"a": 0.2})
+    values = np.array([[0.15, 0.0, 0.0, 0.0]])
+    marker_mask = np.array([[True, False, False, False]])
+
+    state = build_state_matrix(values, schema, config, marker_mask=marker_mask)
+
+    assert state[0, 0] == STATE_CENSORED
+    assert values[0, 0] == pytest.approx(0.15)
+    assert state[0, 1] == STATE_OBSERVED  # PSD/uncensored zero stays observed
+
+
+def test_source_marker_without_detection_limit_fails_loudly():
+    schema = _schema()
+    config = CensoringConfig(enabled=True, thresholds={"a": 0.2})
+    marker_mask = np.array([[False, True, False, False]])
+
+    with pytest.raises(ValueError, match="no detection limit"):
+        build_state_matrix(
+            np.ones((1, 4)), schema, config, marker_mask=marker_mask
+        )
+
+
 def test_at_or_below_threshold_detects_reported_subliminal_values():
     schema = _schema()
     values = np.array([[0.1, 1.0, 1.0, 1.0]])

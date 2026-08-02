@@ -15,6 +15,7 @@ from graph_temporal_vae.data import (
     chronological_split_index,
     compute_time_cyclical_features,
     compute_window_starts,
+    extract_censor_marker_mask,
     inverse_target_values,
     load_frame,
     load_modality_frame,
@@ -97,6 +98,29 @@ def test_load_frame_joins_multiple_csvs_on_timestamp(tmp_path):
     assert list(frame["a"]) == list(range(6))
     assert list(frame["b"]) == list(range(6, 12))
     assert frame.index.is_monotonic_increasing
+
+
+def test_load_frame_parses_numeric_qc_marker_and_retains_mask(tmp_path):
+    path = tmp_path / "marked.csv"
+    pd.DataFrame(
+        {
+            "time": pd.date_range("2024-01-01", periods=3, freq="h"),
+            "chem": ["0.15_", "0.2", np.nan],
+            "psd": ["0", "1.5_", "2.0"],
+        }
+    ).to_csv(path, index=False)
+
+    frame = load_frame(
+        [path], "time", target_cols=["chem", "psd"], aux_cols=[]
+    )
+
+    np.testing.assert_allclose(frame["chem"].to_numpy(), [0.15, 0.2, np.nan], equal_nan=True)
+    np.testing.assert_allclose(frame["psd"].to_numpy(), [0.0, 1.5, 2.0])
+    marker_mask = extract_censor_marker_mask(frame, ["chem", "psd"])
+    np.testing.assert_array_equal(
+        marker_mask,
+        np.array([[True, False], [False, True], [False, False]]),
+    )
 
 
 def test_load_frame_rejects_irregular_grid_by_default(tmp_path):
