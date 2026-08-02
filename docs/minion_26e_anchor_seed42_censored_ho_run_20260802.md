@@ -51,7 +51,7 @@ processing summary are new.
 | PSD masked timesteps | 762 |
 | total mask cells | 218,026 |
 | natural-missing overlap | 0 |
-| censored overlap | 4,116 |
+| censored overlap | 4,116 (including 651 numeric `_` marker cells) |
 | PSD zero cells | 80,797 |
 | PSD zero cells classified censored | 0 |
 
