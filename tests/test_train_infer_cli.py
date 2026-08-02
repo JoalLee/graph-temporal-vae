@@ -1299,14 +1299,17 @@ def test_train_ho_config_resolves_a_distinct_fixed_mask_seed_and_ratio():
 
 def test_external_heldout_mask_loader_preserves_matrix_and_reports_overlap(tmp_path):
     mask = np.array(
-        [[True, False], [False, True], [True, True]], dtype=bool
+        [[True, True], [True, True], [True, False]], dtype=bool
     )
     mask_path = tmp_path / "heldout_mask.npy"
     columns_path = tmp_path / "heldout_mask_columns.csv"
     np.save(mask_path, mask)
     pd.DataFrame({"target_col": ["chem", "psd"]}).to_csv(columns_path, index=False)
     observed = np.array(
-        [[True, True], [True, False], [True, True]], dtype=bool
+        [[True, True], [True, False], [False, False]], dtype=bool
+    )
+    censored = np.array(
+        [[False, False], [False, True], [False, False]], dtype=bool
     )
 
     loaded, diagnostics = load_external_heldout_mask(
@@ -1315,12 +1318,14 @@ def test_external_heldout_mask_loader_preserves_matrix_and_reports_overlap(tmp_p
         expected_rows=3,
         target_cols=["chem", "psd"],
         observed_mask=observed,
+        censored_mask=censored,
     )
 
     np.testing.assert_array_equal(loaded, mask)
-    assert diagnostics["requested_cells"] == 4
+    assert diagnostics["requested_cells"] == 5
     assert diagnostics["observed_cells"] == 3
     assert diagnostics["natural_missing_overlap_cells"] == 1
+    assert diagnostics["censored_overlap_cells"] == 1
 
 
 def test_external_heldout_mask_loader_rejects_target_order_mismatch(tmp_path):
@@ -1660,10 +1665,13 @@ def test_legacy_dynamic_mask_matches_research_modal_pattern():
 
 def test_anchor_constrained_selection_mask_preserves_observed_anchors():
     observed = np.ones((168, 4), dtype=bool)
+    observed[40:52, 0] = False
+    observed[80:96, 2:] = False
     heldout = sample_anchor_constrained_heldout_mask(observed, ratio=0.1, seed=42, n_chem=1)
 
     assert heldout.shape == observed.shape
     assert heldout.any()
+    assert not np.any(heldout & ~observed)
     for feature in range(4):
         positions = np.flatnonzero(heldout[:, feature])
         if positions.size:

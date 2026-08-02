@@ -247,8 +247,9 @@ def censoring_report(
     state: np.ndarray,
     schema: DataSchema,
     config: Optional[CensoringConfig],
+    marker_mask=None,
 ) -> Dict[str, Any]:
-    """Summarize the observation-state split for logging and bundle metadata."""
+    """Summarize observation states for logging and bundle metadata."""
     state = np.asarray(state)
     total = int(state.size)
     counts = {
@@ -270,11 +271,14 @@ def censoring_report(
             "threshold": float(thresholds[index]) if np.isfinite(thresholds[index]) else None,
         }
     n_censored_columns = sum(1 for stats in per_column.values() if stats["censored_fraction"] > 0)
+    markers = _validate_marker_mask(marker_mask, state.shape)
     return {
         "cells": total,
         "counts": counts,
         "fractions": {key: (value / total if total else 0.0) for key, value in counts.items()},
         "n_censored_columns": n_censored_columns,
+        "marker_cells": int(markers.sum()),
+        "marker_censored_cells": int((markers & (state == STATE_CENSORED)).sum()),
         "per_column": per_column,
     }
 
