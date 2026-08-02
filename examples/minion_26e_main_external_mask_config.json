@@ -1,13 +1,13 @@
 {
   "modality_files": {
     "chemistry": [
-      "data/research_data/minion_2024_2025_26e_split/chemistry_26e_core_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored/chemistry_26e_core_20240201_20251031.csv"
     ],
     "psd": [
-      "data/research_data/minion_2024_2025_26e_split/psd_26e_full_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored/psd_26e_full_20240201_20251031.csv"
     ],
     "meteorology": [
-      "data/research_data/minion_2024_2025_26e_split/meteorology_26e_at_rh_wind_blh_20240201_20251031.csv"
+      "data/research_data/minion_2024_2025_26e_split_censored/meteorology_26e_at_rh_wind_blh_20240201_20251031.csv"
     ]
   },
   "timestamp_col": "time",
@@ -67,8 +67,8 @@
   "selection_mask_mode": "anchor_constrained",
   "selection_mask_ratio": 0.1,
   "shared_full_heldout_mask": true,
-  "selection_mask_path": "data/research_data/minion_2024_2025_26e_split/heldout_mask_full_seed42.npy",
-  "selection_mask_columns_path": "data/research_data/minion_2024_2025_26e_split/heldout_mask_full_columns_seed42.csv",
+  "selection_mask_path": "data/research_data/minion_2024_2025_26e_split_censored/heldout_mask_full_seed42.npy",
+  "selection_mask_columns_path": "data/research_data/minion_2024_2025_26e_split_censored/heldout_mask_full_columns_seed42.csv",
   "validation_metric": "ho_mse",
   "full_data_refit_epochs": 0,
   "val_crps_mc_samples": 20,
@@ -100,6 +100,39 @@
   "chem_feature_weight": 12.0,
   "psd_feature_weight": 1.0,
   "aux_mask_channel": false,
+  "censoring": {
+    "enabled": true,
+    "detect": "zero",
+    "input_fill": "half_threshold",
+    "loss": "tobit",
+    "thresholds": {
+      "Al": 0.1,
+      "As": 6.3e-05,
+      "Ba": 0.00039,
+      "Br": 0.0001,
+      "Ca": 0.0003,
+      "Cl-": 0.05,
+      "Cr": 0.00011999999999999999,
+      "Cu": 7.9e-05,
+      "EC": 0.015,
+      "Fe": 0.00017,
+      "K": 0.0012,
+      "Mn": 0.00014000000000000001,
+      "NH4+": 0.08,
+      "NO2-": 0.05,
+      "NO3-": 0.01,
+      "Na+": 0.05,
+      "Ni": 9.6e-05,
+      "PM2.5": 0.22447925,
+      "Pb": 0.00013000000000000002,
+      "SO42-": 0.05,
+      "Se": 8.1e-05,
+      "Si": 0.018,
+      "Ti": 0.0016,
+      "V": 0.00011999999999999999,
+      "Zn": 6.7e-05
+    }
+  },
   "seed": 42,
   "model_kwargs": {
     "latent_dim": 256,
