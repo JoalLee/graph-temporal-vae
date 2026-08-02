@@ -848,6 +848,82 @@ def test_heldout_eval_example_script_scores_only_masked_points(tmp_path):
     assert len(predictions) == results["chem_heldout_n"] + results["psd_heldout_n"]
     assert set(predictions["family"]) <= {"chem", "psd"}
     assert predictions["physical_pred_std"].gt(0).all()
+
+
+def test_heldout_eval_separates_censored_markers_and_respects_mdl(tmp_path):
+    csv_path = tmp_path / "censored_synthetic.csv"
+    frame = _write_synthetic_csv(csv_path, n=96, seed=4)
+    frame["target_a"] = frame["target_a"].astype(object)
+    frame.loc[20:29, "target_a"] = "0.05_"
+    frame.to_csv(csv_path, index=False)
+    mdl_path = tmp_path / "mdl.json"
+    mdl_path.write_text(json.dumps({"target_a": 0.1}))
+    bundle_path = tmp_path / "censored_bundle.pt"
+
+    cli_main([
+        "train",
+        "--csv", str(csv_path),
+        "--timestamp-col", "time",
+        "--target-cols", "target_a,target_b",
+        "--aux-cols", "ws,at",
+        "--n-chem", "1",
+        "--censoring-thresholds", str(mdl_path),
+        "--window-size", "16",
+        "--stride", "8",
+        "--val-fraction", "0.2",
+        "--batch-size", "4",
+        "--epochs", "1",
+        "--patience", "1",
+        "--latent-dim", "4",
+        "--hidden-dims", "8",
+        "--encoder-layers", "1",
+        "--decoder-layers", "1",
+        "--n-graph-heads", "1",
+        "-o", str(bundle_path),
+    ])
+
+    external_mask = np.zeros((len(frame), 2), dtype=bool)
+    external_mask[20:25, 0] = True       # censored marker cells
+    external_mask[70:85, 0] = True       # exact chemistry cells
+    external_mask[10:25, 1] = True       # exact second target cells
+    external_mask_path = tmp_path / "censored_heldout.npy"
+    external_columns_path = tmp_path / "censored_heldout_columns.csv"
+    np.save(external_mask_path, external_mask)
+    pd.DataFrame({"target_col": ["target_a", "target_b"]}).to_csv(
+        external_columns_path, index=False
+    )
+    output_path = tmp_path / "censored_heldout_metrics.json"
+    predictions_path = tmp_path / "censored_heldout_predictions.csv"
+    script = Path(__file__).resolve().parents[1] / "examples" / "heldout_eval.py"
+    proc = subprocess.run(
+        [
+            sys.executable, str(script),
+            "--bundle", str(bundle_path),
+            "--csv", str(csv_path),
+            "--n-chem", "1",
+            "--n-mc-samples", "3",
+            "--stride", "8",
+            "--selection-mask-path", str(external_mask_path),
+            "--selection-mask-columns-path", str(external_columns_path),
+            "-o", str(output_path),
+            "--predictions-csv", str(predictions_path),
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    results = json.loads(output_path.read_text())
+    assert results["selection_mask_protocol"]["censored_overlap_cells"] == 5
+    assert results["chem_censored_ho_n"] == 5
+    assert np.isfinite(results["chem_censored_ho_gaussian_nll"])
+    assert 0.0 <= results["chem_censored_ho_constrained_mean_above_mdl_rate"] <= 1.0
+
+    predictions = pd.read_csv(predictions_path)
+    censored_predictions = predictions[predictions["observation_state"] == "censored"]
+    assert len(censored_predictions) == 5
+    assert np.all(censored_predictions["physical_pred_mean"] <= 0.1 + 1e-8)
+    assert np.all(censored_predictions["physical_q025"] <= 0.1 + 1e-8)
+    assert np.all(censored_predictions["physical_q975"] <= 0.1 + 1e-8)
     # scaled_* must be the SAME z-score space for observed and predicted --
     # a real (if imperfect) model should land in a comparable range, not be
     # off by the several standard deviations a de-standardized value

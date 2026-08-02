@@ -650,7 +650,9 @@ def main():
             p_below = p_below_limit[:, cols][censored_valid]
             raw_mean = mean_out_unconstrained[:, cols][censored_valid]
             constrained_mean = mean_out[:, cols][censored_valid]
-            limits = limit_output[None, :][:, cols][censored_valid]
+            limits = np.broadcast_to(
+                limit_output[cols][None, :], censored_valid.shape
+            )[censored_valid]
             results[f"{cat_name}_censored_ho_p_below_mdl"] = float(np.mean(p_below))
             results[f"{cat_name}_censored_ho_gaussian_nll"] = float(
                 np.mean(-np.log(np.clip(p_below, 1e-12, 1.0)))

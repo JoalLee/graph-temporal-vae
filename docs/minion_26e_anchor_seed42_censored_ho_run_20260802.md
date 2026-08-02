@@ -67,7 +67,7 @@ The output summary contains all source/mask hashes and generation parameters:
 
 ## Validation record
 
-- Focused censoring/data-pipeline/train-inference tests: `128 passed`.
+- Full repository test suite: `141 passed`.
 - The new fixed-mask test verifies that a selected censored cell is removed
   from the input and ordinary censor loss, exposed through
   `heldout_censor_mask`, and not counted in exact-value `heldout_mask`.
