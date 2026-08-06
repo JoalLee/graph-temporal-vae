@@ -19,6 +19,7 @@ class ImputationVAE_Graph(nn.Module):
     """Graph-enhanced probabilistic VAE for multivariate time-series imputation."""
 
     def __init__(self, target_dim, aux_dim, window_size, latent_dim=256,
+                 latent_mode='variational',
                  hidden_dims=[512, 512, 512], encoder_layers=5, decoder_layers=5,
                  kernel_size=3, dropout=0.1, heteroscedastic=True, n_graph_heads=4,
                  var_min=1e-3, var_max=10.0,
@@ -148,6 +149,11 @@ class ImputationVAE_Graph(nn.Module):
                  prior_df_min=2.1,
                  prior_df_max=30.0):
         super().__init__()
+        self.latent_mode = str(latent_mode)
+        if self.latent_mode not in {'variational', 'deterministic'}:
+            raise ValueError(
+                "latent_mode must be one of {'variational', 'deterministic'}"
+            )
         self.ignore_obs_mask = ignore_obs_mask
         self.cross_modal_query_gate_mode = str(cross_modal_query_gate_mode)
         self.use_realnvp = use_realnvp
@@ -768,7 +774,10 @@ class ImputationVAE_Graph(nn.Module):
             'last_local_chunk_graph_obs_ratio_mean',
         ):
             setattr(self, name, getattr(self.encoder, name, None))
-        z = self.reparameterize(mu, logvar) if sample_latent else mu
+        should_sample_latent = (
+            self.latent_mode == 'variational' and bool(sample_latent)
+        )
+        z = self.reparameterize(mu, logvar) if should_sample_latent else mu
         self.last_log_det_J = None
         self.last_z0 = z
         self.last_zK = z

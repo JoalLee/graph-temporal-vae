@@ -14,6 +14,7 @@ class ModelConfig:
     """Optional Graph-enhanced Temporal-VAE architecture and ablation settings."""
 
     latent_dim: int = 256
+    latent_mode: str = "variational"
     hidden_dims: List[int] = field(default_factory=lambda: [512, 512, 512])
     encoder_layers: int = 5
     decoder_layers: int = 5

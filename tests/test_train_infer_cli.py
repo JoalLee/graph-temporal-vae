@@ -116,6 +116,44 @@ def _small_multimodal_train_config():
     )
 
 
+def test_probabilistic_ae_bundle_roundtrip_and_history(tmp_path):
+    csv_path = tmp_path / "probabilistic_ae.csv"
+    _write_synthetic_csv(csv_path, n=80)
+    bundle_path = tmp_path / "probabilistic_ae.pt"
+    config = TrainConfig(
+        csv=[str(csv_path)],
+        timestamp_col="time",
+        target_cols=["target_a", "target_b"],
+        aux_cols=["ws", "at"],
+        window_size=8,
+        stride=8,
+        val_fraction=0.25,
+        batch_size=4,
+        epochs=1,
+        patience=1,
+        kl_max_beta=1.0,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [8],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+            "latent_mode": "deterministic",
+        },
+    )
+
+    train_from_config(config, str(bundle_path))
+
+    raw_bundle = torch.load(bundle_path, map_location="cpu", weights_only=True)
+    loaded = load_bundle(bundle_path, device=torch.device("cpu"))
+    history = pd.read_csv(tmp_path / "probabilistic_ae_history.csv")
+    assert raw_bundle["model_kwargs"]["latent_mode"] == "deterministic"
+    assert loaded["model"].latent_mode == "deterministic"
+    assert history["kl_beta"].eq(0.0).all()
+    assert history["train_kl"].eq(0.0).all()
+    assert history["train_weighted_kl"].eq(0.0).all()
+
+
 def test_multimodal_cli_discovers_schema_persists_preprocessing_and_imputes(tmp_path):
     paths = _write_modality_csvs(tmp_path)
     bundle_path = tmp_path / "multimodal.pt"
@@ -1243,6 +1281,40 @@ def test_lr_warmup_epochs_overrides_ratio_default():
     assert default_trainer.lr_scheduler.warmup_epochs == 35  # unchanged default behavior
 
 
+def test_probabilistic_ae_reports_zero_effective_kl_beta():
+    config = TrainConfig(
+        csv=["unused.csv"],
+        timestamp_col="time",
+        target_cols=["target"],
+        epochs=4,
+        kl_max_beta=1.0,
+        model_kwargs={
+            "latent_dim": 4,
+            "hidden_dims": [4],
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "n_graph_heads": 1,
+            "latent_mode": "deterministic",
+        },
+    )
+    model = ImputationVAE_Graph(
+        target_dim=1,
+        aux_dim=0,
+        window_size=8,
+        **config.model_kwargs,
+    )
+    trainer = Trainer(
+        model,
+        train_loader=None,
+        val_loader=None,
+        config=config,
+        device=torch.device("cpu"),
+    )
+
+    assert trainer._effective_kl_beta(1.0) == 0.0
+    assert config.model_kwargs["latent_mode"] == "deterministic"
+
+
 def test_use_adaptive_lr_builds_plateau_scheduler_and_skips_cosine_after_warmup():
     config = TrainConfig(
         csv=["unused.csv"],
@@ -1655,6 +1727,47 @@ def test_feature_weights_are_applied_before_window_reduction():
 
     assert loss.item() == pytest.approx(13.0)
     assert recon.item() == pytest.approx(13.0)
+
+
+def test_probabilistic_ae_loss_is_reconstruction_only_even_with_flow_and_beta():
+    torch.manual_seed(3)
+    model = ImputationVAE_Graph(
+        target_dim=2,
+        aux_dim=1,
+        window_size=8,
+        latent_dim=4,
+        hidden_dims=[8, 8],
+        encoder_layers=1,
+        decoder_layers=1,
+        n_graph_heads=1,
+        n_chem=1,
+        dropout=0.0,
+        latent_mode="deterministic",
+        use_realnvp=True,
+        realnvp_layers=2,
+    )
+    model.eval()
+    target = torch.randn(2, 8, 2)
+    cond = torch.randn(2, 8, 1)
+    obs_mask = torch.ones_like(target)
+
+    recon_mean, recon_logvar, mu, logvar, _ = model(
+        target, cond, obs_mask, sample_latent=True
+    )
+    loss, recon, kl, weighted_kl = vae_loss(
+        recon_mean,
+        recon_logvar,
+        target,
+        obs_mask,
+        mu,
+        logvar,
+        beta=1.0,
+        model=model,
+    )
+
+    assert loss.item() == pytest.approx(recon.item())
+    assert kl.item() == pytest.approx(0.0)
+    assert weighted_kl.item() == pytest.approx(0.0)
 
 
 def test_fixed_mask_is_kept_out_of_training_inputs():

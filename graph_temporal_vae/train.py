@@ -416,6 +416,9 @@ def _latent_kl_loss(mu, logvar, model=None, prior_type="gaussian"):
     signal. Always reflects the true divergence, regardless of any
     free-bits floor applied to the loss term in ``vae_loss`` -- otherwise
     collapse would become invisible the moment free-bits is turned on."""
+    if model is not None and getattr(model, "latent_mode", "variational") == "deterministic":
+        return mu.detach().new_zeros(())
+
     kl_per_dim, log_det = _latent_kl_per_dim(mu, logvar, model=model, prior_type=prior_type)
     total = kl_per_dim.sum(dim=1)
     if log_det is not None:
@@ -494,6 +497,10 @@ def vae_loss(recon_mean, recon_logvar, target, obs_mask, mu, logvar, beta, metri
             chem_feature_weight=chem_feature_weight,
             psd_feature_weight=psd_feature_weight,
         )
+
+    if model is not None and getattr(model, "latent_mode", "variational") == "deterministic":
+        zero = recon.detach().new_zeros(())
+        return recon, recon.detach(), zero, zero
 
     kl_per_dim, log_det = _latent_kl_per_dim(mu, logvar, model=model, prior_type=prior_type)
     raw_kl_total = kl_per_dim.sum(dim=1)
@@ -757,6 +764,11 @@ class Trainer:
             enabled=self.amp_enabled and self.amp_dtype == torch.float16
         )
 
+    def _effective_kl_beta(self, beta):
+        if getattr(self.model, "latent_mode", "variational") == "deterministic":
+            return 0.0
+        return float(beta)
+
     def _resolve_amp_dtype(self, value):
         if self.device.type != "cuda" or not self.config.use_amp:
             return None
@@ -796,6 +808,7 @@ class Trainer:
             if beta_override is None
             else float(beta_override)
         )
+        beta = self._effective_kl_beta(beta)
         zero = torch.zeros((), device=self.device)
         total_loss = zero.clone()
         n_batches = 0
@@ -1167,7 +1180,7 @@ class Trainer:
                 epochs_without_improvement += 1
             self._record_epoch(
                 epoch, train_loss, val_metrics, current_lr,
-                self.kl_scheduler.get_beta(epoch), is_best,
+                self._effective_kl_beta(self.kl_scheduler.get_beta(epoch)), is_best,
                 train_calibration=train_calibration,
                 train_ho_metrics=train_ho_metrics,
             )
@@ -1271,7 +1284,7 @@ class Trainer:
                 "train_recon": train_calibration["recon"],
                 "train_weighted_kl": train_calibration["weighted_kl"],
                 "lr": refit_lr,
-                "kl_beta": self.config.kl_max_beta,
+                "kl_beta": self._effective_kl_beta(self.config.kl_max_beta),
                 "is_best": int(is_best),
             })
             if history_path is not None:
