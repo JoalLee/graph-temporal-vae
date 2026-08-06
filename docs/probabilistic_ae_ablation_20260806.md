@@ -189,6 +189,39 @@ more strongly to decoder variance/calibration, observed-versus-held-out shift,
 and objective/data-mask formulation than to latent sampling as the dominant
 cause.
 
+## Physical-space underestimation check
+
+The held-out predictions confirm a downward bias in physical magnitude, but
+not a universal cell-by-cell downward shift. For the PAE with the seed-42
+evaluation mask:
+
+| diagnostic | value |
+|---|---:|
+| physical mean(prediction) / mean(observation) | 0.8856 |
+| fraction of cells with prediction < observation | 49.89% |
+| same ratio in the highest observed-value decile | 0.7859 |
+| high-decile fraction underestimated | 68.43% |
+| Chemistry high-decile ratio | 0.9348 |
+| PSD high-decile ratio | 0.7557 |
+| model-space mean(prediction) / mean(observation) | 0.9924 |
+
+The low and middle ranges are slightly over-predicted on average while the
+upper tail is compressed toward the mean. This is consistent with
+regression-to-the-mean and the shared `log1p` target/output transform: a
+central prediction in transformed space is not the arithmetic mean after
+inverse transformation. The VAE control shows essentially the same pattern
+(overall physical ratio 0.8864 and PSD high-decile ratio 0.7569), so this is a
+shared physical-output/objective issue, not evidence that deterministic latent
+caused it.
+
+For the independent-style seed-43 mask, PAE physical ratio is 0.9512 overall
+and 0.7481 in the high decile, with 73.71% of high-value cells underestimated.
+Thus the robust finding is high-value underestimation, especially for PSD;
+the exact overall mean bias varies with the held-out mask because of the heavy
+tail. Any remedy should be transform-/likelihood-aware or trained with a
+physical-space objective; a post-hoc rescaling would be a baseline diagnostic,
+not the architectural solution.
+
 ## Full-run commands
 
 ```bash
