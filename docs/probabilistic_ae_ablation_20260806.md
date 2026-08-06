@@ -52,6 +52,41 @@ The integration test trains a one-epoch PAE, reloads its bundle, and verifies
 the zero-KL history fields. A separate uncertainty test verifies identical
 decoder means but distinct likelihood samples.
 
+## GB10 smoke record
+
+The committed implementation was synced to
+`/home/jhenyulee/project/graph-temporal-vae` without replacing the remote
+`train.py`: its pre-existing changes were preserved and only commit
+`7712e3f`'s PAE patch was applied. A one-epoch small-model smoke then exercised
+the real Aeroviz-QC Minion inputs and fixed seed-42 held-out mask.
+
+```text
+output: runs/minion_pae_smoke_20260806/model.pt
+rows: 15,336
+targets: 262 (32 chemistry + 230 PSD)
+fixed global-HO cells: 219,090
+natural-missing overlap: 0
+censored overlap: 8
+latent_mode: deterministic
+kl_beta: 0.0
+train_kl: 0.0
+train_weighted_kl: 0.0
+train_loss: 150972.234375
+train_recon: 150972.234375
+validation HO MSE: 0.980582594871521
+```
+
+Artifact hashes:
+
+```text
+3307638ea10415374422ebca4dc8e4c55ce3cb066b7bc4ffebe3d14673478322  model.pt
+32b51d7d23e1472021dc21099062b0bd624cb2b0d10c84f110179102e04232d0  model_history.csv
+```
+
+The smoke MSE is not a model-quality result: the network was reduced to
+342,826 parameters and trained for one epoch. It only validates the remote
+data/mask/training/bundle path and the deterministic-latent loss invariants.
+
 ## Full-run commands
 
 ```bash
