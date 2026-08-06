@@ -101,7 +101,7 @@
   "psd_feature_weight": 1.0,
   "aux_mask_channel": false,
   "censoring": {
-    "enabled": true,
+    "enabled": false,
     "detect": "zero",
     "input_fill": "half_threshold",
     "loss": "tobit",

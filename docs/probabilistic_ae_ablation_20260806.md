@@ -22,6 +22,10 @@ does, but it uses the encoder mean deterministically and removes the KL term.
   `anchor_constrained` selection mask, dynamic training-mask protocol,
   architecture width/depth, RealNVP transform, likelihood, optimizer, and
   training schedule.
+- The existing VAE control's persisted `config.used.json` has
+  `censoring.enabled = false`; the PAE treatment is explicitly pinned to the
+  same value. The source config currently says `true`, so copying it without
+  this correction would not be a matched experiment.
 
 RealNVP is retained in the first matched PAE arm as a deterministic latent
 transform. Removing it would change two architectural factors at once and is
@@ -59,6 +63,11 @@ The committed implementation was synced to
 `train.py`: its pre-existing changes were preserved and only commit
 `7712e3f`'s PAE patch was applied. A one-epoch small-model smoke then exercised
 the real Aeroviz-QC Minion inputs and fixed seed-42 held-out mask.
+
+This first smoke used the source config's `censoring.enabled = true` before the
+persisted VAE control was compared. It remains valid as an implementation-path
+check, but it is not the matched treatment and must not be used in the VAE/PAE
+quality comparison. The final treatment config is pinned to `false` above.
 
 ```text
 output: runs/minion_pae_smoke_20260806/model.pt
