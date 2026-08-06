@@ -96,6 +96,35 @@ The smoke MSE is not a model-quality result: the network was reduced to
 342,826 parameters and trained for one epoch. It only validates the remote
 data/mask/training/bundle path and the deterministic-latent loss invariants.
 
+## Matched full run
+
+Before launch, the resolved PAE config was compared against
+`runs/aeroviz_qc_own_source_20260805/config.used.json`. After removing only
+the PAE treatment field, the comparison returned `top_diff=[]` and
+`model_diff=[]`.
+
+The matched full run was launched on GB10 at:
+
+```text
+runs/aeroviz_qc_probabilistic_ae_20260806/
+initial main PID: 1281952
+parameters: 17,131,120
+epochs configured: 2,000 (early stopping patience: 100)
+GPU memory at launch: 13,123 MiB
+```
+
+Initial log sanity check:
+
+```text
+epoch 1: val_ho_mse=1.2704, KL=0.000/0.000
+epoch 2: val_ho_mse=1.2045, KL=0.000/0.000
+epoch 3: val_ho_mse=1.1429, KL=0.000/0.000
+```
+
+These early values only confirm that optimization is progressing and the
+zero-KL treatment is active. Final model-quality conclusions require the
+selected checkpoint and held-out/physical-QC evaluation.
+
 ## Full-run commands
 
 ```bash
